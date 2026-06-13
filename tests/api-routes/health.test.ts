@@ -14,7 +14,7 @@ describe("GET /api/health", () => {
   it("reports ok + backend/llm flags (both on)", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(isLlmConfigured).mockReturnValue(true);
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/health"));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true, backend: true, llm: true });
   });
@@ -22,7 +22,7 @@ describe("GET /api/health", () => {
   it("reports flags off when not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
     vi.mocked(isLlmConfigured).mockReturnValue(false);
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/health"));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true, backend: false, llm: false });
   });

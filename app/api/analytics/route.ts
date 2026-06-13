@@ -4,16 +4,20 @@ import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getRecords, setAggregates } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
 import { aggregatesKey } from "@/lib/server/fingerprint";
+import { withLogging } from "@/lib/server/http-log";
+import { log } from "@/lib/server/logger";
+import { setRequestContext } from "@/lib/server/observability/request-context";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /** Compute (or return cached) analytics aggregates for a set of batches.
  *  Requires the batches to have been ingested (records present in Mongo). */
-export async function POST(req: Request) {
+export const POST = withLogging("analytics", async (req: Request) => {
   if (!isBackendConfigured()) return NextResponse.json({ error: "backend_not_configured" }, { status: 503 });
   const ctx = await getTenantContext();
   if (!ctx) return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
+  setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
 
   let body: { batchIds?: string[]; refresh?: boolean };
   try {
@@ -27,14 +31,22 @@ export async function POST(req: Request) {
   const key = aggregatesKey(batchIds);
   if (!body.refresh) {
     const cached = await getAggregates(ctx.tenantId, ctx.accountId, key);
-    if (cached) return NextResponse.json({ aggregates: cached, cached: true });
+    if (cached) {
+      log().info({ batchCount: batchIds.length, key, cached: true }, "analytics served from cache");
+      return NextResponse.json({ aggregates: cached, cached: true });
+    }
   }
 
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
   if (records.length === 0) {
+    log().warn({ batchCount: batchIds.length }, "analytics requested for un-ingested batches");
     return NextResponse.json({ error: "not_ingested", message: "Run ingestion for these batches first." }, { status: 409 });
   }
   const agg = computeAggregates(records, batchIds, ctx, key);
   await setAggregates(agg);
+  log().info(
+    { batchCount: batchIds.length, recordCount: records.length, key, refresh: Boolean(body.refresh) },
+    "analytics aggregates computed",
+  );
   return NextResponse.json({ aggregates: agg, cached: false });
-}
+});

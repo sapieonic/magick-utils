@@ -6,6 +6,7 @@ import pino from "pino";
 import pretty from "pino-pretty";
 import { initOtelLogs } from "./observability/otel-logs";
 import { createOtelSink } from "./observability/otel-pino-sink";
+import { contextBindings } from "./observability/request-context";
 
 const isProduction = process.env.NODE_ENV === "production";
 const otelEnabled =
@@ -54,4 +55,15 @@ export const logger = pino(
 
 export function createChildLogger(bindings: Record<string, unknown>) {
   return logger.child(bindings);
+}
+
+/** Context-aware logger: returns the root logger enriched with the active
+ *  request/job correlation fields (reqId, jobId, route, tenant/account) when one
+ *  is set — see request-context.ts. Use this inside request- or job-scoped code
+ *  (route handlers, the magick-master client, the ingestion worker) so every line
+ *  is automatically tagged and easy to trace through Grafana. Falls back to the
+ *  bare root logger when called outside any unit of work. */
+export function log() {
+  const bindings = contextBindings();
+  return Object.keys(bindings).length > 0 ? logger.child(bindings) : logger;
 }

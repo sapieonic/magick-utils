@@ -213,7 +213,7 @@ describe("POST /api/auth/logout", () => {
   it("returns ok without touching session when auth not configured", async () => {
     vi.mocked(isAuthConfigured).mockReturnValue(false);
     const { POST } = await import("@/app/api/auth/logout/route");
-    const res = await POST();
+    const res = await POST(new Request("http://localhost/api/auth/logout", { method: "POST" }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true });
     expect(getSession).not.toHaveBeenCalled();
@@ -224,7 +224,7 @@ describe("POST /api/auth/logout", () => {
     const session = fakeSession({ idToken: "tk" });
     vi.mocked(getSession).mockResolvedValue(session as never);
     const { POST } = await import("@/app/api/auth/logout/route");
-    const res = await POST();
+    const res = await POST(new Request("http://localhost/api/auth/logout", { method: "POST" }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true });
     expect(session.destroy).toHaveBeenCalled();
@@ -237,7 +237,7 @@ describe("GET /api/auth/me", () => {
   it("401 + configured:false when auth not configured", async () => {
     vi.mocked(isAuthConfigured).mockReturnValue(false);
     const { GET } = await import("@/app/api/auth/me/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/auth/me"));
     expect(res.status).toBe(401);
     await expect(res.json()).resolves.toEqual({ authenticated: false, configured: false });
   });
@@ -246,7 +246,7 @@ describe("GET /api/auth/me", () => {
     vi.mocked(isAuthConfigured).mockReturnValue(true);
     vi.mocked(getSession).mockResolvedValue(fakeSession({}) as never);
     const { GET } = await import("@/app/api/auth/me/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/auth/me"));
     expect(res.status).toBe(401);
     await expect(res.json()).resolves.toEqual({ authenticated: false });
   });
@@ -263,7 +263,7 @@ describe("GET /api/auth/me", () => {
       }) as never,
     );
     const { GET } = await import("@/app/api/auth/me/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/auth/me"));
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json).toEqual({
@@ -278,7 +278,7 @@ describe("GET /api/auth/me", () => {
     vi.mocked(isAuthConfigured).mockReturnValue(true);
     vi.mocked(getSession).mockResolvedValue(fakeSession({ idToken: "tk" }) as never);
     const { GET } = await import("@/app/api/auth/me/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/auth/me"));
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.context).toBeNull();
