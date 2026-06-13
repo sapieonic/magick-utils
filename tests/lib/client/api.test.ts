@@ -64,7 +64,7 @@ describe("backendStatus", () => {
     const api = await freshApi();
     await api.backendStatus();
     await api.backendStatus();
-    const healthCalls = fetchMock.mock.calls.filter((c) => String(c[0]).startsWith("/api/health"));
+    const healthCalls = fetchMock.mock.calls.filter((c: [string, (RequestInit | undefined)?]) => String(c[0]).startsWith("/api/health"));
     expect(healthCalls).toHaveLength(1);
   });
 
@@ -103,7 +103,7 @@ describe("listCampaigns", () => {
     // (seeded RNG → deterministic), so assert structural equality + length.
     expect(out.batches).toEqual(CAMPAIGNS);
     expect(out.batches).toHaveLength(26);
-    const campCalls = fetchMock.mock.calls.filter((c) => String(c[0]).startsWith("/api/campaigns"));
+    const campCalls = fetchMock.mock.calls.filter((c: [string, (RequestInit | undefined)?]) => String(c[0]).startsWith("/api/campaigns"));
     expect(campCalls).toHaveLength(0);
   });
 
@@ -389,7 +389,7 @@ describe("streamChat", () => {
     const onDelta = vi.fn();
     const ok = await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
     expect(ok).toBe(true);
-    expect(onDelta.mock.calls.map((c) => c[0])).toEqual(["Hello", " world"]);
+    expect(onDelta.mock.calls.map((c: [string]) => c[0])).toEqual(["Hello", " world"]);
   });
 
   it("handles frames split across chunk boundaries (buffering)", async () => {
@@ -402,7 +402,7 @@ describe("streamChat", () => {
     const api = await freshApi();
     const onDelta = vi.fn();
     await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
-    expect(onDelta.mock.calls.map((c) => c[0])).toEqual(["Hi", "!"]);
+    expect(onDelta.mock.calls.map((c: [string]) => c[0])).toEqual(["Hi", "!"]);
   });
 
   it("ignores non-data frames and unparsable/done payloads", async () => {
@@ -421,7 +421,7 @@ describe("streamChat", () => {
     const onDelta = vi.fn();
     const ok = await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
     expect(ok).toBe(true);
-    expect(onDelta.mock.calls.map((c) => c[0])).toEqual(["A"]);
+    expect(onDelta.mock.calls.map((c: [string]) => c[0])).toEqual(["A"]);
   });
 
   it("POSTs {batchIds,model,message,history}", async () => {

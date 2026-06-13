@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { Button, Icon, cx } from "@/components/ui";
 import { streamChat } from "@/lib/api";
 import type { Batch } from "@/lib/types";
@@ -86,34 +86,34 @@ export function ChatPanel({
     const history = messages.map((msg) =>
       msg.role === "user"
         ? { role: "user" as const, content: msg.text }
-        : { role: "assistant" as const, content: msg.text ?? (msg.parts ?? []).map((p) => p.t).join("") },
+        : { role: "assistant" as const, content: msg.text ?? (msg.parts ?? []).map((p: Part) => p.t).join("") },
     );
     // Optimistically append the user turn + an empty assistant placeholder that
     // onDelta will fill in (live path). The placeholder index is the new length.
     const placeholderIdx = messages.length + 1;
-    setMessages((m) => [...m, userMsg, { role: "assistant", text: "", model, streaming: true }]);
+    setMessages((m: ChatMessage[]) => [...m, userMsg, { role: "assistant", text: "", model, streaming: true }]);
     setInput("");
     setStreaming(true);
 
     streamChat(batchIds, model, q, history, (delta) => {
-      setMessages((m) => m.map((msg, i) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: (msg.text ?? "") + delta } : msg)));
+      setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: (msg.text ?? "") + delta } : msg)));
     })
       .then((live) => {
         if (live) {
           // Live path done: mark the streamed message as settled.
           setStreaming(false);
-          setMessages((m) => m.map((msg, i) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
+          setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
         } else {
           // LLM off → replace the placeholder with the canned typewriter message.
-          setMessages((m) => m.map((msg, i) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: undefined, parts: CANNED.default } : msg)));
+          setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: undefined, parts: CANNED.default } : msg)));
         }
       })
       .catch(() => {
         // Network/stream error mid-flight: settle gracefully so input re-enables
         // instead of staying disabled forever.
         setStreaming(false);
-        setMessages((m) =>
-          m.map((msg, i) =>
+        setMessages((m: ChatMessage[]) =>
+          m.map((msg: ChatMessage, i: number) =>
             i === placeholderIdx && msg.role === "assistant"
               ? { ...msg, streaming: false, text: msg.text && msg.text.length ? msg.text : "Sorry — I couldn't reach the assistant. Please try again." }
               : msg,
@@ -124,7 +124,7 @@ export function ChatPanel({
 
   const onStreamDone = () => {
     setStreaming(false);
-    setMessages((m) => m.map((msg, i) => (i === m.length - 1 && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
+    setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === m.length - 1 && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
   };
 
   return (
@@ -205,7 +205,7 @@ export function ChatPanel({
             </div>
           ) : (
             <div className="space-y-4">
-              {messages.map((msg, i) =>
+              {messages.map((msg: ChatMessage, i: number) =>
                 msg.role === "user" ? (
                   <div key={i} className="flex justify-end">
                     <div className="max-w-[85%] rounded-2xl rounded-br-md px-3.5 py-2.5 text-[13.5px] font-medium text-white" style={{ background: "var(--accent)" }}>
@@ -241,7 +241,7 @@ export function ChatPanel({
         {/* composer */}
         <div className="border-t border-slate-100 p-3 shrink-0">
           <form
-            onSubmit={(e) => {
+            onSubmit={(e: FormEvent<HTMLFormElement>) => {
               e.preventDefault();
               ask(input);
             }}
@@ -252,7 +252,7 @@ export function ChatPanel({
               <input
                 ref={inputRef}
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => setInput(e.target.value)}
                 disabled={streaming}
                 placeholder="Ask anything about this campaign…"
                 className="h-11 w-full rounded-xl border border-slate-200 bg-white pl-9 pr-3 text-sm text-slate-800 placeholder:text-slate-400 focus:border-[var(--accent)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-ring)]"

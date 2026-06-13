@@ -53,8 +53,8 @@ function splitSystem(messages: ChatMessage[]): {
 
 function textOf(message: Anthropic.Message): string {
   return message.content
-    .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b) => b.text)
+    .filter((b: Anthropic.ContentBlock): b is Anthropic.TextBlock => b.type === "text")
+    .map((b: Anthropic.TextBlock) => b.text)
     .join("");
 }
 
@@ -133,7 +133,7 @@ export class AnthropicProvider implements LLMProvider {
         tool_choice: { type: "tool", name: STRUCTURED_TOOL_NAME },
       });
       const toolUse = res.content.find(
-        (b): b is Anthropic.ToolUseBlock =>
+        (b: Anthropic.ContentBlock): b is Anthropic.ToolUseBlock =>
           b.type === "tool_use" && b.name === STRUCTURED_TOOL_NAME,
       );
       if (toolUse) {

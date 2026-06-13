@@ -23,7 +23,7 @@ export function ColumnPicker({
   const allChecked = allKeys.every((k) => selected.has(k));
   const toggleAll = () => setSelected(allChecked ? new Set() : new Set(allKeys));
   const toggle = (k: string) =>
-    setSelected((s) => {
+    setSelected((s: Set<string>) => {
       const n = new Set(s);
       if (n.has(k)) n.delete(k);
       else n.add(k);
@@ -50,7 +50,7 @@ export function ColumnPicker({
                 <div className="h-px flex-1 bg-slate-100" />
                 <button
                   onClick={() =>
-                    setSelected((s) => {
+                    setSelected((s: Set<string>) => {
                       const n = new Set(s);
                       if (groupAll) groupKeys.forEach((k) => n.delete(k));
                       else groupKeys.forEach((k) => n.add(k));

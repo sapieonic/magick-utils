@@ -28,7 +28,7 @@ import {
   typeKey,
 } from "@/lib/data";
 import { useApp } from "@/lib/store";
-import type { Batch } from "@/lib/types";
+import type { Batch, BreakdownSeg, SelType } from "@/lib/types";
 import { listCampaigns } from "@/lib/api";
 import { FilterSelect } from "@/components/screens/campaigns/FilterSelect";
 import { DownloadModal } from "@/components/screens/campaigns/DownloadModal";
@@ -74,13 +74,13 @@ export default function CampaignsScreen() {
     setPage(1);
   }, [search, channel, statusF, providerF]);
 
-  const providers = useMemo(() => ["all", ...Array.from(new Set(campaigns.map((c) => c.provider)))], [campaigns]);
+  const providers = useMemo(() => ["all", ...Array.from(new Set(campaigns.map((c: Batch) => c.provider)))], [campaigns]);
 
   const filtered = useMemo(() => {
-    const list = campaigns.filter((c) => {
+    const list = campaigns.filter((c: Batch) => {
       if (channel !== "all" && typeKey(c) !== channel) return false;
       if (providerF !== "all" && c.provider !== providerF) return false;
-      if (statusF !== "all" && !c.breakdown.some((b) => b.key === statusF)) return false;
+      if (statusF !== "all" && !c.breakdown.some((b: BreakdownSeg) => b.key === statusF)) return false;
       if (
         search &&
         !(
@@ -111,7 +111,7 @@ export default function CampaignsScreen() {
   // same-type selection: once a batch is picked, only batches of that selType can join
   const activeSelType = useMemo(() => {
     for (const id of selected) {
-      const c = campaigns.find((x) => x.id === id);
+      const c = campaigns.find((x: Batch) => x.id === id);
       if (c) return selType(c);
     }
     return null;
@@ -119,27 +119,27 @@ export default function CampaignsScreen() {
   const selectable = (c: Batch) => !activeSelType || selType(c) === activeSelType;
 
   const at = activeSelType || (pageItems[0] && selType(pageItems[0]));
-  const eligible = pageItems.filter((c) => selType(c) === at);
-  const allOnPageSelected = eligible.length > 0 && eligible.every((c) => selected.has(c.id));
-  const someSelected = pageItems.some((c) => selected.has(c.id));
+  const eligible = pageItems.filter((c: Batch) => selType(c) === at);
+  const allOnPageSelected = eligible.length > 0 && eligible.every((c: Batch) => selected.has(c.id));
+  const someSelected = pageItems.some((c: Batch) => selected.has(c.id));
 
   const toggle = (id: string) =>
-    setSelected((s) => {
+    setSelected((s: Set<string>) => {
       const n = new Set(s);
       if (n.has(id)) n.delete(id);
       else n.add(id);
       return n;
     });
   const togglePage = () =>
-    setSelected((s) => {
+    setSelected((s: Set<string>) => {
       const n = new Set(s);
-      if (allOnPageSelected) eligible.forEach((c) => n.delete(c.id));
-      else eligible.forEach((c) => n.add(c.id));
+      if (allOnPageSelected) eligible.forEach((c: Batch) => n.delete(c.id));
+      else eligible.forEach((c: Batch) => n.add(c.id));
       return n;
     });
 
   const setSortKey = (key: string) =>
-    setSort((s) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" }));
+    setSort((s: SortState) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" }));
   const SortHead = ({ k, children, align }: { k: string; children: React.ReactNode; align?: "right" }) => (
     <th className={cx("px-3 py-2.5 font-bold select-none", align === "right" && "text-right")}>
       <button
@@ -184,7 +184,7 @@ export default function CampaignsScreen() {
           icon="Search"
           placeholder="Search campaigns or batch ID…"
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)}
           className="w-full sm:w-72"
         />
         <FilterSelect
@@ -215,7 +215,7 @@ export default function CampaignsScreen() {
           label="Provider"
           value={providerF}
           onChange={setProviderF}
-          options={providers.map((p) => ({ value: p, label: p === "all" ? "All providers" : p }))}
+          options={providers.map((p: string) => ({ value: p, label: p === "all" ? "All providers" : p }))}
         />
         {hasFilters && (
           <Button variant="ghost" size="sm" icon="X" onClick={resetFilters}>
@@ -270,7 +270,7 @@ export default function CampaignsScreen() {
                       </td>
                     </tr>
                   ))
-                : pageItems.map((c) => {
+                : pageItems.map((c: Batch) => {
                 const isSel = selected.has(c.id);
                 const canSel = selectable(c);
                 return (
@@ -287,7 +287,7 @@ export default function CampaignsScreen() {
                         disabled={!canSel}
                         title={
                           !canSel && activeSelType
-                            ? `You can only combine batches of the same type (${SEL_LABEL[activeSelType]}). Clear the selection to switch types.`
+                            ? `You can only combine batches of the same type (${SEL_LABEL[activeSelType as SelType]}). Clear the selection to switch types.`
                             : undefined
                         }
                         onChange={() => toggle(c.id)}

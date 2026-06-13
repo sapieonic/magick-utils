@@ -41,19 +41,19 @@ export default function Page() {
 
   const targets = useMemo<Batch[]>(() => {
     if (!batches.length) return [];
-    const fallback = batches.filter((c) => selType(c) === "ai")[0] || batches[0];
+    const fallback = batches.filter((c: Batch) => selType(c) === "ai")[0] || batches[0];
     const list = (analyzeTargets && analyzeTargets.length ? analyzeTargets : [fallback.id])
-      .map((id) => batches.find((c) => c.id === id))
+      .map((id) => batches.find((c: Batch) => c.id === id))
       .filter((c): c is Batch => Boolean(c));
     return list.length ? list : [batches[0]];
   }, [analyzeTargets, batches]);
 
-  const ids = useMemo(() => targets.map((t) => t.id), [targets]);
+  const ids = useMemo(() => targets.map((t: Batch) => t.id), [targets]);
   const idsKey = ids.join(",");
 
-  const totalRecords = targets.reduce((a, c) => a + c.total, 0);
-  const hasVoice = targets.some((t) => t.channel === "voice");
-  const hasMsg = targets.some((t) => t.channel !== "voice");
+  const totalRecords = targets.reduce((a: number, c: Batch) => a + c.total, 0);
+  const hasVoice = targets.some((t: Batch) => t.channel === "voice");
+  const hasMsg = targets.some((t: Batch) => t.channel !== "voice");
 
   const [tab, setTab] = useState("overview");
   // Toggleable AI chat sidebar. Starts closed (a floating "Ask AI" button and a
@@ -73,7 +73,7 @@ export default function Page() {
   const refreshRef = useRef(false);
   const runIngest = () => {
     refreshRef.current = true;
-    setRunToken((n) => n + 1);
+    setRunToken((n: number) => n + 1);
   };
 
   // Real ingestion: create a job and poll it. When the backend is off,
@@ -101,7 +101,7 @@ export default function Page() {
 
     const simulate = () => {
       simIv = setInterval(() => {
-        setIngest((p) => {
+        setIngest((p: number) => {
           const next = p + Math.random() * 9 + 4;
           if (next >= 100) {
             if (simIv) clearInterval(simIv);
@@ -203,7 +203,7 @@ export default function Page() {
               )}
             </div>
             <div className="text-[13px] text-slate-400 mt-1.5 flex items-center gap-2 flex-wrap">
-              <span className="font-mono">{targets.map((t) => t.batchId).join(", ").slice(0, 60)}</span>
+              <span className="font-mono">{targets.map((t: Batch) => t.batchId).join(", ").slice(0, 60)}</span>
               <span>·</span>
               <span>{fmtNum(totalRecords)} records</span>
             </div>
@@ -235,7 +235,7 @@ export default function Page() {
             <Button variant="secondary" icon="RefreshCw" onClick={runIngest} disabled={ingesting}>
               Refresh data
             </Button>
-            <Button variant={chatOpen ? "soft" : "primary"} icon="Sparkles" onClick={() => setChatOpen((o) => !o)}>
+            <Button variant={chatOpen ? "soft" : "primary"} icon="Sparkles" onClick={() => setChatOpen((o: boolean) => !o)}>
               Ask AI
             </Button>
           </div>

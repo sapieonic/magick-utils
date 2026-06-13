@@ -50,7 +50,7 @@ describe("ChatPanel — empty state & suggestions", () => {
   });
 
   it("clicking a suggestion sends it through streamChat with the batch ids and renders both turns", async () => {
-    mockStreamChat.mockImplementation(async (_ids, _model, _msg, _history, onDelta) => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _model: string, _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Because the dialer was throttled.");
       return true; // live path
     });
@@ -72,7 +72,7 @@ describe("ChatPanel — empty state & suggestions", () => {
 
 describe("ChatPanel — composer", () => {
   it("submits typed input and clears the field", async () => {
-    mockStreamChat.mockImplementation(async (_ids, _model, _msg, _history, onDelta) => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _model: string, _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Answer.");
       return true;
     });
@@ -101,7 +101,7 @@ describe("ChatPanel — composer", () => {
 
 describe("ChatPanel — clear", () => {
   it("wipes the conversation back to the empty state", async () => {
-    mockStreamChat.mockImplementation(async (_ids, _model, _msg, _history, onDelta) => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _model: string, _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Settled answer.");
       return true;
     });
