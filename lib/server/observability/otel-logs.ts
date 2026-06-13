@@ -36,6 +36,7 @@ function parseHeaders(raw: string): Record<string, string> {
 }
 
 let provider: LoggerProvider | null = null;
+let shutdownHandlersInstalled = false;
 
 /** Idempotent. No-op unless OTEL_ENABLED==='true' and an OTLP endpoint is set. */
 export function initOtelLogs(): void {
@@ -86,4 +87,17 @@ export async function shutdownOtelLogs(): Promise<void> {
   } finally {
     provider = null;
   }
+}
+
+/**
+ * Register SIGTERM/SIGINT handlers that flush + shut down log export on exit.
+ * Idempotent. Lives here (a Node-only module reached only via dynamic import)
+ * rather than in instrumentation.ts so Next's Edge-Runtime static scanner never
+ * sees `process.on` — keeping the edge bundle clean without any `as any` casts.
+ */
+export function installLogShutdownHandlers(): void {
+  if (shutdownHandlersInstalled) return;
+  shutdownHandlersInstalled = true;
+  process.on("SIGTERM", () => void shutdownOtelLogs());
+  process.on("SIGINT", () => void shutdownOtelLogs());
 }

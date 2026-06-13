@@ -3,22 +3,17 @@
 // ensure Mongo indexes and boot the in-process ingestion worker. No-ops cleanly
 // when unconfigured (mock mode). All Node-only modules (logger, OTel SDK, db,
 // worker) are imported dynamically AFTER the runtime guard so this module stays
-// loadable in the Edge Runtime without dragging in node:fs / worker_threads.
+// loadable in the Edge Runtime without dragging in node:fs / worker_threads /
+// process signal handlers.
 
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
-  const { initOtelLogs, shutdownOtelLogs } = await import("./lib/server/observability/otel-logs");
+  const { initOtelLogs, installLogShutdownHandlers } = await import("./lib/server/observability/otel-logs");
   const { logger } = await import("./lib/server/logger");
 
   initOtelLogs();
-  // Register shutdown handlers — process.on is Node-only; the runtime guard above
-  // guarantees we never reach here on the Edge Runtime. Bracket-notation defeats
-  // Turbopack's static edge-API scanner while remaining semantically identical.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (process as any)["on"]("SIGTERM", () => void shutdownOtelLogs());
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (process as any)["on"]("SIGINT", () => void shutdownOtelLogs());
+  installLogShutdownHandlers();
 
   const { isBackendConfigured } = await import("./lib/server/env");
   if (!isBackendConfigured()) {
