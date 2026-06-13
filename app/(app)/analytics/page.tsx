@@ -2,13 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Button, Card, Icon, Spinner, Tabs, TypeBadge, TypeDot } from "@/components/ui";
+import { Button, Card, Icon, Spinner, Tabs, TypeBadge, TypeDot, cx } from "@/components/ui";
 import { aggregate, fmtNum, selType, typeKey } from "@/lib/data";
 import { createIngestJob, getAnalytics, getJob, listCampaigns } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, TypeKey } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
-import { ChatBox } from "@/components/screens/analytics/ChatBox";
+import { ChatPanel } from "@/components/screens/analytics/ChatPanel";
 import { ConversationTab } from "@/components/screens/analytics/ConversationTab";
 import { CostTab } from "@/components/screens/analytics/CostTab";
 import { InsightsTab } from "@/components/screens/analytics/InsightsTab";
@@ -56,6 +56,9 @@ export default function Page() {
   const hasMsg = targets.some((t) => t.channel !== "voice");
 
   const [tab, setTab] = useState("overview");
+  // Toggleable AI chat sidebar. Starts closed (a floating "Ask AI" button and a
+  // header button surface it); docks beside content on xl, overlays below.
+  const [chatOpen, setChatOpen] = useState(false);
   // Opaque cache key for insights/chat (server picks the actual model via LLM_MODEL).
   // Not user-selectable and never shown — the analytics UI exposes no model names.
   const model = "claude";
@@ -173,7 +176,13 @@ export default function Page() {
   }
 
   return (
-    <div className="mx-auto max-w-[1400px] px-4 sm:px-6 py-6 pb-10">
+    <div
+      className={cx(
+        "mx-auto max-w-[1400px] px-4 sm:px-6 py-6 pb-10 transition-[padding] duration-300 ease-out",
+        // On xl+ the chat docks beside the content, so reflow to avoid overlap.
+        chatOpen && "xl:pr-[416px]",
+      )}
+    >
       {/* header */}
       <Card className="p-5 mb-5">
         <div className="flex flex-wrap items-start justify-between gap-4">
@@ -226,6 +235,9 @@ export default function Page() {
             <Button variant="secondary" icon="RefreshCw" onClick={runIngest} disabled={ingesting}>
               Refresh data
             </Button>
+            <Button variant={chatOpen ? "soft" : "primary"} icon="Sparkles" onClick={() => setChatOpen((o) => !o)}>
+              Ask AI
+            </Button>
           </div>
         </div>
       </Card>
@@ -254,8 +266,21 @@ export default function Page() {
       {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} />}
       {tab === "insights" && <InsightsTab model={model} targets={targets} currency={currency} batchIds={ids} />}
 
-      {/* persistent chat */}
-      <ChatBox model={model} targets={targets} batchIds={ids} />
+      {/* Floating toggle — persistent entry point when the panel is closed. */}
+      {!chatOpen && (
+        <button
+          onClick={() => setChatOpen(true)}
+          className="fade-up fixed bottom-6 right-6 z-30 flex items-center gap-2 rounded-full py-3 pl-4 pr-5 text-[14px] font-bold text-white shadow-[0_8px_24px_-6px_rgba(79,70,229,0.6)] transition-transform hover:scale-[1.03] active:scale-95"
+          style={{ background: "var(--brand-grad)" }}
+          title="Ask AI about this campaign"
+        >
+          <Icon name="Sparkles" size={18} />
+          Ask AI
+        </button>
+      )}
+
+      {/* Toggleable AI chat sidebar — docks on xl, overlays as a drawer below. */}
+      <ChatPanel model={model} targets={targets} batchIds={ids} open={chatOpen} onClose={() => setChatOpen(false)} />
     </div>
   );
 }
