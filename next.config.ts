@@ -14,6 +14,8 @@ const nextConfig: NextConfig = {
     "@opentelemetry/sdk-logs",
     "@opentelemetry/exporter-logs-otlp-proto",
     "@opentelemetry/api-logs",
+    "@opentelemetry/resources",
+    "@opentelemetry/semantic-conventions",
   ],
 };
 
