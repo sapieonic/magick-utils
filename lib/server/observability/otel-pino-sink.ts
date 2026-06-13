@@ -28,10 +28,12 @@ export interface MappedLogRecord {
   attributes: Record<string, AnyValue>;
 }
 
-/** Pure: convert a parsed Pino log object into OTel LogRecord fields. */
+/** Pure: convert a parsed Pino log object into OTel LogRecord fields.
+ *  If `time` is absent or unparseable, `timestamp` falls back to `Date.now()`.
+ */
 export function pinoLineToLogRecord(obj: Record<string, unknown>): MappedLogRecord {
   const level = typeof obj.level === "number" ? obj.level : 30;
-  const sev = SEVERITY[level] ?? SEVERITY[30]!;
+  const sev = SEVERITY[level] ?? SEVERITY[30];
 
   const attributes: Record<string, AnyValue> = {};
   for (const [key, value] of Object.entries(obj)) {

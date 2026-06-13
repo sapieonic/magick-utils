@@ -31,6 +31,24 @@ describe("pinoLineToLogRecord", () => {
     expect(rec.timestamp).toBe(Date.parse("2026-06-13T00:00:00.000Z"));
   });
 
+  it("accepts a numeric epoch-ms time field (pino default)", () => {
+    const epoch = 1749772800000;
+    const rec = pinoLineToLogRecord({ level: 30, msg: "x", time: epoch });
+    expect(rec.timestamp).toBe(epoch);
+  });
+
+  it("falls back to Date.now() when time is unparseable", () => {
+    const before = Date.now();
+    const rec = pinoLineToLogRecord({ level: 30, msg: "x", time: "not-a-date" });
+    expect(rec.timestamp).toBeGreaterThanOrEqual(before);
+  });
+
+  it("defaults a non-number level to INFO", () => {
+    const rec = pinoLineToLogRecord({ level: "info", msg: "x", time: "2026-06-13T00:00:00.000Z" });
+    expect(rec.severityNumber).toBe(SeverityNumber.INFO);
+    expect(rec.severityText).toBe("INFO");
+  });
+
   it("routes remaining fields into attributes and excludes reserved keys", () => {
     const rec = pinoLineToLogRecord({
       level: 30,
