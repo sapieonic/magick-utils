@@ -17,10 +17,10 @@ Internet (HTTPS)
         │                                                 │
         │  Nginx (host)                                   │
         │    analytics.magickvoice.com :443               │
-        │      └── /  → proxy 127.0.0.1:3000              │
+        │      └── /  → proxy 127.0.0.1:3008              │
         │                                                 │
         │  Docker                                         │
-        │    └── app  → :3000 (localhost only)            │
+        │    └── app  → 127.0.0.1:3008 → :3000 (localhost) │
         └─────────────────────────────────────────────────┘
                           │  outbound (HTTPS)
                           ├──► magick-master  (appi.magickvoice.com)  — auth + campaign data
@@ -142,23 +142,23 @@ docker compose --env-file .env up -d --build
 
 This builds the multi-stage image (`node:24-alpine`, Next.js standalone output) and starts:
 
-- `app` — the Next.js server on `127.0.0.1:3000` (localhost only)
+- `app` — the Next.js server published on `127.0.0.1:3008` (localhost only; the container listens on 3000 internally)
 
 Verify it's up:
 
 ```bash
 docker compose ps
-curl -s http://127.0.0.1:3000/api/health
+curl -s http://127.0.0.1:3008/api/health
 # Expected: {"ok":true,"backend":true,"llm":true}
 #   backend:true  → MAGICK_MASTER_BASE_URL + SESSION_SECRET are set
 #   llm:true       → LLM_* are set
 ```
 
-> Prefer plain Docker? `docker build -t magick-utils --build-arg NEXT_PUBLIC_FIREBASE_API_KEY=... [other NEXT_PUBLIC_* args] .` then `docker run -d -p 127.0.0.1:3000:3000 --env-file .env --restart unless-stopped magick-utils`.
+> Prefer plain Docker? `docker build -t magick-utils --build-arg NEXT_PUBLIC_FIREBASE_API_KEY=... [other NEXT_PUBLIC_* args] .` then `docker run -d -p 127.0.0.1:3008:3000 --env-file .env --restart unless-stopped magick-utils`.
 
 ## 5. Configure Nginx
 
-Create a server block that reverse-proxies `analytics.magickvoice.com` to the app on `127.0.0.1:3000`:
+Create a server block that reverse-proxies `analytics.magickvoice.com` to the app on `127.0.0.1:3008`:
 
 ```bash
 sudo tee /etc/nginx/sites-available/analytics > /dev/null <<'NGINX'
@@ -170,7 +170,7 @@ server {
     client_max_body_size 25m;
 
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:3008;
         proxy_http_version 1.1;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
@@ -301,9 +301,9 @@ The `NEXT_PUBLIC_FIREBASE_*` values weren't present at **build** time, so they a
 
 ### 502 Bad Gateway from Nginx
 
-The app container isn't reachable on `127.0.0.1:3000`.
+The app container isn't reachable on `127.0.0.1:3008`.
 - `docker compose ps` — is `app` running and `healthy`?
-- `curl http://127.0.0.1:3000/api/health` — does it respond directly?
+- `curl http://127.0.0.1:3008/api/health` — does it respond directly?
 - `docker compose logs app --tail=50` — startup errors?
 
 ### Container keeps restarting
