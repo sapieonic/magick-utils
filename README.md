@@ -72,9 +72,24 @@ Copy `.env.example` → `.env.local` and fill in:
 - `MONGODB_URI` — durable state
 - `LLM_API_KEY`, `LLM_MODEL`, (optional) `LLM_BASE_URL` — insights / chat
 - `NEXT_PUBLIC_FIREBASE_*` — web login config
+- `CRON_SECRET` — shared secret guarding the scheduled cleanup endpoint (see below)
 
 On boot, `instrumentation.ts` ensures Mongo indexes and starts the worker when the backend is configured.
 See [`BACKEND.md`](./BACKEND.md) for a full local-testing walkthrough against the live (read-only) services.
+
+### Scheduled cleanup
+
+To keep MongoDB small enough for the Atlas free tier, a daily GitHub Actions cron
+([`.github/workflows/cleanup.yml`](./.github/workflows/cleanup.yml)) calls `POST /api/cron/cleanup`, which
+prunes regenerable/derived data: cached **aggregates** > 7 days, terminal (done/error) **jobs** > 1 day, and
+cached **insights** > 30 days. The endpoint is guarded by a Bearer `CRON_SECRET` and no-ops (503) until both
+`MONGODB_URI` and `CRON_SECRET` are set. To activate the schedule, set the app's `CRON_SECRET` env var and add
+two **repository secrets** (Settings → Secrets and variables → Actions):
+
+- `CLEANUP_URL` — the deployed endpoint URL, e.g. `https://<your-host>/api/cron/cleanup`
+- `CRON_SECRET` — the same value as the app's env var
+
+See [`BACKEND.md`](./BACKEND.md#scheduled-cleanup) for the retention rationale.
 
 ## Status
 
