@@ -1,0 +1,28 @@
+# Production compose for MagickUtils (analytics.magickvoice.com).
+#
+# One Next.js app container behind host Nginx. MongoDB is external (Atlas), and the
+# platform API (magick-master) + LLM are external services — so there are no local
+# database/cache containers, unlike magic-voice-core.
+#
+# Compose auto-loads `.env` from this directory for BOTH:
+#   • build-arg substitution below (the NEXT_PUBLIC_* values, baked at build time), and
+#   • the container's runtime environment (via env_file).
+#
+#   docker compose --env-file .env up -d --build
+services:
+  app:
+    build:
+      context: .
+      args:
+        # NEXT_PUBLIC_* are inlined into the client bundle at build time.
+        NEXT_PUBLIC_FIREBASE_API_KEY: ${NEXT_PUBLIC_FIREBASE_API_KEY:-}
+        NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:-}
+        NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${NEXT_PUBLIC_FIREBASE_PROJECT_ID:-}
+        NEXT_PUBLIC_FIREBASE_APP_ID: ${NEXT_PUBLIC_FIREBASE_APP_ID:-}
+    image: magick-utils:latest
+    # Server-only secrets (Mongo, magick-master, LLM, SESSION_SECRET) at runtime.
+    env_file: .env
+    # Bind to localhost only — Nginx on the host terminates TLS and proxies in.
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
