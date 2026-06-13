@@ -411,7 +411,7 @@ export function Dropdown({ trigger, children, align = "left", width = 224 }: { t
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    const h = (e: MouseEvent) => {
+    const h = (e: globalThis.MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener("mousedown", h);
