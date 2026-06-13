@@ -58,14 +58,14 @@ export default function DashboardScreen() {
     // "last 30 days" subtitle. Use breakdown sum (not b.total) so volume
     // reconciles with the stat cards, which derive from breakdown.
     const acc = new Map<string, { date: string; calls: number; messages: number; ts: number }>();
-    const latest = batches.reduce((mx, b) => Math.max(mx, new Date(b.date).getTime()), 0);
+    const latest = batches.reduce((mx: number, b: Batch) => Math.max(mx, new Date(b.date).getTime()), 0);
     const cutoff = latest - 30 * 24 * 60 * 60 * 1000;
-    batches.forEach((b) => {
+    batches.forEach((b: Batch) => {
       const dt = new Date(b.date);
       if (dt.getTime() < cutoff) return;
       const label = dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
       const ts = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()).getTime();
-      const count = b.breakdown.reduce((s, x) => s + x.value, 0);
+      const count = b.breakdown.reduce((s: number, x: { value: number }) => s + x.value, 0);
       const cur = acc.get(label) ?? { date: label, calls: 0, messages: 0, ts };
       if (b.channel === "voice") cur.calls += count;
       else cur.messages += count;
@@ -169,7 +169,7 @@ export default function DashboardScreen() {
                       </td>
                     </tr>
                   ))
-                : recent.map((c) => (
+                : recent.map((c: Batch) => (
                     <tr
                       key={c.id}
                       className="border-b border-slate-50 hover:bg-slate-50/70 transition-colors cursor-pointer group"

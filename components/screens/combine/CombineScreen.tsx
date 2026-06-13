@@ -26,7 +26,7 @@ import {
 } from "@/lib/data";
 import { createIngestJob, downloadCsvUrl, getJob, listCampaigns } from "@/lib/api";
 import { useApp } from "@/lib/store";
-import type { Batch, SelType } from "@/lib/types";
+import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
 
 import { ColumnPicker, relevantGroups } from "./ColumnPicker";
 import { StepBadge } from "./StepBadge";
@@ -63,25 +63,25 @@ export function CombineScreen() {
   }, []);
 
   const campaigns = useMemo(
-    () => combineTargets.map((id) => batches.find((c) => c.id === id)).filter((c): c is Batch => Boolean(c)),
+    () => combineTargets.map((id) => batches.find((c: Batch) => c.id === id)).filter((c): c is Batch => Boolean(c)),
     [combineTargets, batches],
   );
   const batchType: SelType = campaigns.length ? selType(campaigns[0]) : "ai";
-  const totalRows = campaigns.reduce((a, c) => a + c.total, 0);
+  const totalRows = campaigns.reduce((a: number, c: Batch) => a + c.total, 0);
 
   const groups = useMemo(() => relevantGroups(batchType), [batchType]);
 
   // init / reconcile selected columns when groups change
   useEffect(() => {
-    setSelectedCols((prev) => {
-      const valid = new Set(groups.flatMap((g) => g.columns.map((c) => c.key)));
-      if (!prev) return new Set(groups.flatMap((g) => g.columns.filter((c) => c.default).map((c) => c.key)));
-      return new Set([...prev].filter((k) => valid.has(k)));
+    setSelectedCols((prev: Set<string> | null) => {
+      const valid = new Set(groups.flatMap((g: ColumnGroup) => g.columns.map((c: ColumnDef) => c.key)));
+      if (!prev) return new Set(groups.flatMap((g: ColumnGroup) => g.columns.filter((c: ColumnDef) => c.default).map((c: ColumnDef) => c.key)));
+      return new Set([...prev].filter((k: string) => valid.has(k)));
     });
   }, [groups]);
 
   const colOrder = useMemo(
-    () => groups.flatMap((g) => g.columns.map((c) => c.key)).filter((k) => selectedCols && selectedCols.has(k)),
+    () => groups.flatMap((g: ColumnGroup) => g.columns.map((c: ColumnDef) => c.key)).filter((k: string) => selectedCols && selectedCols.has(k)),
     [groups, selectedCols],
   );
   const previewRows = useMemo(
@@ -97,7 +97,7 @@ export function CombineScreen() {
     if (phase !== "working" || live || !mockMode) return;
     setProg(0);
     const iv = setInterval(() => {
-      setProg((p) => {
+      setProg((p: number) => {
         const next = p + Math.random() * 11 + 3;
         if (next >= 100) {
           clearInterval(iv);
@@ -155,7 +155,7 @@ export function CombineScreen() {
     setPhase("working");
     // Resolve the job BEFORE the sim can start: success ⇒ set jobId (poll path);
     // null ⇒ confirmed backend-off ⇒ flip mockMode so the simulation runs.
-    const res = await createIngestJob(campaigns.map((c) => c.id), "merge");
+    const res = await createIngestJob(campaigns.map((c: Batch) => c.id), "merge");
     if (res) setJobId(res.jobId);
     else setMockMode(true);
   };
@@ -172,7 +172,7 @@ export function CombineScreen() {
   const addCampaign = (id: string) =>
     setCombineTargets(combineTargets.includes(id) ? combineTargets : [...combineTargets, id]);
   // only batches of the same selection type can be added to the merge
-  const available = batches.filter((c) => !combineTargets.includes(c.id) && selType(c) === batchType);
+  const available = batches.filter((c: Batch) => !combineTargets.includes(c.id) && selType(c) === batchType);
 
   // Wait for the real batch list before deciding "nothing selected" — otherwise
   // the empty state flashes while live data loads.
@@ -220,7 +220,7 @@ export function CombineScreen() {
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              {campaigns.map((c) => (
+              {campaigns.map((c: Batch) => (
                 <span
                   key={c.id}
                   className="group inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white pl-1.5 pr-1 py-1 hover:border-slate-300 transition-colors"
@@ -255,7 +255,7 @@ export function CombineScreen() {
                         No other {SEL_LABEL[batchType]} batches
                       </div>
                     )}
-                    {available.map((c) => (
+                    {available.map((c: Batch) => (
                       <button
                         key={c.id}
                         onClick={() => addCampaign(c.id)}
@@ -289,7 +289,7 @@ export function CombineScreen() {
               <ColumnPicker
                 groups={groups}
                 selected={selectedCols}
-                setSelected={(updater) => setSelectedCols((prev) => updater(prev ?? new Set()))}
+                setSelected={(updater) => setSelectedCols((prev: Set<string> | null) => updater(prev ?? new Set()))}
               />
             )}
           </Card>
@@ -315,7 +315,7 @@ export function CombineScreen() {
                 <table className="text-[12px] min-w-full">
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200">
-                      {colOrder.map((k) => (
+                      {colOrder.map((k: string) => (
                         <th key={k} className="px-3 py-2 text-left font-mono font-semibold text-slate-500 whitespace-nowrap">
                           {k}
                         </th>
@@ -323,9 +323,9 @@ export function CombineScreen() {
                     </tr>
                   </thead>
                   <tbody>
-                    {previewRows.map((r, i) => (
+                    {previewRows.map((r: Record<string, string>, i: number) => (
                       <tr key={i} className="border-b border-slate-100 last:border-0">
-                        {colOrder.map((k) => (
+                        {colOrder.map((k: string) => (
                           <td
                             key={k}
                             className="px-3 py-2 font-mono text-slate-600 whitespace-nowrap max-w-[200px] truncate"
@@ -359,7 +359,7 @@ export function CombineScreen() {
                 />
                 <SummaryRow
                   label="Combined spend"
-                  value={fmtMoney(campaigns.reduce((a, c) => a + c.spendInr, 0), currency)}
+                  value={fmtMoney(campaigns.reduce((a: number, c: Batch) => a + c.spendInr, 0), currency)}
                 />
               </dl>
 
@@ -406,7 +406,7 @@ export function CombineScreen() {
                         className="flex-1"
                         icon="Download"
                         onClick={() => {
-                          if (jobId) window.location.href = downloadCsvUrl(campaigns.map((c) => c.id), colOrder);
+                          if (jobId) window.location.href = downloadCsvUrl(campaigns.map((c: Batch) => c.id), colOrder);
                         }}
                       >
                         Download CSV

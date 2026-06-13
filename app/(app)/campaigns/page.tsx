@@ -109,7 +109,7 @@ export default function CampaignsScreen() {
   const pageItems = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   // same-type selection: once a batch is picked, only batches of that selType can join
-  const activeSelType = useMemo(() => {
+  const activeSelType = useMemo<SelType | null>(() => {
     for (const id of selected) {
       const c = campaigns.find((x: Batch) => x.id === id);
       if (c) return selType(c);
@@ -360,7 +360,7 @@ export default function CampaignsScreen() {
               <IconButton
                 icon="ChevronLeft"
                 size="sm"
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                onClick={() => setPage((p: number) => Math.max(1, p - 1))}
                 className={page === 1 ? "opacity-40 pointer-events-none" : ""}
               />
               {Array.from({ length: pages }).map((_, i) => (
@@ -379,7 +379,7 @@ export default function CampaignsScreen() {
               <IconButton
                 icon="ChevronRight"
                 size="sm"
-                onClick={() => setPage((p) => Math.min(pages, p + 1))}
+                onClick={() => setPage((p: number) => Math.min(pages, p + 1))}
                 className={page === pages ? "opacity-40 pointer-events-none" : ""}
               />
             </div>
@@ -398,7 +398,7 @@ export default function CampaignsScreen() {
               {selected.size}
             </span>
             <span className="text-sm font-medium text-slate-200 whitespace-nowrap">
-              {activeSelType ? SEL_LABEL[activeSelType] : ""}
+              {activeSelType ? SEL_LABEL[activeSelType as SelType] : ""}
               {selected.size > 1 ? " batches" : " batch"}
             </span>
             <div className="flex-1" />

@@ -73,7 +73,7 @@ export function Topbar({
           </button>
         }
       >
-        {(close) =>
+        {(close: () => void) =>
           RANGES.map((r) => (
             <MenuItem
               key={r}
@@ -101,7 +101,7 @@ export function Topbar({
           </button>
         }
       >
-        {(close) => (
+        {(close: () => void) => (
           <>
             <div className="px-2.5 py-2 mb-1 border-b border-slate-100">
               <div className="text-sm font-bold text-slate-800 truncate">{displayName}</div>

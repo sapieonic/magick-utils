@@ -83,7 +83,7 @@ export function ChatPanel({
     if (!q.trim() || streaming) return;
     const userMsg: ChatMessage = { role: "user", text: q };
     // History from prior turns (before this question) for the live LLM call.
-    const history = messages.map((msg) =>
+    const history = messages.map((msg: ChatMessage) =>
       msg.role === "user"
         ? { role: "user" as const, content: msg.text }
         : { role: "assistant" as const, content: msg.text ?? (msg.parts ?? []).map((p: Part) => p.t).join("") },

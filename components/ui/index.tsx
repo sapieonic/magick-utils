@@ -7,6 +7,7 @@ import {
   useState,
   type CSSProperties,
   type InputHTMLAttributes,
+  type MouseEvent,
   type ReactNode,
 } from "react";
 import {
@@ -86,8 +87,8 @@ export function Button({ variant = "primary", size = "md", icon, iconRight, chil
       style={{ height: size === "md" ? 38 : undefined, ...style }}
       className={cx(
         "inline-flex items-center justify-center font-semibold transition-all whitespace-nowrap select-none disabled:opacity-50 disabled:pointer-events-none focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]",
-        sizes[size],
-        variants[variant],
+        sizes[size as keyof typeof sizes],
+        variants[variant as keyof typeof variants],
         className,
       )}
       disabled={disabled || loading}
@@ -354,7 +355,7 @@ export function Checkbox({ checked, indeterminate, onChange, label, sub, classNa
   return (
     <label title={title} className={cx("flex items-start gap-2.5 select-none group", disabled ? "cursor-not-allowed opacity-40" : "cursor-pointer", className)}>
       <span
-        onClick={(e) => {
+        onClick={(e: MouseEvent<HTMLSpanElement>) => {
           e.preventDefault();
           if (!disabled) onChange && onChange(!checked);
         }}
@@ -418,7 +419,7 @@ export function Dropdown({ trigger, children, align = "left", width = 224 }: { t
   }, []);
   return (
     <div className="relative" ref={ref}>
-      <div onClick={() => setOpen((o) => !o)}>{trigger}</div>
+      <div onClick={() => setOpen((o: boolean) => !o)}>{trigger}</div>
       {open && (
         <div className={cx("absolute z-40 mt-2 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl fade-up", align === "right" ? "right-0" : "left-0")} style={{ width }}>
           {typeof children === "function" ? children(() => setOpen(false)) : children}

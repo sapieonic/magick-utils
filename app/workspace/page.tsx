@@ -60,7 +60,7 @@ export default function WorkspacePage() {
   // when the tenant is empty/unknown or the backend is off.
   useEffect(() => {
     const t = tenant.trim();
-    const known = liveTenants.some((lt) => lt.id === t);
+    const known = liveTenants.some((lt: SessionTenantInfo) => lt.id === t);
     if (!backendOn || !t || !known) {
       setAccountsForTenant([]);
       return;
@@ -116,8 +116,8 @@ export default function WorkspacePage() {
     if (backendOn) {
       try {
         await postContext(t, a);
-        const matched = list.find((w) => w.tenant === t);
-        const acct = accountsForTenant.find((x) => x.id === a);
+        const matched = list.find((w: Workspace) => w.tenant === t);
+        const acct = accountsForTenant.find((x: SessionAccountInfo) => x.id === a);
         setWorkspace({
           name: matched?.name ?? t,
           tenant: t,
@@ -183,12 +183,12 @@ export default function WorkspacePage() {
                     setShowSuggest(true);
                     setShowAcctSuggest(false);
                   }}
-                  onChange={(e) => {
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                     setTenant(e.target.value);
                     setError("");
                   }}
                 />
-                <button type="button" onClick={() => setShowSuggest((s) => !s)} className="absolute right-2.5 text-slate-400 hover:text-slate-600">
+                <button type="button" onClick={() => setShowSuggest((s: boolean) => !s)} className="absolute right-2.5 text-slate-400 hover:text-slate-600">
                   <Icon name="ChevronDown" size={16} />
                 </button>
               </div>
@@ -197,7 +197,7 @@ export default function WorkspacePage() {
                 <div className="absolute left-0 right-0 z-30 mt-2 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl fade-up">
                   <div className="px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">Your workspaces</div>
                   {list.length === 0 && <div className="px-2.5 py-2 text-[13px] text-slate-400">No workspaces found — enter IDs manually.</div>}
-                  {list.map((w) => (
+                  {list.map((w: Workspace) => (
                     <button type="button" key={w.tenant} onClick={() => chooseTenant(w.tenant, w.account || undefined)} className="flex w-full items-center gap-3 rounded-lg px-2.5 py-2 hover:bg-slate-100 transition-colors text-left">
                       <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white text-xs font-bold shrink-0" style={{ background: "var(--brand-grad)" }}>
                         {w.name[0]}
@@ -243,13 +243,13 @@ export default function WorkspacePage() {
                     if (accountsForTenant.length > 0) setShowAcctSuggest(true);
                     setShowSuggest(false);
                   }}
-                  onChange={(e) => {
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                     setAccount(e.target.value);
                     setError("");
                   }}
                 />
                 {accountsForTenant.length > 0 && (
-                  <button type="button" onClick={() => setShowAcctSuggest((s) => !s)} className="absolute right-2.5 text-slate-400 hover:text-slate-600">
+                  <button type="button" onClick={() => setShowAcctSuggest((s: boolean) => !s)} className="absolute right-2.5 text-slate-400 hover:text-slate-600">
                     <Icon name="ChevronDown" size={16} />
                   </button>
                 )}
@@ -258,7 +258,7 @@ export default function WorkspacePage() {
               {showAcctSuggest && accountsForTenant.length > 0 && (
                 <div className="absolute left-0 right-0 z-30 mt-2 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl fade-up">
                   <div className="px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">Accounts in this tenant</div>
-                  {accountsForTenant.map((a) => (
+                  {accountsForTenant.map((a: SessionAccountInfo) => (
                     <button type="button" key={a.id} onClick={() => chooseAccount(a.id)} className="flex w-full items-center gap-3 rounded-lg px-2.5 py-2 hover:bg-slate-100 transition-colors text-left">
                       <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-slate-100 text-slate-500 shrink-0">
                         <Icon name="User" size={15} />
