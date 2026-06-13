@@ -10,24 +10,26 @@ import { createOtelSink } from "./observability/otel-pino-sink";
 const isProduction = process.env.NODE_ENV === "production";
 const otelEnabled =
   process.env.OTEL_ENABLED === "true" && Boolean(process.env.OTEL_EXPORTER_OTLP_ENDPOINT);
-const level = (process.env.LOG_LEVEL || "info") as pino.Level;
+const level = (process.env.LOG_LEVEL || "info") as pino.LevelWithSilent;
 
 // Ensure the global LoggerProvider exists before any line hits the OTel sink —
 // idempotent, so instrumentation.register() calling it again is harmless.
 if (otelEnabled) initOtelLogs();
 
-function buildStreams(): pino.StreamEntry[] {
-  const stdout: pino.StreamEntry = isProduction
+function buildStreams(): pino.StreamEntry<pino.LevelWithSilent>[] {
+  const stdout: pino.StreamEntry<pino.LevelWithSilent> = isProduction
     ? { level, stream: process.stdout }
     : { level, stream: pretty({ colorize: true }) };
 
-  const streams: pino.StreamEntry[] = [stdout];
+  const streams: pino.StreamEntry<pino.LevelWithSilent>[] = [stdout];
   if (otelEnabled) streams.push({ level, stream: createOtelSink() });
   return streams;
 }
 
 // Secret-bearing fields that must never reach stdout or log storage. magick-utils
 // carries Firebase `idToken` on jobs/contexts and may log request headers.
+// Note: "*.idToken" matches one nesting level only (pino wildcards are single-segment);
+// deeper paths like context.job.idToken are not covered.
 export const REDACT_PATHS = [
   "idToken",
   "*.idToken",
