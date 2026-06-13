@@ -1,10 +1,10 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Badge, Button, Card, Icon, cx } from "@/components/ui";
 import { Logo } from "@/components/Logo";
 import { WORKSPACES } from "@/lib/data";
-import { backendStatus, fetchMe, postContext, type SessionTenantInfo } from "@/lib/api";
+import { backendStatus, fetchMe, listAccounts, postContext, type SessionAccountInfo, type SessionTenantInfo } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Workspace } from "@/lib/types";
 
@@ -19,9 +19,12 @@ export default function WorkspacePage() {
   const [showAcctSuggest, setShowAcctSuggest] = useState(false);
   const [backendOn, setBackendOn] = useState(false);
   const [list, setList] = useState<Workspace[]>(WORKSPACES);
-  // Live tenants carry their selectable accounts (nested from the login payload);
-  // empty in mock mode, where account entry stays manual.
+  // Live tenants the user belongs to (from the login payload); empty in mock mode.
   const [liveTenants, setLiveTenants] = useState<SessionTenantInfo[]>([]);
+  // Accounts for the currently selected tenant, fetched on demand (cascade) since
+  // the login payload doesn't nest them. Empty ⇒ manual account entry.
+  const [accountsForTenant, setAccountsForTenant] = useState<SessionAccountInfo[]>([]);
+  const [acctLoading, setAcctLoading] = useState(false);
   const wrapRef = useRef<HTMLFormElement | null>(null);
 
   useEffect(() => {
@@ -51,27 +54,46 @@ export default function WorkspacePage() {
     });
   }, []);
 
-  // Accounts selectable for the currently entered tenant (live mode only).
-  const accountsForTenant = useMemo(
-    () => liveTenants.find((t) => t.id === tenant.trim())?.accounts ?? [],
-    [liveTenants, tenant],
-  );
+  // Cascade: once a known tenant is selected in live mode, fetch its accounts so
+  // the user picks from a list instead of typing an id. Auto-selects a sole
+  // account; opens the picker when there are several. Clears (→ manual entry)
+  // when the tenant is empty/unknown or the backend is off.
+  useEffect(() => {
+    const t = tenant.trim();
+    const known = liveTenants.some((lt) => lt.id === t);
+    if (!backendOn || !t || !known) {
+      setAccountsForTenant([]);
+      return;
+    }
+    let active = true;
+    setAcctLoading(true);
+    listAccounts(t)
+      .then((accts) => {
+        if (!active) return;
+        setAccountsForTenant(accts);
+        if (accts.length === 1) {
+          setAccount(accts[0].id);
+          setShowAcctSuggest(false);
+        } else if (accts.length > 1) {
+          setShowAcctSuggest(true);
+        }
+      })
+      .finally(() => {
+        if (active) setAcctLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [tenant, backendOn, liveTenants]);
 
-  // Pick a tenant: fill it, then auto-select its account when there's exactly
-  // one, or open the account picker when there are several.
+  // Pick a tenant: fill it and clear any prior account. In mock mode the seeded
+  // account is preset directly; in live mode the cascade effect above loads it.
   const chooseTenant = (tenantId: string, presetAccount?: string) => {
     setTenant(tenantId);
     setError("");
     setShowSuggest(false);
-    const accts = liveTenants.find((t) => t.id === tenantId)?.accounts ?? [];
-    if (presetAccount) {
-      setAccount(presetAccount);
-    } else if (accts.length === 1) {
-      setAccount(accts[0].id);
-    } else {
-      setAccount("");
-      setShowAcctSuggest(accts.length > 1);
-    }
+    setAccount(presetAccount ?? "");
+    if (presetAccount) setShowAcctSuggest(false);
   };
 
   const chooseAccount = (accountId: string) => {
@@ -200,7 +222,8 @@ export default function WorkspacePage() {
             <div className="relative">
               <label className="block text-[13px] font-semibold text-slate-600 mb-1.5">
                 Account ID
-                {accountsForTenant.length > 0 && (
+                {acctLoading && <span className="ml-2 font-normal text-slate-400">loading accounts…</span>}
+                {!acctLoading && accountsForTenant.length > 0 && (
                   <span className="ml-2 font-normal text-slate-400">
                     {accountsForTenant.length} account{accountsForTenant.length === 1 ? "" : "s"} available
                   </span>

@@ -24,7 +24,7 @@ import { VolumeChart } from "@/components/screens/dashboard/VolumeChart";
 import { StatusDonut } from "@/components/screens/dashboard/StatusDonut";
 
 export default function DashboardScreen() {
-  const { currency, dateRange, setAnalyzeTargets } = useApp();
+  const { currency, dateRange, setAnalyzeTargets, user } = useApp();
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   // Start empty — never seed with mock. listCampaigns() supplies mock only when
@@ -81,6 +81,15 @@ export default function DashboardScreen() {
     [batches],
   );
 
+  // Greet the signed-in user by first name, time-of-day aware. Falls back to a
+  // nameless greeting on the mock/no-backend path where no session user exists.
+  const greeting = useMemo(() => {
+    const h = new Date().getHours();
+    const part = h < 12 ? "morning" : h < 18 ? "afternoon" : "evening";
+    const first = user?.name?.trim().split(/\s+/)[0] || user?.email?.split("@")[0];
+    return first ? `Good ${part}, ${first} 👋` : `Good ${part} 👋`;
+  }, [user]);
+
   const stats = [
     { label: "Total campaigns", value: fmtNum(agg.totalCampaigns), icon: "Layers", delta: 12, sub: "across all channels", spark: sparkline(11, 14, 18, 8) },
     { label: "Total calls", value: fmtCompact(agg.totalCalls), icon: "PhoneCall", delta: 8, sub: fmtNum(agg.totalCalls) + " calls placed", spark: sparkline(22, 14, 60, 30) },
@@ -93,7 +102,7 @@ export default function DashboardScreen() {
     <div className="mx-auto max-w-[1400px] px-4 sm:px-6 py-6">
       <div className="flex items-end justify-between gap-4 mb-5">
         <div>
-          <div className="text-sm text-slate-400">Good afternoon, Priya 👋</div>
+          <div className="text-sm text-slate-400">{greeting}</div>
           <div className="text-[15px] text-slate-500 mt-0.5">
             Here&apos;s what happened in your campaigns over the{" "}
             <span className="font-semibold text-slate-700">{dateRange.toLowerCase()}</span>.

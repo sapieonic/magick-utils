@@ -5,10 +5,13 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { Currency, Workspace } from "./types";
+import type { SessionUserInfo } from "./api";
 
 interface AppState {
   workspace: Workspace | null;
   setWorkspace: (w: Workspace | null) => void;
+  user: SessionUserInfo | null;
+  setUser: (u: SessionUserInfo | null) => void;
   currency: Currency;
   setCurrency: (c: Currency) => void;
   dateRange: string;
@@ -36,6 +39,9 @@ function load(): Partial<AppState> & { workspace?: Workspace | null } {
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [workspace, setWorkspaceState] = useState<Workspace | null>(null);
+  // Signed-in identity from the session (fetched by the app layout). Kept in
+  // memory only — re-derived via fetchMe() on load, not persisted.
+  const [user, setUserState] = useState<SessionUserInfo | null>(null);
   const [currency, setCurrencyState] = useState<Currency>("inr");
   const [dateRange, setDateRangeState] = useState<string>("Last 30 days");
   const [combineTargets, setCombineTargetsState] = useState<string[]>([]);
@@ -65,6 +71,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const signOut = useCallback(() => {
     sessionStorage.removeItem(KEY);
     setWorkspaceState(null);
+    setUserState(null);
     setCombineTargetsState([]);
     setAnalyzeTargetsState([]);
   }, []);
@@ -73,6 +80,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     () => ({
       workspace,
       setWorkspace: setWorkspaceState,
+      user,
+      setUser: setUserState,
       currency,
       setCurrency: setCurrencyState,
       dateRange,
@@ -83,7 +92,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setAnalyzeTargets: setAnalyzeTargetsState,
       signOut,
     }),
-    [workspace, currency, dateRange, combineTargets, analyzeTargets, signOut],
+    [workspace, user, currency, dateRange, combineTargets, analyzeTargets, signOut],
   );
 
   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>;

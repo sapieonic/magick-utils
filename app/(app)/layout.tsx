@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
-import { fetchMe, type SessionUserInfo } from "@/lib/api";
+import { fetchMe } from "@/lib/api";
 import { useApp } from "@/lib/store";
 
 const TITLES: Record<string, string> = {
@@ -16,11 +16,10 @@ const TITLES: Record<string, string> = {
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
-  const { workspace, currency, setCurrency, dateRange, setDateRange, signOut } = useApp();
+  const { workspace, user, setUser, currency, setCurrency, dateRange, setDateRange, signOut } = useApp();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [ready, setReady] = useState(false);
-  const [user, setUser] = useState<SessionUserInfo | null>(null);
 
   // Load the real signed-in user from the session (null on the mock/no-backend
   // path, where the Topbar falls back to a generic label).
@@ -34,7 +33,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [setUser]);
 
   // workspace guard — redirect to selection if none chosen
   useEffect(() => {

@@ -149,6 +149,22 @@ export async function postSession(idToken: string): Promise<{ tenants: SessionTe
   return { tenants: (j.tenants ?? []) as SessionTenantInfo[] };
 }
 
+/** List the accounts available within a tenant, for the cascading workspace
+ *  picker. Returns [] when the backend is off or the request fails, so the UI
+ *  cleanly falls back to manual account entry. */
+export async function listAccounts(tenantId: string): Promise<SessionAccountInfo[]> {
+  try {
+    const res = await fetch(`/api/accounts?tenantId=${encodeURIComponent(tenantId)}`, {
+      cache: "no-store",
+    });
+    if (!res.ok) return [];
+    const j = await res.json();
+    return (j.accounts ?? []) as SessionAccountInfo[];
+  } catch {
+    return [];
+  }
+}
+
 /** Select the active tenant/account workspace on the session. */
 export async function postContext(tenantId: string, accountId: string): Promise<void> {
   const res = await fetch("/api/auth/context", {
