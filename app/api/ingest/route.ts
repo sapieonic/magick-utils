@@ -4,15 +4,19 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext } from "@/lib/server/session";
 import { createJob, getBatch } from "@/lib/server/repositories";
 import type { Job, JobType } from "@/lib/server/types";
+import { withLogging } from "@/lib/server/http-log";
+import { log } from "@/lib/server/logger";
+import { setRequestContext } from "@/lib/server/observability/request-context";
 
 /** Enqueue an ingestion (or merge) job for a set of batches. The worker picks it
  *  up, paginates magick-master, normalizes, and persists records to Mongo. */
-export async function POST(req: Request) {
+export const POST = withLogging("ingest", async (req: Request) => {
   if (!isBackendConfigured()) {
     return NextResponse.json({ error: "backend_not_configured" }, { status: 503 });
   }
   const ctx = await getTenantContext();
   if (!ctx) return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
+  setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
 
   let body: { batchIds?: string[]; type?: JobType };
   try {
@@ -49,5 +53,9 @@ export async function POST(req: Request) {
     updatedAt: now,
   };
   await createJob(job);
+  log().info(
+    { jobId: job.jobId, type, batchCount: batchIds.length, total },
+    "ingestion job enqueued",
+  );
   return NextResponse.json({ jobId: job.jobId, total });
-}
+});

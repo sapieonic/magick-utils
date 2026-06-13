@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { isAuthConfigured } from "@/lib/server/env";
 import { getSession } from "@/lib/server/session";
+import { withLogging } from "@/lib/server/http-log";
 
-export async function GET() {
+export const GET = withLogging("auth/me", async () => {
   if (!isAuthConfigured()) {
     return NextResponse.json({ authenticated: false, configured: false }, { status: 401 });
   }
@@ -16,4 +17,4 @@ export async function GET() {
     tenants: session.tenants ?? [],
     context: session.tenantId && session.accountId ? { tenantId: session.tenantId, accountId: session.accountId } : null,
   });
-}
+});

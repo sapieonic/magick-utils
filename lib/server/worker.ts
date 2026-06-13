@@ -8,7 +8,8 @@ import { MagickClient } from "./magick-client";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
 import type { Job, NormalizedRecord, TenantContext } from "./types";
-import { logger } from "./logger";
+import { logger, log } from "./logger";
+import { runWithRequestContext } from "./observability/request-context";
 
 const PROGRESS_FLUSH = 200;
 const IDLE_DELAY_MS = 2500;
@@ -18,6 +19,7 @@ let started = false;
 export function startWorker() {
   if (started) return;
   started = true;
+  logger.info("[worker] ingestion worker loop started");
   void loop();
 }
 
@@ -38,12 +40,31 @@ async function loop() {
       await sleep(IDLE_DELAY_MS);
       continue;
     }
-    try {
-      await processJob(job);
-    } catch (err) {
-      logger.error({ err, jobId: job.jobId }, "[worker] job failed");
-      await updateJob(job.jobId, { status: "error", error: String(err) }).catch(() => {});
-    }
+    const claimed = job;
+    // Tag every log line (and every magick-master call) for this job's run with
+    // the jobId + tenant/account so a single ingestion is easy to follow in Grafana.
+    await runWithRequestContext(
+      {
+        jobId: claimed.jobId,
+        route: `worker:${claimed.type}`,
+        tenantId: claimed.tenantId,
+        accountId: claimed.accountId,
+      },
+      async () => {
+        const startedAt = Date.now();
+        log().info(
+          { type: claimed.type, batchCount: claimed.batchIds.length, total: claimed.total },
+          "[worker] job claimed",
+        );
+        try {
+          await processJob(claimed);
+          log().info({ durationMs: Date.now() - startedAt }, "[worker] job completed");
+        } catch (err) {
+          log().error({ err, durationMs: Date.now() - startedAt }, "[worker] job failed");
+          await updateJob(claimed.jobId, { status: "error", error: String(err) }).catch(() => {});
+        }
+      },
+    );
   }
 }
 
@@ -76,6 +97,9 @@ async function ingestBatch(
 ): Promise<number> {
   const batch = await getBatch(ctx.tenantId, ctx.accountId, batchId);
   if (!batch) throw new Error(`batch ${batchId} not found (list campaigns first)`);
+
+  const startedAt = Date.now();
+  log().info({ batchId, selType: batch.selType, channel: batch.channel }, "[worker] ingesting batch");
 
   await upsertBatch({ ...batch, ingestStatus: "ingesting", updatedAt: new Date().toISOString() });
 
@@ -133,6 +157,11 @@ async function ingestBatch(
     total: records.length || batch.total,
   });
   await upsertBatch(rebuilt);
+
+  log().info(
+    { batchId, records: records.length, durationMs: Date.now() - startedAt },
+    "[worker] batch ingested",
+  );
 
   return records.length;
 }

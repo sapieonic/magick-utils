@@ -2,6 +2,9 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { countRecords, getBatch, streamRecords } from "@/lib/server/repositories";
 import type { NormalizedRecord } from "@/lib/server/types";
+import { withLogging } from "@/lib/server/http-log";
+import { log } from "@/lib/server/logger";
+import { setRequestContext } from "@/lib/server/observability/request-context";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -54,6 +57,7 @@ async function handle(batchIds: string[], columns: string[], ctx: { tenantId: st
 
   const count = await countRecords(ctx.tenantId, ctx.accountId, batchIds);
   if (count === 0) {
+    log().warn({ batchCount: batchIds.length }, "export requested for un-ingested batches");
     return Response.json({ error: "not_ingested", message: "Run ingestion for these batches first." }, { status: 409 });
   }
 
@@ -65,21 +69,29 @@ async function handle(batchIds: string[], columns: string[], ctx: { tenantId: st
   const cols = columns.length > 0 ? columns : DEFAULT_COLS;
   const cursor = await streamRecords(ctx.tenantId, ctx.accountId, batchIds);
 
+  const exportLog = log().child({ batchCount: batchIds.length, recordCount: count, columns: cols.length });
+  exportLog.info("CSV export started");
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const enc = new TextEncoder();
+      const startedAt = Date.now();
+      let rows = 0;
       controller.enqueue(enc.encode(cols.map(csvEscape).join(",") + "\n"));
       try {
         for await (const rec of cursor) {
+          rows++;
           const row = cols.map((c) => csvEscape(colValue(rec, c, nameById))).join(",");
           controller.enqueue(enc.encode(row + "\n"));
         }
       } catch (err) {
+        exportLog.error({ err, rows }, "CSV export stream failed");
         controller.error(err);
         return;
       } finally {
         await cursor.close().catch(() => {});
       }
+      exportLog.info({ rows, durationMs: Date.now() - startedAt }, "CSV export completed");
       controller.close();
     },
   });
@@ -93,10 +105,11 @@ async function handle(batchIds: string[], columns: string[], ctx: { tenantId: st
   });
 }
 
-export async function POST(req: Request) {
+export const POST = withLogging("export", async (req: Request) => {
   if (!isBackendConfigured()) return Response.json({ error: "backend_not_configured" }, { status: 503 });
   const ctx = await getTenantContext();
   if (!ctx) return Response.json({ error: "not_authenticated" }, { status: 401 });
+  setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
   let body: { batchIds?: string[]; columns?: string[] };
   try {
     body = await req.json();
@@ -104,14 +117,15 @@ export async function POST(req: Request) {
     return Response.json({ error: "invalid_json" }, { status: 400 });
   }
   return handle((body.batchIds ?? []).filter(Boolean), body.columns ?? [], ctx);
-}
+});
 
-export async function GET(req: Request) {
+export const GET = withLogging("export", async (req: Request) => {
   if (!isBackendConfigured()) return Response.json({ error: "backend_not_configured" }, { status: 503 });
   const ctx = await getTenantContext();
   if (!ctx) return Response.json({ error: "not_authenticated" }, { status: 401 });
+  setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
   const url = new URL(req.url);
   const batchIds = (url.searchParams.get("batchIds") ?? "").split(",").filter(Boolean);
   const columns = (url.searchParams.get("columns") ?? "").split(",").filter(Boolean);
   return handle(batchIds, columns, ctx);
-}
+});

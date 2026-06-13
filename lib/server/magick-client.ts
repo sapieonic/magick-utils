@@ -9,6 +9,7 @@
 
 import { env, isAuthConfigured } from "@/lib/server/env";
 import type { TenantContext } from "@/lib/server/types";
+import { log } from "@/lib/server/logger";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -280,8 +281,44 @@ function buildUrl(path: string, query?: Record<string, string | number | undefin
   return url.toString();
 }
 
+/** The path (no query, no host) for a magick-master URL, for compact log lines.
+ *  Query params here are non-sensitive (limit/offset/status/batch ids/dates) but
+ *  we drop them to keep log cardinality low; secrets live only in headers. */
+function logPath(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}
+
+/** fetch() wrapper that times every magick-master call and logs the outcome —
+ *  one INFO line per successful request, WARN on non-2xx, ERROR on network
+ *  failure. Inherits the active request/job correlation fields via `log()`, so
+ *  upstream calls are traceable back to the API request (or worker job) that
+ *  triggered them. The caller still inspects `res.ok` and throws MagickApiError. */
+async function loggedFetch(url: string, init: RequestInit): Promise<Response> {
+  const method = init.method ?? "GET";
+  const path = logPath(url);
+  const startedAt = Date.now();
+  try {
+    const res = await fetch(url, init);
+    const durationMs = Date.now() - startedAt;
+    const fields = { upstream: "magick-master", method, path, status: res.status, durationMs };
+    if (res.ok) log().info(fields, "magick-master request ok");
+    else log().warn(fields, "magick-master request non-2xx");
+    return res;
+  } catch (err) {
+    log().error(
+      { upstream: "magick-master", method, path, durationMs: Date.now() - startedAt, err },
+      "magick-master request errored",
+    );
+    throw err;
+  }
+}
+
 async function raw(url: string, headers: Record<string, string>): Promise<Response> {
-  const res = await fetch(url, {
+  const res = await loggedFetch(url, {
     headers: { ...headers, "x-mgkvc-originator": "magick-analytics" },
     cache: "no-store",
   });
@@ -308,7 +345,7 @@ function authHeaders(idToken: string): Record<string, string> {
 /** Exchange a Firebase id_token for a session: user + tenants + memberships. */
 export async function authSession(idToken: string): Promise<AuthSessionResponse> {
   const url = buildUrl("/auth/session");
-  const res = await fetch(url, {
+  const res = await loggedFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

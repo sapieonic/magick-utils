@@ -6,6 +6,8 @@ import {
   deleteInsightsOlderThan,
   deleteTerminalJobsOlderThan,
 } from "@/lib/server/repositories";
+import { withLogging } from "@/lib/server/http-log";
+import { log } from "@/lib/server/logger";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,13 +36,15 @@ function isAuthorized(req: Request): boolean {
  * free-tier Mongo stays small. Runs without a user session, so it is guarded by
  * a shared Bearer secret (CRON_SECRET) instead of the tenant cookie.
  */
-export async function POST(req: Request) {
+export const POST = withLogging("cron/cleanup", async (req: Request) => {
   if (!isBackendConfigured())
     return NextResponse.json({ error: "backend_not_configured" }, { status: 503 });
   if (!isCronConfigured())
     return NextResponse.json({ error: "cron_not_configured" }, { status: 503 });
-  if (!isAuthorized(req))
+  if (!isAuthorized(req)) {
+    log().warn("cron cleanup rejected — bad or missing CRON_SECRET");
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
 
   const now = Date.now();
   const cutoff = (days: number) => new Date(now - days * DAY_MS).toISOString();
@@ -51,5 +55,6 @@ export async function POST(req: Request) {
     deleteInsightsOlderThan(cutoff(INSIGHTS_RETENTION_DAYS)),
   ]);
 
+  log().info({ deleted: { aggregates, jobs, insights } }, "cron cleanup pruned stale data");
   return NextResponse.json({ ok: true, deleted: { aggregates, jobs, insights } });
-}
+});

@@ -46,7 +46,7 @@ describe("GET /api/campaigns", () => {
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
     const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/campaigns"));
     expect(res.status).toBe(503);
     await expect(res.json()).resolves.toEqual({ error: "backend_not_configured" });
   });
@@ -55,7 +55,7 @@ describe("GET /api/campaigns", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(null);
     const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/campaigns"));
     expect(res.status).toBe(401);
   });
 
@@ -66,7 +66,7 @@ describe("GET /api/campaigns", () => {
     listBulkJobs.mockResolvedValue({ jobs: [{ id: "3" }, { id: "1" }, { id: "" }, { id: "2" }] });
 
     const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/campaigns"));
     expect(res.status).toBe(200);
     const json = await res.json();
     // empty id filtered out, sorted by dayAgo asc
@@ -78,7 +78,7 @@ describe("GET /api/campaigns", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     listBulkJobs.mockRejectedValue(new Error("upstream 500"));
     const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/campaigns"));
     expect(res.status).toBe(502);
     await expect(res.json()).resolves.toMatchObject({ error: "fetch_failed" });
   });
@@ -88,7 +88,7 @@ describe("GET /api/campaigns", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     listBulkJobs.mockRejectedValue(new MagickApiError(401, "Invalid or expired token"));
     const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET();
+    const res = await GET(new Request("http://localhost/api/campaigns"));
     expect(res.status).toBe(401);
     await expect(res.json()).resolves.toMatchObject({ error: "session_expired" });
     expect(sessionDestroy).toHaveBeenCalledOnce();
