@@ -48,9 +48,22 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
 | `/api/analytics` | POST `{batchIds,refresh?}` | compute/cache aggregates (409 if not ingested) |
 | `/api/insights` | POST `{batchIds,model,refresh?}` | LLM insight, cached by fingerprint+model |
 | `/api/chat` | POST `{batchIds,model,message,history?}` | SSE-streamed grounded Q&A |
+| `/api/cron/cleanup` | POST | prune stale data (Bearer `CRON_SECRET`); returns `{deleted}` counts |
 
 Typical flow: log in → pick workspace → `GET /api/campaigns` → `POST /api/ingest` for a selection →
 poll `GET /api/jobs/:id` → then `analytics` / `insights` / `export` work against the ingested records.
+
+## Scheduled cleanup
+`POST /api/cron/cleanup` prunes regenerable/derived data so the MongoDB Atlas free tier stays small:
+cached **aggregates** > 7 days (recomputed on next analytics request), terminal (done/error) **jobs** >
+1 day (live jobs are untouched; this also clears their stored idTokens), and cached **insights** > 30 days
+(regen costs an LLM call, hence the longer window). `records` and `batches` are left alone — `records` is
+the largest collection but dropping it forces a re-ingest, so it needs a separate usage-based policy.
+
+The endpoint runs without a user session, guarded by a shared Bearer secret (`CRON_SECRET`). It's driven
+by a daily GitHub Actions cron (`.github/workflows/cleanup.yml`), which needs two repo secrets: `CLEANUP_URL`
+(the deployed endpoint URL) and `CRON_SECRET` (matching the app's env). Returns 503 until both `MONGODB_URI`
+and `CRON_SECRET` are configured.
 
 ## Client seam (`lib/api.ts`)
 `listCampaigns`, `createIngestJob`, `getJob`, `getAnalytics`, `generateInsights`, `streamChat`,

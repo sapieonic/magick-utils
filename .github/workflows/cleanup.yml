@@ -1,0 +1,38 @@
+name: Daily data cleanup
+
+# Prune stale aggregates / terminal jobs / old insights so the MongoDB Atlas
+# free tier stays small. Calls the app's protected cleanup endpoint
+# (POST /api/cron/cleanup) on a daily schedule.
+#
+# Requires two repository secrets:
+#   CLEANUP_URL  - full URL of the deployed endpoint, e.g.
+#                  https://your-app.example.com/api/cron/cleanup
+#   CRON_SECRET  - the same value as the app's CRON_SECRET env var
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily at 03:00 UTC
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+# Don't pile up runs if a previous one is still going.
+concurrency:
+  group: cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Prune stale data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call cleanup endpoint
+        env:
+          CLEANUP_URL: ${{ secrets.CLEANUP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CLEANUP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "::error::CLEANUP_URL and CRON_SECRET repository secrets must be set."
+            exit 1
+          fi
+          curl -fsS -X POST "$CLEANUP_URL" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -H "Content-Type: application/json" \
+            -w '\nHTTP %{http_code}\n'
