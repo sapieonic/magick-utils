@@ -8,6 +8,7 @@ import { MagickClient } from "./magick-client";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
 import type { Job, NormalizedRecord, TenantContext } from "./types";
+import { logger } from "./logger";
 
 const PROGRESS_FLUSH = 200;
 const IDLE_DELAY_MS = 2500;
@@ -31,7 +32,7 @@ async function loop() {
     try {
       job = await claimNextJob();
     } catch (err) {
-      console.error("[worker] claimNextJob failed", err);
+      logger.error({ err }, "[worker] claimNextJob failed");
     }
     if (!job) {
       await sleep(IDLE_DELAY_MS);
@@ -40,7 +41,7 @@ async function loop() {
     try {
       await processJob(job);
     } catch (err) {
-      console.error(`[worker] job ${job.jobId} failed`, err);
+      logger.error({ err, jobId: job.jobId }, "[worker] job failed");
       await updateJob(job.jobId, { status: "error", error: String(err) }).catch(() => {});
     }
   }
