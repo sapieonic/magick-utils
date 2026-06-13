@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { Badge, Button, Card, Icon, cx } from "@/components/ui";
 import { Logo } from "@/components/Logo";
@@ -102,7 +102,7 @@ export default function WorkspacePage() {
     setShowAcctSuggest(false);
   };
 
-  const submit = async (e: React.FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
     const t = tenant.trim();
     const a = account.trim();
@@ -183,7 +183,7 @@ export default function WorkspacePage() {
                     setShowSuggest(true);
                     setShowAcctSuggest(false);
                   }}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
                     setTenant(e.target.value);
                     setError("");
                   }}
@@ -243,7 +243,7 @@ export default function WorkspacePage() {
                     if (accountsForTenant.length > 0) setShowAcctSuggest(true);
                     setShowSuggest(false);
                   }}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
                     setAccount(e.target.value);
                     setError("");
                   }}
