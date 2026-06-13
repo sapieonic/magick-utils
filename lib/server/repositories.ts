@@ -233,6 +233,38 @@ export async function setAggregates(doc: AggregatesDoc): Promise<void> {
   );
 }
 
+/**
+ * Delete cached aggregates last computed before `cutoffIso`. Returns the number
+ * removed. Aggregates are a regenerable cache (recomputed on the next analytics
+ * request), so pruning stale ones keeps the collection and its index small
+ * enough to stay on the Atlas free tier. `computedAt` is an ISO-8601 UTC string,
+ * which sorts lexicographically, so a `$lt` string comparison is correct here.
+ */
+export async function deleteAggregatesOlderThan(
+  cutoffIso: string
+): Promise<number> {
+  const col = await aggregates();
+  const res = await col.deleteMany({ computedAt: { $lt: cutoffIso } });
+  return res.deletedCount ?? 0;
+}
+
+/**
+ * Delete completed/errored jobs last updated before `cutoffIso`. Only terminal
+ * jobs are removed — queued/running jobs are live work the worker still needs.
+ * Returns the number removed. Jobs also carry the caller's Firebase idToken, so
+ * pruning finished ones is good token hygiene on top of keeping the index small.
+ */
+export async function deleteTerminalJobsOlderThan(
+  cutoffIso: string
+): Promise<number> {
+  const col = await jobs();
+  const res = await col.deleteMany({
+    status: { $in: ["done", "error"] satisfies Job["status"][] },
+    updatedAt: { $lt: cutoffIso },
+  });
+  return res.deletedCount ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // Insights
 // ---------------------------------------------------------------------------
@@ -254,4 +286,17 @@ export async function setInsight(doc: Insight): Promise<void> {
     { $set: doc },
     { upsert: true }
   );
+}
+
+/**
+ * Delete cached LLM insights created before `cutoffIso`. Insights are
+ * regenerable, but regeneration costs an LLM call, so callers use a longer
+ * retention window than for aggregates. Returns the number removed.
+ */
+export async function deleteInsightsOlderThan(
+  cutoffIso: string
+): Promise<number> {
+  const col = await insights();
+  const res = await col.deleteMany({ createdAt: { $lt: cutoffIso } });
+  return res.deletedCount ?? 0;
 }

@@ -11,6 +11,10 @@ export const env = {
   mongoUri: process.env.MONGODB_URI ?? "",
   mongoDb: process.env.MONGODB_DB ?? "magickutils",
 
+  // Shared secret guarding the cron cleanup endpoint (POST /api/cron/cleanup),
+  // which the daily GitHub Actions workflow calls with a Bearer token.
+  cronSecret: process.env.CRON_SECRET ?? "",
+
   llm: {
     provider: (process.env.LLM_PROVIDER ?? "openai-compatible") as "openai-compatible" | "anthropic",
     model: process.env.LLM_MODEL ?? "",
@@ -31,6 +35,11 @@ export function isAuthConfigured(): boolean {
 
 export function isMongoConfigured(): boolean {
   return Boolean(env.mongoUri);
+}
+
+/** A cron secret is set → the scheduled cleanup endpoint will accept requests. */
+export function isCronConfigured(): boolean {
+  return Boolean(env.cronSecret);
 }
 
 /** LLM key present → AI insights + chat can call a real model. */
