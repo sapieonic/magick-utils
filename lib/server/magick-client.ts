@@ -149,6 +149,20 @@ export interface RawTenant {
   [key: string]: unknown;
 }
 
+export interface RawAccount {
+  id: string;
+  tenant_id?: string | null;
+  name?: string | null;
+  slug?: string | null;
+  status?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AccountsListResponse {
+  accounts?: RawAccount[] | null;
+  [key: string]: unknown;
+}
+
 export interface RawUser {
   [key: string]: unknown;
 }
@@ -307,6 +321,20 @@ export async function authSession(idToken: string): Promise<AuthSessionResponse>
 /** Fetch the current user + tenants/memberships for a Bearer id_token. */
 export async function authMe(idToken: string): Promise<AuthMeResponse> {
   return getJson<AuthMeResponse>(buildUrl("/auth/me"), authHeaders(idToken));
+}
+
+/** List the accounts within a tenant. Auth-style call: Bearer + X-Tenant-Id only
+ *  (no account context exists yet) — used by the workspace picker to cascade the
+ *  account list once a tenant is chosen. magick-master validates the user's
+ *  membership in the tenant and scopes the result to it. */
+export async function listTenantAccounts(
+  idToken: string,
+  tenantId: string,
+): Promise<AccountsListResponse> {
+  return getJson<AccountsListResponse>(buildUrl("/accounts"), {
+    ...authHeaders(idToken),
+    "X-Tenant-Id": tenantId,
+  });
 }
 
 // ---------------------------------------------------------------------------

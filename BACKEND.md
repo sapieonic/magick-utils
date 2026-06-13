@@ -66,8 +66,10 @@ mock/canned output when the backend/LLM is off.
    - If `NEXT_PUBLIC_FIREBASE_*` is set → use **Continue with Google** or email/password (real Firebase).
    - Otherwise → expand **“Sign in with a Firebase ID token (testing)”**, paste a valid Firebase ID
      token (grab one from the real MagickVoice app's DevTools, or via the Firebase CLI), → **Use ID token**.
-4. On `/workspace`, the dropdown is populated from your real tenants (`/auth/me`). Pick a tenant, enter
-   the **Account ID**, → **Continue** (calls `/api/auth/context`, which magick-master membership-checks).
+4. On `/workspace`, the dropdown is populated from your real tenants (`/auth/me`). Pick a tenant and its
+   **accounts cascade in** (fetched from magick-master `GET /accounts` via `/api/accounts?tenantId=`) — a
+   sole account auto-selects, several open a picker, and manual entry still works if none come back. →
+   **Continue** (calls `/api/auth/context`, which magick-master membership-checks).
 5. `/campaigns` now lists your real bulk-dispatch jobs (read-only).
 6. The other screens (dashboard / combine / analytics) still read mock data until wired (next iterate).
    You can exercise the rest of the pipeline directly with the session cookie, e.g.:
