@@ -35,7 +35,7 @@ export function schemaPrompt(schema: ZodType<unknown>): string {
 /** Format a zod error into a short, model-actionable list of problems. */
 export function formatZodError(err: z.ZodError): string {
   return err.issues
-    .map((i) => `- ${i.path.length ? i.path.join(".") : "(root)"}: ${i.message}`)
+    .map((i: z.ZodIssue) => `- ${i.path.length ? i.path.join(".") : "(root)"}: ${i.message}`)
     .join("\n");
 }
 

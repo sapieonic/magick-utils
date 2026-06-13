@@ -42,7 +42,7 @@ export function FilterSelect({
         </button>
       }
     >
-      {(close) => (
+      {(close: () => void) => (
         <div className="max-h-72 overflow-y-auto">
           {options.map((o) => (
             <MenuItem

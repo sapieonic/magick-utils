@@ -5,7 +5,7 @@ import { Button, Icon, Spinner, cx } from "@/components/ui";
 import { fmtMoney, fmtNum } from "@/lib/data";
 import { generateInsights } from "@/lib/api";
 import type { Batch, Currency } from "@/lib/types";
-import type { Insight } from "@/lib/server/types";
+import type { Anomaly, Insight, Recommendation } from "@/lib/server/types";
 import { Num } from "./Num";
 
 export function InsightsTab({
@@ -66,7 +66,7 @@ export function InsightsTab({
             icon="RefreshCw"
             onClick={() => {
               refreshRef.current = true;
-              setRegen((n) => n + 1);
+              setRegen((n: number) => n + 1);
             }}
             disabled={gen === "loading"}
           >
@@ -98,7 +98,7 @@ export function InsightsTab({
                 <Icon name="TriangleAlert" size={14} /> Anomalies detected
               </div>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {insight.anomalies.map((a, i) => (
+                {insight.anomalies.map((a: Anomaly, i: number) => (
                   <AnomalyCard key={i} tone={a.severity === "high" ? "bad" : "warn"} icon="TriangleAlert" title={a.title} body={a.detail} />
                 ))}
               </div>
@@ -112,7 +112,7 @@ export function InsightsTab({
                 <Icon name="Lightbulb" size={14} /> Recommendations
               </div>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {insight.recommendations.map((r, i) => (
+                {insight.recommendations.map((r: Recommendation, i: number) => (
                   <RecCard key={i} n={i + 1} title={r.title} body={r.detail} />
                 ))}
               </div>

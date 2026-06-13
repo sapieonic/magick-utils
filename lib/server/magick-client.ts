@@ -281,7 +281,10 @@ function buildUrl(path: string, query?: Record<string, string | number | undefin
 }
 
 async function raw(url: string, headers: Record<string, string>): Promise<Response> {
-  const res = await fetch(url, { headers, cache: "no-store" });
+  const res = await fetch(url, {
+    headers: { ...headers, "x-mgkvc-originator": "magick-analytics" },
+    cache: "no-store",
+  });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new MagickApiError(res.status, body, url);
@@ -307,7 +310,11 @@ export async function authSession(idToken: string): Promise<AuthSessionResponse>
   const url = buildUrl("/auth/session");
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "x-mgkvc-originator": "magick-analytics",
+    },
     body: JSON.stringify({ id_token: idToken }),
     cache: "no-store",
   });

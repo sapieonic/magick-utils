@@ -28,7 +28,7 @@ export function DownloadModal({
     if (phase !== "working") return;
     setProg(0);
     const iv = setInterval(() => {
-      setProg((p) => {
+      setProg((p: number) => {
         const next = p + Math.random() * 16 + 4;
         if (next >= 100) {
           clearInterval(iv);

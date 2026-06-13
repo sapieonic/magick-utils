@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ChangeEvent, type FormEvent, type MouseEvent } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Icon, Input, Spinner } from "@/components/ui";
 import { Logo } from "@/components/Logo";
@@ -38,7 +38,7 @@ export default function LoginPage() {
     backendStatus().then((s) => setBackendOn(s.backend));
   }, []);
 
-  const submit = async (e: React.FormEvent | null, via: "google" | "email" | "token") => {
+  const submit = async (e: FormEvent | null, via: "google" | "email" | "token") => {
     e?.preventDefault();
     setMethod(via);
     setError("");
@@ -118,7 +118,7 @@ export default function LoginPage() {
             </div>
           )}
 
-          <button onClick={(e) => submit(e, "google")} disabled={loading} className="w-full h-11 rounded-xl border border-slate-200 bg-white font-semibold text-sm text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition-all flex items-center justify-center gap-3 shadow-sm disabled:opacity-60">
+          <button onClick={(e: MouseEvent<HTMLButtonElement>) => submit(e, "google")} disabled={loading} className="w-full h-11 rounded-xl border border-slate-200 bg-white font-semibold text-sm text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition-all flex items-center justify-center gap-3 shadow-sm disabled:opacity-60">
             {loading && method === "google" ? <Spinner size={16} /> : <GoogleG />}
             Continue with Google
           </button>
@@ -127,17 +127,17 @@ export default function LoginPage() {
             <div className="h-px flex-1 bg-slate-200" /> or sign in with email <div className="h-px flex-1 bg-slate-200" />
           </div>
 
-          <form onSubmit={(e) => submit(e, "email")} className="space-y-3.5">
+          <form onSubmit={(e: FormEvent<HTMLFormElement>) => submit(e, "email")} className="space-y-3.5">
             <div>
               <label className="block text-[13px] font-semibold text-slate-600 mb-1.5">Work email</label>
-              <Input icon="Mail" type="email" placeholder="you@company.com" value={email} onChange={(e) => setEmail(e.target.value)} required />
+              <Input icon="Mail" type="email" placeholder="you@company.com" value={email} onChange={(e: ChangeEvent<HTMLInputElement>) => setEmail(e.target.value)} required />
             </div>
             <div>
               <div className="flex items-center justify-between mb-1.5">
                 <label className="block text-[13px] font-semibold text-slate-600">Password</label>
                 <a className="text-[13px] font-semibold text-[var(--accent-strong)] hover:underline cursor-pointer">Forgot?</a>
               </div>
-              <Input icon="Lock" type="password" placeholder="••••••••••" value={pwd} onChange={(e) => setPwd(e.target.value)} required />
+              <Input icon="Lock" type="password" placeholder="••••••••••" value={pwd} onChange={(e: ChangeEvent<HTMLInputElement>) => setPwd(e.target.value)} required />
             </div>
             <Button type="submit" size="lg" className="w-full" loading={loading && method === "email"} iconRight={loading ? undefined : "ArrowRight"}>
               Sign in
@@ -146,7 +146,7 @@ export default function LoginPage() {
 
           {backendOn && (
             <div className="mt-5 rounded-xl border border-slate-200 bg-slate-50/70 p-3">
-              <button type="button" onClick={() => setShowToken((s) => !s)} className="flex w-full items-center justify-between text-[13px] font-semibold text-slate-600">
+              <button type="button" onClick={() => setShowToken((s: boolean) => !s)} className="flex w-full items-center justify-between text-[13px] font-semibold text-slate-600">
                 <span className="flex items-center gap-1.5">
                   <Icon name="KeyRound" size={14} /> Sign in with a Firebase ID token (testing)
                 </span>
@@ -156,7 +156,7 @@ export default function LoginPage() {
                 <div className="mt-3 space-y-2.5">
                   <textarea
                     value={idToken}
-                    onChange={(e) => setIdToken(e.target.value)}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setIdToken(e.target.value)}
                     placeholder="Paste a Firebase ID token (eyJ…)"
                     rows={3}
                     className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-[12px] font-mono text-slate-800 placeholder:text-slate-400 placeholder:font-sans focus:outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-ring)] resize-none"

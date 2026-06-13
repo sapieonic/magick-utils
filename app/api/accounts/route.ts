@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { isAuthConfigured } from "@/lib/server/env";
-import { getSession } from "@/lib/server/session";
+import { getSession, type SessionTenant } from "@/lib/server/session";
 import { listTenantAccounts, MagickApiError, type RawAccount } from "@/lib/server/magick-client";
 
 /** List the accounts a user can pick within a tenant — powers the cascading
@@ -21,7 +21,7 @@ export async function GET(req: Request) {
   if (!session.idToken) {
     return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
   }
-  const known = (session.tenants ?? []).some((t) => t.id === tenantId);
+  const known = (session.tenants ?? []).some((t: SessionTenant) => t.id === tenantId);
   if (session.tenants && session.tenants.length > 0 && !known) {
     return NextResponse.json({ error: "tenant_not_accessible" }, { status: 403 });
   }

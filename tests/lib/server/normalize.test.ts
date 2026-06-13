@@ -25,7 +25,7 @@ describe("normalizeStatus", () => {
     ["initiating", "pending"],
     ["ringing", "pending"],
   ];
-  it.each(callCases)("maps call status %s -> %s", (input, expected) => {
+  it.each(callCases)("maps call status %s -> %s", (input: string, expected: string) => {
     expect(normalizeStatus(input, "call")).toBe(expected);
   });
 
@@ -43,7 +43,7 @@ describe("normalizeStatus", () => {
     ["sending", "sent"],
     ["sent", "sent"],
   ];
-  it.each(messageCases)("maps message status %s -> %s", (input, expected) => {
+  it.each(messageCases)("maps message status %s -> %s", (input: string, expected: string) => {
     expect(normalizeStatus(input, "message")).toBe(expected);
   });
 

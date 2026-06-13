@@ -64,7 +64,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockImplementation(
-      (_t, _a, id) => Promise.resolve(({ total: id === "b1" ? 10 : 5 }) as never),
+      (_t: string, _a: string, id: string) => Promise.resolve(({ total: id === "b1" ? 10 : 5 }) as never),
     );
 
     const { POST } = await import("@/app/api/ingest/route");

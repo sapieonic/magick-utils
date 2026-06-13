@@ -19,7 +19,7 @@ export function ModelSelect({ model, setModel, compact }: { model: string; setMo
         </button>
       }
     >
-      {(close) => (
+      {(close: () => void) => (
         <>
           <div className="px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">AI model</div>
           {MODELS.map((x) => (
