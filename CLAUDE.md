@@ -12,7 +12,14 @@ messaging campaign data. See `PROPOSAL.md` for the full architecture and rationa
 - Target deploy: a **single long-running Node host** (Render/Railway/Fly) — NOT Vercel serverless —
   so long-running jobs (ingestion, CSV merge, AI analysis) can run in-process. State in **MongoDB
   Atlas**. LLM is **provider-agnostic** (OpenAI-compatible: DeepSeek/Kimi/OpenRouter, or Anthropic).
-  (Backend not yet wired — see "Status".)
+
+## Commands
+- `npm run dev` — dev server (Turbopack). `npm run build` / `npm start` — prod build + serve.
+- `npm run lint` — ESLint. `npx tsc --noEmit` — typecheck. Both must pass before a change is done.
+- `npm test` — Vitest (run once). `npm run test:watch`, `npm run test:coverage`.
+- Single file: `npx vitest run tests/lib/server/aggregate.test.ts`. By name: `npx vitest run -t "merge"`.
+- Tests default to the **node** environment (`vitest.config.ts`); DOM/component tests opt in per-file with
+  a `// @vitest-environment jsdom` comment at the top. `tests/` mirrors the source tree.
 
 ## Layout
 - `app/login`, `app/workspace` — auth + tenant/account context selection.
@@ -43,8 +50,9 @@ messaging channels distinct for badges (`ai | ivr | whatsapp | telegram | email`
   (real ingest job poll → `getAnalytics` aggregates feed Overview/Cost/Conversation tabs; `generateInsights`
   for AI Insights; `streamChat` SSE for the chat box). Every path degrades to mock/canned when the
   backend/LLM is off, so the UI still runs with no env.
-- ⏳ Next iterate: add real Firebase login to the login/workspace screens. Token refresh for long jobs,
-  prettier batch ids, and GridFS export retention are deferred (noted in `BACKEND.md`).
+- ✅ Firebase login wired (`lib/firebase.ts`: Google + email sign-in → ID token exchanged by the BFF).
+  No-ops cleanly when `NEXT_PUBLIC_FIREBASE_*` is unset (mock mode / token-paste testing).
+- ⏳ Deferred (noted in `BACKEND.md`): token refresh for long jobs, prettier batch ids, GridFS export retention.
 
 ## Conventions
 - Client components that use hooks/state/recharts/handlers start with `"use client";`.
