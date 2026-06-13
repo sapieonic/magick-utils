@@ -75,7 +75,7 @@ describe("computeAggregates — duration histogram boundaries", () => {
     [300, "5m+"], // boundary 300 -> upper
     [600, "5m+"],
   ];
-  it.each(cases)("duration %d falls in bucket %s", (sec, bucket) => {
+  it.each(cases)("duration %d falls in bucket %s", (sec: number, bucket: string) => {
     const a = agg([makeRecord({ durationSeconds: sec, raw: { status: "completed" } })]);
     const hit = a.durationHistogram!.find((h) => h.bucket === bucket)!;
     expect(hit.calls).toBe(1);
