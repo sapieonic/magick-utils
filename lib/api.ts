@@ -8,6 +8,19 @@ import type { AggregatesDoc, Insight, Job } from "@/lib/server/types";
 
 let _status: { backend: boolean; llm: boolean } | null = null;
 
+/** When a live BFF data call comes back 401, the magick-master session has
+ *  expired (or was never authenticated) — the server has already cleared the
+ *  cookie, so send the user back to login. Centralized so every screen reacts
+ *  the same way; guarded against redirect loops if we're already on /login.
+ *  Returns true when a redirect was triggered. */
+function handleSessionExpiry(res: Response): boolean {
+  if (res.status !== 401 || typeof window === "undefined") return false;
+  if (!window.location.pathname.startsWith("/login")) {
+    window.location.href = "/login";
+  }
+  return true;
+}
+
 export async function backendStatus(): Promise<{ backend: boolean; llm: boolean }> {
   if (_status) return _status;
   try {
@@ -26,6 +39,7 @@ export async function listCampaigns(): Promise<{ batches: Batch[]; source: "live
   if (!backend) return { batches: CAMPAIGNS, source: "mock" };
   try {
     const res = await fetch("/api/campaigns", { cache: "no-store" });
+    if (handleSessionExpiry(res)) return { batches: CAMPAIGNS, source: "mock" };
     if (!res.ok) throw new Error(`campaigns ${res.status}`);
     const j = await res.json();
     return { batches: j.batches as Batch[], source: "live" };
@@ -42,12 +56,14 @@ export async function createIngestJob(batchIds: string[], type: "ingest" | "merg
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, type }),
   });
+  if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;
   return res.json();
 }
 
 export async function getJob(jobId: string): Promise<Job | null> {
   const res = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
+  if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;
   return res.json();
 }
@@ -60,6 +76,7 @@ export async function getAnalytics(batchIds: string[], refresh = false): Promise
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, refresh }),
   });
+  if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;
   const j = await res.json();
   return j.aggregates as AggregatesDoc;
@@ -73,6 +90,7 @@ export async function generateInsights(batchIds: string[], model: string, refres
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, model, refresh }),
   });
+  if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;
   const j = await res.json();
   return j.insight as Insight;
@@ -94,6 +112,7 @@ export async function streamChat(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, model, message, history }),
   });
+  if (handleSessionExpiry(res)) return false;
   if (!res.ok || !res.body) return false;
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

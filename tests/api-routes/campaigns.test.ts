@@ -1,13 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/server/env", () => ({ isBackendConfigured: vi.fn() }));
-vi.mock("@/lib/server/session", () => ({ getTenantContext: vi.fn() }));
+
+const sessionDestroy = vi.fn();
+vi.mock("@/lib/server/session", () => ({
+  getTenantContext: vi.fn(),
+  getSession: vi.fn(async () => ({ destroy: sessionDestroy })),
+}));
 
 const listBulkJobs = vi.fn();
+class MagickApiError extends Error {
+  status: number;
+  constructor(status: number, message = "err") {
+    super(message);
+    this.name = "MagickApiError";
+    this.status = status;
+  }
+}
 vi.mock("@/lib/server/magick-client", () => ({
   MagickClient: class {
     listBulkJobs = listBulkJobs;
   },
+  MagickApiError,
 }));
 
 vi.mock("@/lib/server/repositories", () => ({
@@ -67,5 +81,16 @@ describe("GET /api/campaigns", () => {
     const res = await GET();
     expect(res.status).toBe(502);
     await expect(res.json()).resolves.toMatchObject({ error: "fetch_failed" });
+  });
+
+  it("401 session_expired and destroys the session on a magick-master 401", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    listBulkJobs.mockRejectedValue(new MagickApiError(401, "Invalid or expired token"));
+    const { GET } = await import("@/app/api/campaigns/route");
+    const res = await GET();
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: "session_expired" });
+    expect(sessionDestroy).toHaveBeenCalledOnce();
   });
 });

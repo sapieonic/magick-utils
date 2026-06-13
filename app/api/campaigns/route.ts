@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { isBackendConfigured } from "@/lib/server/env";
-import { getTenantContext } from "@/lib/server/session";
-import { MagickClient } from "@/lib/server/magick-client";
+import { getSession, getTenantContext } from "@/lib/server/session";
+import { MagickClient, MagickApiError } from "@/lib/server/magick-client";
 import { getBatch, upsertBatch } from "@/lib/server/repositories";
 import { batchDocToBatch, bulkJobToBatchDoc } from "@/lib/server/map";
 
@@ -36,6 +36,14 @@ export async function GET() {
       .sort((a, b) => a.dayAgo - b.dayAgo);
     return NextResponse.json({ batches });
   } catch (err) {
+    // An expired/invalid magick-master token surfaces as a 401. The stored
+    // session is now useless, so clear it and signal the client to re-login
+    // rather than masking it as a generic upstream failure.
+    if (err instanceof MagickApiError && err.status === 401) {
+      const session = await getSession();
+      session.destroy();
+      return NextResponse.json({ error: "session_expired", detail: String(err) }, { status: 401 });
+    }
     return NextResponse.json({ error: "fetch_failed", detail: String(err) }, { status: 502 });
   }
 }
