@@ -9,6 +9,7 @@ import type {
   Insight,
   Job,
   NormalizedRecord,
+  PromptTemplate,
 } from "@/lib/server/types";
 
 // Next.js global-singleton pattern: cache the client (and its connect promise)
@@ -62,6 +63,10 @@ export async function insights(): Promise<Collection<Insight>> {
   return (await getDb()).collection<Insight>("insights");
 }
 
+export async function promptTemplates(): Promise<Collection<PromptTemplate>> {
+  return (await getDb()).collection<PromptTemplate>("prompt_templates");
+}
+
 // Index codes that mean "this index already exists / was just created by a
 // racing caller" — safe to ignore so ensureIndexes stays idempotent.
 const IGNORABLE_INDEX_CODES = new Set([
@@ -93,13 +98,14 @@ async function safeCreateIndexes(
  * concurrently — "index already exists" races are swallowed.
  */
 export async function ensureIndexes(): Promise<void> {
-  const [batchesCol, recordsCol, jobsCol, aggregatesCol, insightsCol] =
+  const [batchesCol, recordsCol, jobsCol, aggregatesCol, insightsCol, promptTemplatesCol] =
     await Promise.all([
       batches(),
       records(),
       jobs(),
       aggregates(),
       insights(),
+      promptTemplates(),
     ]);
 
   await Promise.all([
@@ -138,6 +144,12 @@ export async function ensureIndexes(): Promise<void> {
       insightsCol.createIndex(
         { tenantId: 1, accountId: 1, key: 1 },
         { unique: true, name: "uniq_tenant_account_key" }
+      )
+    ),
+    safeCreateIndexes(() =>
+      promptTemplatesCol.createIndex(
+        { tenantId: 1, accountId: 1, slug: 1, version: 1 },
+        { unique: true, name: "uniq_prompt_slug_version" }
       )
     ),
   ]);

@@ -8,6 +8,7 @@ import {
   batches,
   insights,
   jobs,
+  promptTemplates,
   records,
 } from "@/lib/server/db";
 import type {
@@ -16,6 +17,7 @@ import type {
   Insight,
   Job,
   NormalizedRecord,
+  PromptTemplate,
 } from "@/lib/server/types";
 
 function nowIso(): string {
@@ -299,4 +301,58 @@ export async function deleteInsightsOlderThan(
   const col = await insights();
   const res = await col.deleteMany({ createdAt: { $lt: cutoffIso } });
   return res.deletedCount ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt Templates
+// ---------------------------------------------------------------------------
+
+/** MongoDB duplicate-key error code. */
+export const MONGO_DUPLICATE_KEY = 11000;
+
+export function isDuplicateKeyError(err: unknown): boolean {
+  return (err as { code?: number } | null)?.code === MONGO_DUPLICATE_KEY;
+}
+
+/** Insert a new prompt template. Throws with code 11000 if slug+version already exists. */
+export async function createPromptTemplate(doc: PromptTemplate): Promise<void> {
+  const col = await promptTemplates();
+  await col.insertOne({ ...doc });
+}
+
+export async function listPromptTemplates(
+  tenantId: string,
+  accountId: string
+): Promise<PromptTemplate[]> {
+  const col = await promptTemplates();
+  return col
+    .find({ tenantId, accountId })
+    .sort({ slug: 1, version: -1 })
+    .toArray();
+}
+
+export async function getPromptTemplate(
+  tenantId: string,
+  accountId: string,
+  slug: string,
+  version: number
+): Promise<PromptTemplate | null> {
+  const col = await promptTemplates();
+  return col.findOne({ tenantId, accountId, slug, version });
+}
+
+/** Overwrite a prompt template's mutable fields. Returns the updated doc or null. */
+export async function updatePromptTemplate(
+  tenantId: string,
+  accountId: string,
+  slug: string,
+  version: number,
+  patch: Partial<Pick<PromptTemplate, "name" | "content" | "isActive">>
+): Promise<PromptTemplate | null> {
+  const col = await promptTemplates();
+  return col.findOneAndUpdate(
+    { tenantId, accountId, slug, version },
+    { $set: { ...patch, updatedAt: new Date().toISOString() } },
+    { returnDocument: "after" }
+  );
 }

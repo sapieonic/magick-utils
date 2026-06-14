@@ -134,6 +134,19 @@ export interface Recommendation {
   title: string;
   detail: string;
 }
+/** A versioned prompt template. Unique on (tenantId, accountId, slug, version). */
+export interface PromptTemplate {
+  tenantId: string;
+  accountId: string;
+  slug: string;
+  version: number;
+  name: string;
+  content: string;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Insight {
   tenantId: string;
   accountId: string;
