@@ -191,6 +191,9 @@ export async function postContext(tenantId: string, accountId: string): Promise<
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tenantId, accountId }),
   });
+  // A 401 here means the session is gone/expired (not_authenticated) — bounce to
+  // login instead of surfacing a confusing "check the IDs" error on the picker.
+  if (handleSessionExpiry(res)) return;
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
     throw new Error(j.error ? `${j.error}` : `context ${res.status}`);
