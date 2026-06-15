@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
-import { fetchMe } from "@/lib/api";
+import { backendStatus, fetchMe } from "@/lib/api";
 import { useApp } from "@/lib/store";
 
 const TITLES: Record<string, string> = {
@@ -21,30 +21,38 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [ready, setReady] = useState(false);
 
-  // Load the real signed-in user from the session (null on the mock/no-backend
-  // path, where the Topbar falls back to a generic label).
+  // Auth + workspace guard. With a live backend, verify the session first: an
+  // expired/dead session (fetchMe ⇒ 401) sends the user to /login, NOT to the
+  // workspace picker — otherwise stale workspace state in sessionStorage would
+  // keep a signed-out user bouncing around the app. Once authenticated (or in
+  // mock mode, where there's no real session), fall back to the workspace guard
+  // and redirect to selection if none is chosen.
   useEffect(() => {
     let alive = true;
-    fetchMe()
-      .then((me) => {
-        if (alive && me?.user) setUser(me.user);
-      })
-      .catch(() => {});
+    (async () => {
+      const { backend } = await backendStatus();
+      if (!alive) return;
+      if (backend) {
+        const me = await fetchMe().catch(() => null);
+        if (!alive) return;
+        if (!me?.authenticated) {
+          router.replace("/login");
+          return;
+        }
+        if (me.user) setUser(me.user);
+      }
+      const raw = typeof window !== "undefined" ? sessionStorage.getItem("mu_app_state_v1") : null;
+      const hasWs = workspace || (raw && JSON.parse(raw)?.workspace);
+      if (!hasWs) {
+        router.replace("/workspace");
+      } else {
+        setReady(true);
+      }
+    })();
     return () => {
       alive = false;
     };
-  }, [setUser]);
-
-  // workspace guard — redirect to selection if none chosen
-  useEffect(() => {
-    const raw = typeof window !== "undefined" ? sessionStorage.getItem("mu_app_state_v1") : null;
-    const hasWs = workspace || (raw && JSON.parse(raw)?.workspace);
-    if (!hasWs) {
-      router.replace("/workspace");
-    } else {
-      setReady(true);
-    }
-  }, [workspace, router]);
+  }, [workspace, router, setUser]);
 
   if (!ready || !workspace) {
     return <div className="min-h-screen w-full bg-[#f6f7f9]" />;
