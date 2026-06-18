@@ -108,7 +108,7 @@ export default function DashboardScreen() {
             <span className="font-semibold text-slate-700">{dateRange.toLowerCase()}</span>.
           </div>
         </div>
-        <Button variant="secondary" icon="FileDown" className="hidden sm:inline-flex">
+        <Button variant="secondary" icon="FileDown" className="hidden sm:inline-flex" disabled>
           Export report
         </Button>
       </div>
