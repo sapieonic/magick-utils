@@ -17,24 +17,37 @@ type RouteHandler<A extends unknown[]> = (
   ...rest: A
 ) => Promise<Response> | Response;
 
+interface LoggingOptions {
+  /**
+   * Disable request lifecycle logs for high-frequency probe endpoints while
+   * preserving request context for any downstream code that needs it.
+   */
+  logRequests?: boolean;
+}
+
 export function withLogging<A extends unknown[]>(
   route: string,
   handler: RouteHandler<A>,
+  options: LoggingOptions = {},
 ): RouteHandler<A> {
   return async (req: Request, ...rest: A): Promise<Response> => {
     const reqId = randomUUID();
     const method = req.method;
-    let path = req.url;
-    let search = "";
-    try {
-      const u = new URL(req.url);
-      path = u.pathname;
-      search = u.search;
-    } catch {
-      // non-absolute URL — keep req.url as-is
-    }
+    const logRequests = options.logRequests ?? true;
 
     return runWithRequestContext({ reqId, route, method }, async () => {
+      if (!logRequests) return handler(req, ...rest);
+
+      let path = req.url;
+      let search = "";
+      try {
+        const u = new URL(req.url);
+        path = u.pathname;
+        search = u.search;
+      } catch {
+        // non-absolute URL — keep req.url as-is
+      }
+
       const reqLog = logger.child({ reqId, route, method, path });
       const startedAt = Date.now();
       reqLog.info(search ? { search } : {}, "→ request received");
