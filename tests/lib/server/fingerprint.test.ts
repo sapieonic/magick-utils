@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fingerprint, batchSetKey } from "@/lib/server/fingerprint";
+import { fingerprint, batchSetKey, aggregatesKey } from "@/lib/server/fingerprint";
 
 describe("fingerprint", () => {
   it("returns a 16-char lowercase hex string", () => {
@@ -51,5 +51,11 @@ describe("batchSetKey", () => {
 
   it("equals fingerprint of the sorted ids", () => {
     expect(batchSetKey(["b", "a"])).toBe(fingerprint(["a", "b"]));
+  });
+});
+
+describe("aggregatesKey", () => {
+  it("includes the aggregate cache shape version", () => {
+    expect(aggregatesKey(["b", "a"])).toBe(`${batchSetKey(["a", "b"])}:v3`);
   });
 });

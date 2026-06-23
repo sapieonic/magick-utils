@@ -18,7 +18,104 @@ function dayLabel(iso: string | null | undefined): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+type TimeGranularity = "minute" | "hour" | "day";
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+const SHORT_WINDOW_MS = 2 * 60 * MINUTE_MS;
+const MAX_FILLED_TIME_BUCKETS = 370;
+
+function parseTimestamp(iso: string | null | undefined): Date | null {
+  if (!iso) return null;
+  const value = iso.trim();
+  const hasDateTime = /^\d{4}-\d{2}-\d{2}[T ]/.test(value);
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+  const utcValue = value.replace(/^(\d{4}-\d{2}-\d{2}) /, "$1T");
+  const d = new Date(hasDateTime && !hasZone ? `${utcValue}Z` : value);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function sameUtcDay(a: Date, b: Date): boolean {
+  return (
+    a.getUTCFullYear() === b.getUTCFullYear() &&
+    a.getUTCMonth() === b.getUTCMonth() &&
+    a.getUTCDate() === b.getUTCDate()
+  );
+}
+
+function dateRange(dates: Date[]): { min: number; max: number } | null {
+  if (dates.length === 0) return null;
+  let min = dates[0].getTime();
+  let max = min;
+  for (const d of dates) {
+    const time = d.getTime();
+    min = Math.min(min, time);
+    max = Math.max(max, time);
+  }
+  return { min, max };
+}
+
+function chooseTimeGranularity(dates: Date[]): TimeGranularity {
+  const range = dateRange(dates);
+  if (!range) return "day";
+  const { min, max } = range;
+  const start = new Date(min);
+  const end = new Date(max);
+  if (!sameUtcDay(start, end)) return "day";
+  return max - min <= SHORT_WINDOW_MS ? "minute" : "hour";
+}
+
+function bucketStart(d: Date, granularity: TimeGranularity): Date {
+  const start = new Date(d);
+  start.setUTCSeconds(0, 0);
+  if (granularity === "hour" || granularity === "day") start.setUTCMinutes(0, 0, 0);
+  if (granularity === "day") start.setUTCHours(0, 0, 0, 0);
+  return start;
+}
+
+function bucketStepMs(granularity: TimeGranularity): number {
+  if (granularity === "minute") return MINUTE_MS;
+  if (granularity === "hour") return HOUR_MS;
+  return DAY_MS;
+}
+
+function bucketLabel(d: Date, granularity: TimeGranularity): string {
+  if (granularity === "minute") return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "UTC" });
+  if (granularity === "hour") return d.toLocaleTimeString("en-US", { hour: "numeric", timeZone: "UTC" });
+  return dayLabel(d.toISOString());
+}
+
+function fillTimeBuckets<T extends { date: string }>(
+  map: Map<string, T>,
+  dates: Date[],
+  granularity: TimeGranularity,
+  makeBucket: (date: string) => T,
+) {
+  const range = dateRange(dates);
+  if (!range) return;
+  const start = bucketStart(new Date(range.min), granularity).getTime();
+  const end = bucketStart(new Date(range.max), granularity).getTime();
+  const step = bucketStepMs(granularity);
+  const bucketCount = Math.floor((end - start) / step) + 1;
+  if (bucketCount > MAX_FILLED_TIME_BUCKETS) return;
+  for (let time = start; time <= end; time += step) {
+    const bucket = new Date(time);
+    map.set(String(time), makeBucket(bucketLabel(bucket, granularity)));
+  }
+}
+
+function sortedTimeValues<T>(map: Map<string, T>): T[] {
+  return [...map.entries()]
+    .sort(([a], [b]) => {
+      if (a === "invalid") return 1;
+      if (b === "invalid") return -1;
+      return Number(a) - Number(b);
+    })
+    .map(([, value]) => value);
 }
 
 function durationBucket(sec: number): string {
@@ -101,19 +198,26 @@ export function computeAggregates(
   // volume + cost over time
   const volMap = new Map<string, { date: string; calls: number; messages: number }>();
   const costMap = new Map<string, { date: string; telephony: number; ai: number }>();
+  const validDates = records.map((r) => parseTimestamp(r.timestamp)).filter((d): d is Date => Boolean(d));
+  const timeGranularity = chooseTimeGranularity(validDates);
+  fillTimeBuckets(volMap, validDates, timeGranularity, (date) => ({ date, calls: 0, messages: 0 }));
+  fillTimeBuckets(costMap, validDates, timeGranularity, (date) => ({ date, telephony: 0, ai: 0 }));
   for (const r of records) {
-    const d = dayLabel(r.timestamp);
-    const v = volMap.get(d) ?? { date: d, calls: 0, messages: 0 };
+    const parsed = parseTimestamp(r.timestamp);
+    const bucket = parsed ? bucketStart(parsed, timeGranularity) : null;
+    const key = bucket ? String(bucket.getTime()) : "invalid";
+    const label = bucket ? bucketLabel(bucket, timeGranularity) : "—";
+    const v = volMap.get(key) ?? { date: label, calls: 0, messages: 0 };
     if (r.selType === "message") v.messages += 1;
     else v.calls += 1;
-    volMap.set(d, v);
-    const c = costMap.get(d) ?? { date: d, telephony: 0, ai: 0 };
+    volMap.set(key, v);
+    const c = costMap.get(key) ?? { date: label, telephony: 0, ai: 0 };
     c.telephony += r.telephonyCostInr ?? 0;
     c.ai += r.aiCostInr ?? 0;
-    costMap.set(d, c);
+    costMap.set(key, c);
   }
-  const volumeOverTime = [...volMap.values()];
-  const costOverTime = [...costMap.values()];
+  const volumeOverTime = sortedTimeValues(volMap);
+  const costOverTime = sortedTimeValues(costMap);
 
   return {
     tenantId: ctx.tenantId,

@@ -179,6 +179,9 @@ describe("computeAggregates — funnel", () => {
 });
 
 describe("computeAggregates — volume & cost over time grouping", () => {
+  const utcIso = (hour: number, minute: number) =>
+    `2026-01-01T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00Z`;
+
   it("groups by day label, splitting calls vs messages", () => {
     const d1 = "2026-01-01T10:00:00Z";
     const d2 = "2026-01-02T10:00:00Z";
@@ -194,6 +197,162 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     expect(jan2).toEqual({ date: "Jan 2", calls: 0, messages: 1 });
     const cJan1 = a.costOverTime!.find((c) => c.date === "Jan 1")!;
     expect(cJan1).toEqual({ date: "Jan 1", telephony: 6, ai: 3 });
+  });
+
+  it("uses hourly buckets for records spread across one day", () => {
+    const records = [
+      makeRecord({ timestamp: utcIso(10, 5), telephonyCostInr: 5, aiCostInr: 2, raw: { status: "completed" } }),
+      makeRecord({ timestamp: utcIso(10, 25), telephonyCostInr: 1, aiCostInr: 1, raw: { status: "failed" } }),
+      makeRecord({ selType: "message", channel: "whatsapp", timestamp: utcIso(14, 45), telephonyCostInr: 0, aiCostInr: 3, raw: { status: "read" } }),
+    ];
+    const a = agg(records);
+
+    expect(a.volumeOverTime).toEqual([
+      { date: "10 AM", calls: 2, messages: 0 },
+      { date: "11 AM", calls: 0, messages: 0 },
+      { date: "12 PM", calls: 0, messages: 0 },
+      { date: "1 PM", calls: 0, messages: 0 },
+      { date: "2 PM", calls: 0, messages: 1 },
+    ]);
+    expect(a.costOverTime).toEqual([
+      { date: "10 AM", telephony: 6, ai: 3 },
+      { date: "11 AM", telephony: 0, ai: 0 },
+      { date: "12 PM", telephony: 0, ai: 0 },
+      { date: "1 PM", telephony: 0, ai: 0 },
+      { date: "2 PM", telephony: 0, ai: 3 },
+    ]);
+  });
+
+  it("uses minute buckets for short same-day windows", () => {
+    const records = [
+      makeRecord({ timestamp: utcIso(10, 0), raw: { status: "completed" } }),
+      makeRecord({ timestamp: utcIso(10, 2), raw: { status: "failed" } }),
+    ];
+    const a = agg(records);
+
+    expect(a.volumeOverTime).toEqual([
+      { date: "10:00 AM", calls: 1, messages: 0 },
+      { date: "10:01 AM", calls: 0, messages: 0 },
+      { date: "10:02 AM", calls: 1, messages: 0 },
+    ]);
+  });
+
+  it("uses UTC buckets regardless of the server process timezone", () => {
+    const previousTz = process.env.TZ;
+    process.env.TZ = "Asia/Kolkata";
+    try {
+      const a = agg([
+        makeRecord({ timestamp: utcIso(20, 0), raw: { status: "completed" } }),
+        makeRecord({ timestamp: utcIso(23, 0), raw: { status: "failed" } }),
+      ]);
+
+      expect(a.volumeOverTime).toEqual([
+        { date: "8 PM", calls: 1, messages: 0 },
+        { date: "9 PM", calls: 0, messages: 0 },
+        { date: "10 PM", calls: 0, messages: 0 },
+        { date: "11 PM", calls: 1, messages: 0 },
+      ]);
+    } finally {
+      if (previousTz == null) delete process.env.TZ;
+      else process.env.TZ = previousTz;
+    }
+  });
+
+  it("treats offset-less ISO date-times as UTC", () => {
+    const previousTz = process.env.TZ;
+    process.env.TZ = "Asia/Kolkata";
+    try {
+      const a = agg([
+        makeRecord({ timestamp: "2026-01-01T20:00:00", raw: { status: "completed" } }),
+        makeRecord({ timestamp: "2026-01-01T23:00:00", raw: { status: "failed" } }),
+      ]);
+
+      expect(a.volumeOverTime).toEqual([
+        { date: "8 PM", calls: 1, messages: 0 },
+        { date: "9 PM", calls: 0, messages: 0 },
+        { date: "10 PM", calls: 0, messages: 0 },
+        { date: "11 PM", calls: 1, messages: 0 },
+      ]);
+    } finally {
+      if (previousTz == null) delete process.env.TZ;
+      else process.env.TZ = previousTz;
+    }
+  });
+
+  it("treats offset-less SQL-style date-times as UTC", () => {
+    const previousTz = process.env.TZ;
+    process.env.TZ = "Asia/Kolkata";
+    try {
+      const a = agg([
+        makeRecord({ timestamp: "2026-01-01 20:00:00", raw: { status: "completed" } }),
+        makeRecord({ timestamp: "2026-01-01 23:00:00", raw: { status: "failed" } }),
+      ]);
+
+      expect(a.volumeOverTime).toEqual([
+        { date: "8 PM", calls: 1, messages: 0 },
+        { date: "9 PM", calls: 0, messages: 0 },
+        { date: "10 PM", calls: 0, messages: 0 },
+        { date: "11 PM", calls: 1, messages: 0 },
+      ]);
+    } finally {
+      if (previousTz == null) delete process.env.TZ;
+      else process.env.TZ = previousTz;
+    }
+  });
+
+  it("uses minute buckets at the exact short-window threshold", () => {
+    const a = agg([
+      makeRecord({ timestamp: utcIso(10, 0), raw: { status: "completed" } }),
+      makeRecord({ timestamp: utcIso(12, 0), raw: { status: "failed" } }),
+    ]);
+
+    expect(a.volumeOverTime).toHaveLength(121);
+    expect(a.volumeOverTime![0]).toEqual({ date: "10:00 AM", calls: 1, messages: 0 });
+    expect(a.volumeOverTime![120]).toEqual({ date: "12:00 PM", calls: 1, messages: 0 });
+  });
+
+  it("switches from minute to hourly buckets above the short-window threshold", () => {
+    const a = agg([
+      makeRecord({ timestamp: utcIso(10, 0), raw: { status: "completed" } }),
+      makeRecord({ timestamp: utcIso(12, 1), raw: { status: "failed" } }),
+    ]);
+
+    expect(a.volumeOverTime).toEqual([
+      { date: "10 AM", calls: 1, messages: 0 },
+      { date: "11 AM", calls: 0, messages: 0 },
+      { date: "12 PM", calls: 1, messages: 0 },
+    ]);
+  });
+
+  it("caps filled buckets for very wide daily ranges", () => {
+    const a = agg([
+      makeRecord({ timestamp: "2020-01-01T00:00:00Z", raw: { status: "completed" } }),
+      makeRecord({ timestamp: "2026-06-23T00:00:00Z", raw: { status: "failed" } }),
+    ]);
+
+    expect(a.volumeOverTime).toEqual([
+      { date: "Jan 1", calls: 1, messages: 0 },
+      { date: "Jun 23", calls: 1, messages: 0 },
+    ]);
+  });
+
+  it("keeps invalid timestamp buckets after valid chronological buckets", () => {
+    const a = agg([
+      makeRecord({ timestamp: "not-a-date", telephonyCostInr: 1, aiCostInr: 2, raw: { status: "failed" } }),
+      makeRecord({ timestamp: "2026-01-01T00:00:00Z", telephonyCostInr: 3, aiCostInr: 4, raw: { status: "completed" } }),
+      makeRecord({ timestamp: "2026-01-02T00:00:00Z", telephonyCostInr: 5, aiCostInr: 6, raw: { status: "completed" } }),
+    ]);
+
+    expect(a.volumeOverTime).toEqual([
+      { date: "Jan 1", calls: 1, messages: 0 },
+      { date: "Jan 2", calls: 1, messages: 0 },
+      { date: "—", calls: 1, messages: 0 },
+    ]);
+    expect(a.costOverTime).toEqual([
+      { date: "Jan 1", telephony: 3, ai: 4 },
+      { date: "Jan 2", telephony: 5, ai: 6 },
+      { date: "—", telephony: 1, ai: 2 },
+    ]);
   });
 
   it("null/invalid timestamps group under the '—' label", () => {
