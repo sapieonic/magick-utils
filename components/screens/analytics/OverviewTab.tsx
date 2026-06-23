@@ -95,7 +95,7 @@ export function OverviewTab({
       </div>
       <ChartCard
         title="Volume over time"
-        subtitle="Daily records during the campaign window"
+        subtitle="Records during the campaign window"
         action={<Legend items={[{ c: "var(--accent)", l: hasVoice ? "Calls" : "Primary" }, { c: "#94a3b8", l: "Messages" }]} />}
       >
         <VolumeChart data={time} />

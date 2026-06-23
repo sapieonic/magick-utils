@@ -108,7 +108,7 @@ export interface Job {
 export interface AggregatesDoc {
   tenantId: string;
   accountId: string;
-  key: string; // fingerprint of the sorted batchId set
+  key: string; // versioned aggregate cache key for the sorted batchId set
   batchIds: string[];
   totalRecords: number;
   statusMix: { key: string; value: number }[];

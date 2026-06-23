@@ -75,6 +75,7 @@ describe("OverviewTab — analytics vs agg fallback", () => {
     expect(screen.getByText("12,345")).toBeInTheDocument();
     // Answer rate from analytics.successRate
     expect(screen.getByText("81.2%")).toBeInTheDocument();
+    expect(screen.getByText("Records during the campaign window")).toBeInTheDocument();
   });
 
   it("falls back to agg / targets when analytics is absent", () => {
