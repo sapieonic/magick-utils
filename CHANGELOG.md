@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/sapieonic/magick-utils/compare/v1.0.0...v1.1.0) (2026-06-27)
+
+
+### Features
+
+* add Comparative Insights (4a) and Best-Time-to-Reach heatmap (4b) ([#16](https://github.com/sapieonic/magick-utils/issues/16)) ([d561e50](https://github.com/sapieonic/magick-utils/commit/d561e509a63ee057be518d35ecfb9c7a53eaeede))
+
 # 1.0.0 (2026-06-18)
 
 
