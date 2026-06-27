@@ -270,6 +270,30 @@ export function messagingFunnel() {
   ];
 }
 
+// Mock best-time-to-reach matrix (feature 4b) — used when the backend is off so
+// the heatmap renders in demo mode. Mirrors the real `ReachByTimeOfDay` shape
+// from lib/server/types.ts; weekday is getUTCDay() (0=Sun…6=Sat), bands are
+// 3h-wide. Daytime bands carry real volume; nights are sparse / low-sample.
+export function reachHeatmapMock() {
+  const r = mulberry32(5150);
+  const bands = [2, 3, 4, 5, 6]; // 6am–9pm, the outbound window
+  const cells: { weekday: number; band: number; total: number; reached: number; rate: number; lowSample: boolean }[] = [];
+  let totalPlaced = 0;
+  for (let weekday = 0; weekday < 7; weekday++) {
+    const weekend = weekday === 0 || weekday === 6;
+    for (const band of bands) {
+      // Midday (bands 3–4) and Tue–Thu peak; weekends + early/late dip.
+      const peak = (band === 3 || band === 4 ? 1 : 0.7) * (weekday >= 2 && weekday <= 4 ? 1 : 0.85) * (weekend ? 0.45 : 1);
+      const total = Math.round((weekend ? 8 : 60 + r() * 220) * (band === 2 || band === 6 ? 0.4 : 1));
+      const rate = Math.min(0.92, Math.max(0.18, 0.4 * peak + r() * 0.22));
+      const reached = Math.round(total * rate);
+      cells.push({ weekday, band, total, reached, rate: total > 0 ? reached / total : 0, lowSample: total < 20 });
+      totalPlaced += total;
+    }
+  }
+  return { timezone: "UTC" as const, bandHours: 3, minSamples: 20, totalPlaced, cells };
+}
+
 export function costBreakdown() {
   const r = mulberry32(9091);
   const out: { date: string; telephony: number; ai: number }[] = [];

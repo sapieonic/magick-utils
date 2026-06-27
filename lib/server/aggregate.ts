@@ -127,6 +127,52 @@ function durationBucket(sec: number): string {
   return "5m+";
 }
 
+/** Best-time-to-reach (feature 4b): hour-band width and the per-cell sample
+ *  gate below which a cell is flagged `lowSample` and never recommended.
+ *  Tunable here — revisit from the "insufficient data" rate in production. */
+export const REACH_BAND_HOURS = 3; // 8 bands/day
+export const REACH_MIN_SAMPLES = 20;
+
+/** Whether a status bucket counts as "reached" — identical rule to the
+ *  successRate definition below (`completed` for calls, `read` for messages),
+ *  so the heatmap and the headline success rate never disagree. */
+function isReached(bucket: string): boolean {
+  return bucket === "completed" || bucket === "read";
+}
+
+/** Build the weekday × hour-band answer/read-rate matrix from records that
+ *  carry a usable timestamp. UTC in v1 (reuses `parseTimestamp`); sparse —
+ *  only weekday×band combinations with at least one record are emitted. */
+function computeReachByTimeOfDay(records: NormalizedRecord[]): AggregatesDoc["reachByTimeOfDay"] {
+  const cells = new Map<string, { weekday: number; band: number; total: number; reached: number }>();
+  let totalPlaced = 0;
+  for (const r of records) {
+    const parsed = parseTimestamp(r.timestamp);
+    if (!parsed) continue;
+    const weekday = parsed.getUTCDay();
+    const band = Math.floor(parsed.getUTCHours() / REACH_BAND_HOURS);
+    const key = `${weekday}:${band}`;
+    const cell = cells.get(key) ?? { weekday, band, total: 0, reached: 0 };
+    cell.total += 1;
+    if (isReached(statusBucket(r))) cell.reached += 1;
+    cells.set(key, cell);
+    totalPlaced += 1;
+  }
+  return {
+    timezone: "UTC",
+    bandHours: REACH_BAND_HOURS,
+    minSamples: REACH_MIN_SAMPLES,
+    totalPlaced,
+    cells: [...cells.values()]
+      .map((c) => ({
+        ...c,
+        rate: c.total > 0 ? c.reached / c.total : 0,
+        lowSample: c.total < REACH_MIN_SAMPLES,
+      }))
+      .sort((a, b) => a.weekday - b.weekday || a.band - b.band),
+  };
+}
+
 export function computeAggregates(
   records: NormalizedRecord[],
   batchIds: string[],
@@ -148,7 +194,7 @@ export function computeAggregates(
     spendInr += r.totalCostInr ?? 0;
     telephonyInr += r.telephonyCostInr ?? 0;
     aiInr += r.aiCostInr ?? 0;
-    if (bucket === "completed" || bucket === "read") successCount += 1;
+    if (isReached(bucket)) successCount += 1;
   }
   const statusMix = [...statusCounts.entries()].map(([k, value]) => ({ key: k, value }));
 
@@ -236,6 +282,7 @@ export function computeAggregates(
     funnel,
     volumeOverTime,
     costOverTime,
+    reachByTimeOfDay: computeReachByTimeOfDay(records),
     computedAt: new Date().toISOString(),
   };
 }

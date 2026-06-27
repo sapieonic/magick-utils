@@ -96,6 +96,29 @@ export async function generateInsights(batchIds: string[], model: string, refres
   return j.insight as Insight;
 }
 
+/** Comparative insight (feature 4a): the AI narrative explaining what changed
+ *  between the current selection and a baseline. Returns null when the LLM is
+ *  off — the caller still renders the deterministic delta grid (computed client
+ *  side via getAnalytics + diffAggregates), so only the prose degrades. */
+export async function compareInsights(
+  batchIds: string[],
+  baselineBatchIds: string[],
+  model: string,
+  refresh = false,
+): Promise<Insight | null> {
+  const { llm } = await backendStatus();
+  if (!llm) return null;
+  const res = await fetch("/api/insights/compare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ batchIds, baselineBatchIds, model, refresh }),
+  });
+  if (handleSessionExpiry(res)) return null;
+  if (!res.ok) return null;
+  const j = await res.json();
+  return j.insight as Insight;
+}
+
 /** Stream a chat answer token-by-token. Returns false if the backend/LLM is off
  *  (caller should fall back to its simulated response). */
 export async function streamChat(

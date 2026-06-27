@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fingerprint, batchSetKey, aggregatesKey } from "@/lib/server/fingerprint";
+import { fingerprint, batchSetKey, aggregatesKey, compareKey } from "@/lib/server/fingerprint";
 
 describe("fingerprint", () => {
   it("returns a 16-char lowercase hex string", () => {
@@ -56,6 +56,21 @@ describe("batchSetKey", () => {
 
 describe("aggregatesKey", () => {
   it("includes the aggregate cache shape version", () => {
-    expect(aggregatesKey(["b", "a"])).toBe(`${batchSetKey(["a", "b"])}:v3`);
+    expect(aggregatesKey(["b", "a"])).toBe(`${batchSetKey(["a", "b"])}:v4`);
+  });
+});
+
+describe("compareKey", () => {
+  it("is directional — swapping current and baseline yields a different key", () => {
+    expect(compareKey(["a"], ["b"], "m")).not.toBe(compareKey(["b"], ["a"], "m"));
+  });
+
+  it("is order-independent within each side and includes the model", () => {
+    expect(compareKey(["a", "b"], ["c", "d"], "m")).toBe(compareKey(["b", "a"], ["d", "c"], "m"));
+    expect(compareKey(["a"], ["b"], "m1")).not.toBe(compareKey(["a"], ["b"], "m2"));
+  });
+
+  it("is namespaced so it can't collide with a plain aggregates/insight key", () => {
+    expect(compareKey(["a"], ["b"], "m").startsWith("compare:")).toBe(true);
   });
 });
