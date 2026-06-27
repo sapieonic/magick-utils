@@ -1,7 +1,7 @@
 "use client";
 
 import { Card, Icon, cx } from "@/components/ui";
-import { fmtMoney, fmtMoneyFull, fmtNum, fmtPct } from "@/lib/data";
+import { fmtMoney, fmtMoneyFull, fmtPct } from "@/lib/data";
 import type { AggregatesDiff } from "@/lib/server/types";
 import type { Currency } from "@/lib/types";
 
@@ -80,8 +80,11 @@ export function DeltaGrid({ diff, currency, isMessage, baselineLabel }: { diff: 
   const cprBase = diff.baseline.totalRecords > 0 ? spend.baseline / diff.baseline.totalRecords : 0;
   const cprRel = cprBase !== 0 ? (cprCur - cprBase) / cprBase : null;
 
-  const vol = diff.volume;
-  const volRel = vol.relative;
+  // AI's share of total spend — neither up nor down is inherently good, so this
+  // tile uses the neutral delta language (slate pill, direction arrow only).
+  const aiShareCur = spend.current > 0 ? diff.aiInr.current / spend.current : 0;
+  const aiShareBase = spend.baseline > 0 ? diff.aiInr.baseline / spend.baseline : 0;
+  const aiSharePp = (aiShareCur - aiShareBase) * 100;
 
   return (
     <div>
@@ -106,7 +109,7 @@ export function DeltaGrid({ diff, currency, isMessage, baselineLabel }: { diff: 
           deltaText={relText(spend.relative)}
           deltaSign={spend.delta}
           betterWhen="lower"
-          flat={spend.relative != null && Math.abs(spend.relative) < FLAT_REL}
+          flat={spend.relative == null || Math.abs(spend.relative) < FLAT_REL}
           title={`${fmtMoneyFull(spend.current, currency)} vs ${fmtMoneyFull(spend.baseline, currency)}`}
         />
         <DeltaTile
@@ -116,18 +119,18 @@ export function DeltaGrid({ diff, currency, isMessage, baselineLabel }: { diff: 
           deltaText={relText(cprRel)}
           deltaSign={cprCur - cprBase}
           betterWhen="lower"
-          flat={cprRel != null && Math.abs(cprRel) < FLAT_REL}
+          flat={cprRel == null || Math.abs(cprRel) < FLAT_REL}
           title={`${fmtMoneyFull(cprCur, currency)} vs ${fmtMoneyFull(cprBase, currency)} per record`}
         />
         <DeltaTile
-          label="Records"
-          icon="Users"
-          value={fmtNum(vol.current)}
-          deltaText={relText(volRel)}
-          deltaSign={vol.delta}
+          label="AI cost share"
+          icon="Bot"
+          value={fmtPct(aiShareCur)}
+          deltaText={Math.abs(aiSharePp) < FLAT_PP ? "no change" : `${aiSharePp > 0 ? "+" : "−"}${Math.abs(aiSharePp).toFixed(1)} pts`}
+          deltaSign={aiSharePp}
           betterWhen="neutral"
-          flat={volRel != null && Math.abs(volRel) < FLAT_REL}
-          title={`${fmtNum(vol.current)} vs ${fmtNum(vol.baseline)} records`}
+          flat={Math.abs(aiSharePp) < FLAT_PP}
+          title={`AI is ${fmtPct(aiShareCur)} of spend vs ${fmtPct(aiShareBase)} (telephony makes up the rest)`}
         />
       </div>
     </div>
