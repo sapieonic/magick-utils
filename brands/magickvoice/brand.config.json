@@ -1,0 +1,21 @@
+{
+  "name": "MagickUtils",
+  "shortName": "MU",
+  "company": "MagickVoice",
+  "wordmark": { "lead": "Magick", "accent": "Utils" },
+  "byline": "by {company}",
+  "tagline": "Download, merge, and analyze your {company} campaigns.",
+  "loginTagline": "Download, merge, and analyze your {company} call & messaging campaigns — all in one workspace.",
+  "loginHeadline": { "lead": "Turn finished campaigns into ", "accent": "decisions." },
+  "promotions": true,
+  "sales": { "label": "Talk to sales", "href": "#" },
+  "colors": {
+    "accent": "#4f46e5",
+    "accentStrong": "#4338ca",
+    "accentSoft": "#eef2ff",
+    "gradient": ["#8b3fd6", "#6366f1", "#3b82f6"],
+    "panel": ["#1e1b4b", "#312e81", "#4338ca"],
+    "highlight": ["#c4b5fd", "#93c5fd"]
+  },
+  "style": { "gradientAngle": 135 }
+}

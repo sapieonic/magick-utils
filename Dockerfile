@@ -62,6 +62,13 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
+# Brand packs (whitelabeling). The loader reads brands/<id>/ at runtime via a
+# dynamic path, which the standalone tracer can't follow — copy the dir in
+# explicitly so every committed brand ships in the image. To add a brand WITHOUT
+# rebuilding, bind-mount a host brands/ dir over /app/brands and set BRAND=<id>
+# (see docker-compose.yml).
+COPY --from=builder --chown=nextjs:nodejs /app/brands ./brands
+
 USER nextjs
 EXPOSE 3000
 

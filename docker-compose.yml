@@ -22,6 +22,15 @@ services:
     image: magick-utils:latest
     # Server-only secrets (Mongo, magick-master, LLM, SESSION_SECRET) at runtime.
     env_file: .env
+    # Active whitelabel brand (brands/<id>/). Falls back to magickvoice if unset
+    # in .env; the code default is magickvoice too, so this is just explicit.
+    environment:
+      BRAND: ${BRAND:-magickvoice}
+    # Mount the host brands/ dir over the image's copy so a brand can be added or
+    # edited WITHOUT rebuilding: drop brands/<id>/ here, set BRAND=<id> in .env,
+    # and restart. Read-only — the app only ever reads brand packs.
+    volumes:
+      - ./brands:/app/brands:ro
     # Bind to localhost only — Nginx on the host terminates TLS and proxies in.
     ports:
       - "127.0.0.1:3008:3000"

@@ -100,6 +100,10 @@ Edit `.env` with production values. **Mind the two classes of variable** (the ap
 ```bash
 # --- Server-only (runtime) ---
 
+# Whitelabel brand pack to render (brands/<id>/). Default: magickvoice.
+# Resolved at runtime, so the same image whitelabels per deployment — no rebuild.
+BRAND=magickvoice
+
 # Platform API — auth + live campaign data
 MAGICK_MASTER_BASE_URL=https://appi.magickvoice.com
 
@@ -154,7 +158,26 @@ curl -s http://127.0.0.1:3008/api/health
 #   llm:true       → LLM_* are set
 ```
 
-> Prefer plain Docker? `docker build -t magick-utils --build-arg NEXT_PUBLIC_FIREBASE_API_KEY=... [other NEXT_PUBLIC_* args] .` then `docker run -d -p 127.0.0.1:3008:3000 --env-file .env --restart unless-stopped magick-utils`.
+> Prefer plain Docker? `docker build -t magick-utils --build-arg NEXT_PUBLIC_FIREBASE_API_KEY=... [other NEXT_PUBLIC_* args] .` then `docker run -d -p 127.0.0.1:3008:3000 --env-file .env --restart unless-stopped magick-utils`. Add `-v "$PWD/brands:/app/brands:ro"` to mount brand packs (see below).
+
+### Whitelabeling (brand packs)
+
+The UI is whitelabeled by the `BRAND` env var, which selects a pack under
+`brands/<id>/` (`brand.config.json` + `logo.png`). It's resolved at **runtime**,
+so one image serves any brand — set `BRAND` per deployment, no rebuild. Every
+brand committed to the repo is baked into the image, and compose also bind-mounts
+the host `brands/` dir (read-only) over it.
+
+To add or change a brand **without rebuilding**:
+
+```bash
+cp -r brands/magickvoice brands/acme    # then edit brands/acme/brand.config.json + logo.png
+echo "BRAND=acme" >> .env               # (or edit the existing BRAND line)
+docker compose --env-file .env up -d    # restart only — no --build needed
+```
+
+An unknown/empty `BRAND` fails closed to the default MagickVoice look rather than
+erroring. See `brands/README.md` for the config schema.
 
 ## 5. Configure Nginx
 
@@ -313,9 +336,13 @@ docker compose logs app --tail=80
 ```
 Common causes: an invalid env value, the build failing to find `.next/standalone` (ensure `output: "standalone"` is in `next.config.ts`), or the host being out of memory during build (use a 4 GB instance or build the image elsewhere and `docker compose pull`).
 
-### Browser shows the old favicon
+### Browser shows the old / wrong favicon
 
-Favicons are cached aggressively. Hard-refresh (Cmd/Ctrl+Shift+R) or open a new tab.
+The favicon is served at runtime from the active brand's logo (`/logo`, wired via
+`metadata.icons`), so it follows `BRAND`. Browsers cache favicons aggressively —
+hard-refresh (Cmd/Ctrl+Shift+R) or open a new tab. If it's showing the default
+MagickVoice mark for a whitelabel, confirm `BRAND` is set and `brands/<id>/logo.png`
+exists (a missing brand logo falls back to the default).
 
 ### Certbot fails to obtain a certificate
 
