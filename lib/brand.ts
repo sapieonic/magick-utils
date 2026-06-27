@@ -66,7 +66,9 @@ function fill(tpl: string, vars: { company: string; name: string }): string {
   return tpl.replace(/\{company\}/g, vars.company).replace(/\{name\}/g, vars.name);
 }
 
-function resolveBrand(id: string, raw: RawObj): Brand {
+/** Merge a raw parsed config over DEFAULT_BRAND. Exported for unit tests; pure
+ *  (no fs/env) — `getBrand()` is the normal entry point. */
+export function resolveBrand(id: string, raw: RawObj): Brand {
   const d = DEFAULT_BRAND;
   const name = str(raw.name, d.name);
   const company = str(raw.company, d.company);
@@ -109,8 +111,9 @@ function resolveBrand(id: string, raw: RawObj): Brand {
 
 // ----- CSS variables -----
 
-/** `#rgb`/`#rrggbb` → `rgba(r, g, b, a)`; passes other strings through. */
-function hexToRgba(hex: string, alpha: number): string {
+/** `#rgb`/`#rrggbb` → `rgba(r, g, b, a)`; passes other strings through.
+ *  Exported for unit tests. */
+export function hexToRgba(hex: string, alpha: number): string {
   let h = hex.trim().replace(/^#/, "");
   if (h.length === 3) h = h.split("").map((c) => c + c).join("");
   if (!/^[0-9a-fA-F]{6}$/.test(h)) return hex;

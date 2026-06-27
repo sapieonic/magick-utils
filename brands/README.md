@@ -56,7 +56,10 @@ default `magickvoice` brand sets it `true`.
 1. `cp -r brands/magickvoice brands/acme`
 2. Edit `brands/acme/brand.config.json` (name, company, colors, copy).
 3. Replace `brands/acme/logo.png` with the brand's logo (also the favicon).
-4. Deploy with `BRAND=acme` set in the environment.
+4. Set `BRAND=acme` in the deployment env and restart.
 5. Point the brand's domain at that deployment (infra side, handled separately).
 
-No code changes are needed to add a brand.
+No code changes are needed to add a brand. Under the shipped Docker setup,
+committed brands are baked into the image and `docker compose` also bind-mounts
+the host `brands/` dir read-only — so steps 1–4 work with a plain restart, no
+`--build`. See `deployment-guide.md` → "Whitelabeling (brand packs)".
