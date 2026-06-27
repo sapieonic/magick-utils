@@ -104,6 +104,30 @@ export interface Job {
   updatedAt: string;
 }
 
+/** One weekday×hour-band cell of the best-time-to-reach matrix (feature 4b).
+ *  `weekday` is UTC `getUTCDay()` (0=Sun…6=Sat); `band` indexes fixed-width
+ *  hour bands (`band * bandHours`–`(band+1) * bandHours`, UTC). A cell with
+ *  `total < minSamples` is flagged `lowSample` and excluded from "best window"
+ *  selection so we never recommend off a handful of records. */
+export interface ReachCell {
+  weekday: number; // 0–6 (UTC)
+  band: number; // 0…(24/bandHours - 1)
+  total: number; // records placed in this window
+  reached: number; // records that were a success (completed / read)
+  rate: number; // reached / total (0 when total is 0)
+  lowSample: boolean; // total < minSamples
+}
+
+/** Answer/read rate bucketed by weekday × hour-band — the basis for the
+ *  best-time-to-reach heatmap and the AI scheduling recommendation. */
+export interface ReachByTimeOfDay {
+  timezone: "UTC"; // v1 buckets in UTC; local-tz conversion is a fast-follow
+  bandHours: number; // hour-band width (default 3 → 8 bands)
+  minSamples: number; // sample gate below which a cell is lowSample
+  totalPlaced: number; // records with a usable timestamp
+  cells: ReachCell[]; // sparse — only weekday×band combos with records
+}
+
 /** Precomputed analytics for a selection, keyed by fingerprint of the batch set. */
 export interface AggregatesDoc {
   tenantId: string;
@@ -122,7 +146,55 @@ export interface AggregatesDoc {
   funnel?: { stage: string; value: number }[];
   volumeOverTime?: { date: string; calls: number; messages: number }[];
   costOverTime?: { date: string; telephony: number; ai: number }[];
+  reachByTimeOfDay?: ReachByTimeOfDay;
   computedAt: string;
+}
+
+/** A signed delta between two scalar metrics. `relative` is the fractional
+ *  change (current−baseline)/baseline, or `null` when baseline is 0 (avoids a
+ *  divide-by-zero / "+∞%" that the UI and LLM must not over-read). */
+export interface MetricDelta {
+  current: number;
+  baseline: number;
+  delta: number; // current − baseline (absolute)
+  relative: number | null; // fractional change, null when baseline is 0
+}
+
+/** A change in one category's share-of-total between baseline and current.
+ *  Shares (not raw counts) so comparisons aren't dominated by differing volume. */
+export interface ShareShift {
+  key: string;
+  currentShare: number; // 0–1
+  baselineShare: number; // 0–1
+  deltaShare: number; // current − baseline (in share)
+}
+
+/** Deterministic diff of two `AggregatesDoc`s (feature 4a). Every number here is
+ *  computed by code so the LLM only ever *explains* the change, never derives it. */
+export interface AggregatesDiff {
+  current: { batchIds: string[]; totalRecords: number };
+  baseline: { batchIds: string[]; totalRecords: number };
+  /** Success rate change in percentage **points** (current−baseline)*100. */
+  successRate: { current: number; baseline: number; deltaPp: number; relative: number | null };
+  spendInr: MetricDelta;
+  telephonyInr: MetricDelta;
+  aiInr: MetricDelta;
+  /** Shift in telephony's share of total spend (the cost-mix change). */
+  costSplit: { currentTelephonyShare: number; baselineTelephonyShare: number; deltaShare: number };
+  volume: MetricDelta; // totalRecords
+  topicShifts: ShareShift[]; // ordered by |deltaShare| desc
+  statusMixShift: ShareShift[];
+  sentimentShift: ShareShift[];
+  /** Present only when both sides are message sets — per funnel stage, value
+   *  delta plus the stage's share-of-Sent (retention) shift. */
+  funnelShifts?: {
+    stage: string;
+    current: number;
+    baseline: number;
+    currentShareOfSent: number;
+    baselineShareOfSent: number;
+    deltaShareOfSent: number;
+  }[];
 }
 
 export interface Anomaly {

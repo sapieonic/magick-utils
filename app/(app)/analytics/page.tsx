@@ -264,7 +264,7 @@ export default function Page() {
       {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
       {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
       {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} />}
-      {tab === "insights" && <InsightsTab model={model} targets={targets} currency={currency} batchIds={ids} />}
+      {tab === "insights" && <InsightsTab key={idsKey} model={model} targets={targets} currency={currency} batchIds={ids} analytics={analytics} />}
 
       {/* Floating toggle — persistent entry point when the panel is closed. */}
       {!chatOpen && (

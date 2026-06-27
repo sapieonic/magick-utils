@@ -389,7 +389,7 @@ describe("streamChat", () => {
     const onDelta = vi.fn();
     const ok = await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
     expect(ok).toBe(true);
-    expect(onDelta.mock.calls.map((c: [string]) => c[0])).toEqual(["Hello", " world"]);
+    expect(onDelta.mock.calls.map((c: string[]) => c[0])).toEqual(["Hello", " world"]);
   });
 
   it("handles frames split across chunk boundaries (buffering)", async () => {
@@ -402,7 +402,7 @@ describe("streamChat", () => {
     const api = await freshApi();
     const onDelta = vi.fn();
     await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
-    expect(onDelta.mock.calls.map((c: [string]) => c[0])).toEqual(["Hi", "!"]);
+    expect(onDelta.mock.calls.map((c: string[]) => c[0])).toEqual(["Hi", "!"]);
   });
 
   it("ignores non-data frames and unparsable/done payloads", async () => {
@@ -421,7 +421,7 @@ describe("streamChat", () => {
     const onDelta = vi.fn();
     const ok = await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
     expect(ok).toBe(true);
-    expect(onDelta.mock.calls.map((c: [string]) => c[0])).toEqual(["A"]);
+    expect(onDelta.mock.calls.map((c: string[]) => c[0])).toEqual(["A"]);
   });
 
   it("POSTs {batchIds,model,message,history}", async () => {
