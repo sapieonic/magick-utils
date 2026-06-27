@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/sapieonic/magick-utils/compare/v1.1.0...v1.2.0) (2026-06-27)
+
+
+### Features
+
+* add runtime whitelabeling via brand packs (BRAND env) ([#17](https://github.com/sapieonic/magick-utils/issues/17)) ([fd276c6](https://github.com/sapieonic/magick-utils/commit/fd276c6da0129f864855e4591bcf44ae08542bf2))
+
 # [1.1.0](https://github.com/sapieonic/magick-utils/compare/v1.0.0...v1.1.0) (2026-06-27)
 
 
