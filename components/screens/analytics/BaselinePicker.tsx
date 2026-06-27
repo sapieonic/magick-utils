@@ -1,7 +1,7 @@
 "use client";
 
 import { Dropdown, Icon, cx } from "@/components/ui";
-import { SEL_LABEL, fmtPct, selType } from "@/lib/data";
+import { fmtPct, selType } from "@/lib/data";
 import type { Batch } from "@/lib/types";
 
 /** Baseline batch picker for Comparative Insights (4a). Candidates are filtered

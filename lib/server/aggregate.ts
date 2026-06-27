@@ -133,9 +133,11 @@ function durationBucket(sec: number): string {
 export const REACH_BAND_HOURS = 3; // 8 bands/day
 export const REACH_MIN_SAMPLES = 20;
 
-/** Whether a status bucket counts as "reached" — identical rule to the
- *  successRate definition below (`completed` for calls, `read` for messages),
- *  so the heatmap and the headline success rate never disagree. */
+/** Whether a status bucket counts as "reached" — the identical rule the
+ *  successRate definition below applies (`completed` for calls, `read` for
+ *  messages), so the heatmap and the headline success rate score outcomes the
+ *  same way. (The heatmap only counts records with a parseable timestamp, so
+ *  its reached-total can trail successRate*total when timestamps are missing.) */
 function isReached(bucket: string): boolean {
   return bucket === "completed" || bucket === "read";
 }
