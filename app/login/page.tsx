@@ -5,6 +5,7 @@ import { Button, Icon, Input, Spinner } from "@/components/ui";
 import { Logo } from "@/components/Logo";
 import { backendStatus, postSession } from "@/lib/api";
 import { isFirebaseConfigured, googleSignIn, emailSignIn } from "@/lib/firebase";
+import { useBrand } from "@/components/brand/BrandProvider";
 
 function GoogleG() {
   return (
@@ -25,6 +26,7 @@ const FEATURES = [
 
 export default function LoginPage() {
   const router = useRouter();
+  const brand = useBrand();
   const [email, setEmail] = useState("");
   const [pwd, setPwd] = useState("");
   const [loading, setLoading] = useState(false);
@@ -71,21 +73,19 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen w-full flex items-stretch">
       {/* left brand panel */}
-      <div className="hidden lg:flex relative w-[44%] flex-col justify-between p-12 overflow-hidden" style={{ background: "radial-gradient(120% 120% at 0% 0%, #1e1b4b 0%, #312e81 38%, #4338ca 100%)" }}>
-        <div className="absolute inset-0 opacity-[0.5]" style={{ backgroundImage: "radial-gradient(circle at 80% 20%, rgba(139,63,214,0.55), transparent 45%), radial-gradient(circle at 15% 85%, rgba(59,130,246,0.45), transparent 45%)" }} />
+      <div className="hidden lg:flex relative w-[44%] flex-col justify-between p-12 overflow-hidden" style={{ background: "var(--login-panel)" }}>
+        <div className="absolute inset-0 opacity-[0.5]" style={{ backgroundImage: "var(--login-glow)" }} />
         <div className="relative">
           <Logo size={44} light />
         </div>
         <div className="relative">
           <div className="text-white/90 text-[34px] font-extrabold leading-[1.12] tracking-tight max-w-md">
-            Turn finished campaigns into{" "}
-            <span className="text-transparent bg-clip-text" style={{ backgroundImage: "linear-gradient(90deg,#c4b5fd,#93c5fd)" }}>
-              decisions.
+            {brand.loginHeadline.lead}
+            <span className="text-transparent bg-clip-text" style={{ backgroundImage: "var(--login-highlight)" }}>
+              {brand.loginHeadline.accent}
             </span>
           </div>
-          <div className="mt-5 text-white/55 text-[15px] max-w-sm leading-relaxed">
-            Download, merge, and analyze your MagickVoice call &amp; messaging campaigns — all in one workspace.
-          </div>
+          <div className="mt-5 text-white/55 text-[15px] max-w-sm leading-relaxed">{brand.loginTagline}</div>
           <div className="mt-9 flex flex-col gap-3">
             {FEATURES.map((f, i) => (
               <div key={i} className="flex items-center gap-3 text-white/80 text-sm">
@@ -97,7 +97,7 @@ export default function LoginPage() {
             ))}
           </div>
         </div>
-        <div className="relative text-white/40 text-xs">© 2026 MagickVoice · SOC 2 Type II · DPDP compliant</div>
+        <div className="relative text-white/40 text-xs">© 2026 {brand.company} · SOC 2 Type II · DPDP compliant</div>
       </div>
 
       {/* right form */}
@@ -107,8 +107,8 @@ export default function LoginPage() {
             <Logo size={42} />
           </div>
           <div className="mb-7">
-            <h1 className="text-[26px] font-extrabold tracking-tight text-slate-900">Sign in to MagickUtils</h1>
-            <p className="text-slate-500 text-sm mt-1.5">Download, merge, and analyze your MagickVoice campaigns.</p>
+            <h1 className="text-[26px] font-extrabold tracking-tight text-slate-900">Sign in to {brand.name}</h1>
+            <p className="text-slate-500 text-sm mt-1.5">{brand.tagline}</p>
           </div>
 
           {error && (
@@ -169,9 +169,14 @@ export default function LoginPage() {
             </div>
           )}
 
-          <p className="mt-6 text-center text-sm text-slate-500">
-            New to MagickVoice? <a className="font-semibold text-[var(--accent-strong)] hover:underline cursor-pointer">Talk to sales</a>
-          </p>
+          {brand.promotions && brand.sales && (
+            <p className="mt-6 text-center text-sm text-slate-500">
+              New to {brand.company}?{" "}
+              <a href={brand.sales.href} className="font-semibold text-[var(--accent-strong)] hover:underline cursor-pointer">
+                {brand.sales.label}
+              </a>
+            </p>
+          )}
         </div>
       </div>
     </div>

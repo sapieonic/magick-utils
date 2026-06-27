@@ -3,6 +3,7 @@ import Image from "next/image";
 import { useRouter, usePathname } from "next/navigation";
 import { Icon, cx } from "@/components/ui";
 import { Logo } from "@/components/Logo";
+import { useBrand } from "@/components/brand/BrandProvider";
 import type { Workspace } from "@/lib/types";
 
 export const NAV = [
@@ -27,6 +28,7 @@ export function Sidebar({
 }) {
   const router = useRouter();
   const pathname = usePathname();
+  const brand = useBrand();
 
   const item = (n: (typeof NAV)[number]) => {
     const active = pathname === n.href;
@@ -64,7 +66,7 @@ export function Sidebar({
         )}
       >
         <div className={cx("h-16 flex items-center border-b border-slate-100 shrink-0", collapsed ? "justify-center px-2" : "px-5")}>
-          {collapsed ? <Image src="/logo.png" alt="MagickUtils" width={34} height={34} style={{ objectFit: "contain" }} /> : <Logo size={36} />}
+          {collapsed ? <Image src="/logo" alt={brand.name} width={34} height={34} unoptimized style={{ objectFit: "contain" }} /> : <Logo size={36} />}
         </div>
 
         <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-1">

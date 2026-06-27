@@ -5,6 +5,7 @@ import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
 import { backendStatus, fetchMe } from "@/lib/api";
 import { useApp } from "@/lib/store";
+import { useBrand } from "@/components/brand/BrandProvider";
 
 const TITLES: Record<string, string> = {
   "/dashboard": "Dashboard",
@@ -17,6 +18,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const { workspace, user, setUser, currency, setCurrency, dateRange, setDateRange, signOut } = useApp();
+  const brand = useBrand();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [ready, setReady] = useState(false);
@@ -69,7 +71,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       <Sidebar workspace={workspace} collapsed={collapsed} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} onSwitch={switchWorkspace} />
       <div className="flex-1 flex flex-col min-w-0 h-full">
         <Topbar
-          title={TITLES[pathname] ?? "MagickUtils"}
+          title={TITLES[pathname] ?? brand.name}
           workspace={workspace}
           user={user}
           currency={currency}
