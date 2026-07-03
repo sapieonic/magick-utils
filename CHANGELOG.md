@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/sapieonic/magick-utils/compare/v1.2.0...v1.2.1) (2026-07-03)
+
+
+### Bug Fixes
+
+* Control insights model from backend ([#18](https://github.com/sapieonic/magick-utils/issues/18)) ([1a3b78f](https://github.com/sapieonic/magick-utils/commit/1a3b78f782c699660bbdeb1931986dfdb91155ed))
+
 # [1.2.0](https://github.com/sapieonic/magick-utils/compare/v1.1.0...v1.2.0) (2026-06-27)
 
 
