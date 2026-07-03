@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
+import { env, isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getInsight, getRecords, setAggregates, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
@@ -38,7 +38,7 @@ export const POST = withLogging("insights", async (req: Request) => {
   if (!ctx) return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
   setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
 
-  let body: { batchIds?: string[]; model?: string; refresh?: boolean };
+  let body: { batchIds?: string[]; refresh?: boolean };
   try {
     body = await req.json();
   } catch {
@@ -46,7 +46,7 @@ export const POST = withLogging("insights", async (req: Request) => {
   }
   const batchIds = (body.batchIds ?? []).filter(Boolean);
   if (batchIds.length === 0) return NextResponse.json({ error: "no_batches" }, { status: 400 });
-  const model = body.model ?? "default";
+  const model = env.llm.model;
   const aggKey = aggregatesKey(batchIds);
   // Insight cache is keyed on the bare batch-set fingerprint so aggregate-shape
   // version bumps don't needlessly invalidate (and re-bill) generated insights.

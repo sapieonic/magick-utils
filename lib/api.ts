@@ -82,13 +82,13 @@ export async function getAnalytics(batchIds: string[], refresh = false): Promise
   return j.aggregates as AggregatesDoc;
 }
 
-export async function generateInsights(batchIds: string[], model: string, refresh = false): Promise<Insight | null> {
+export async function generateInsights(batchIds: string[], refresh = false): Promise<Insight | null> {
   const { llm } = await backendStatus();
   if (!llm) return null;
   const res = await fetch("/api/insights", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ batchIds, model, refresh }),
+    body: JSON.stringify({ batchIds, refresh }),
   });
   if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;
@@ -103,7 +103,6 @@ export async function generateInsights(batchIds: string[], model: string, refres
 export async function compareInsights(
   batchIds: string[],
   baselineBatchIds: string[],
-  model: string,
   refresh = false,
 ): Promise<Insight | null> {
   const { llm } = await backendStatus();
@@ -111,7 +110,7 @@ export async function compareInsights(
   const res = await fetch("/api/insights/compare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ batchIds, baselineBatchIds, model, refresh }),
+    body: JSON.stringify({ batchIds, baselineBatchIds, refresh }),
   });
   if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;
@@ -123,7 +122,6 @@ export async function compareInsights(
  *  (caller should fall back to its simulated response). */
 export async function streamChat(
   batchIds: string[],
-  model: string,
   message: string,
   history: { role: "user" | "assistant"; content: string }[],
   onDelta: (text: string) => void,
@@ -133,7 +131,7 @@ export async function streamChat(
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ batchIds, model, message, history }),
+    body: JSON.stringify({ batchIds, message, history }),
   });
   if (handleSessionExpiry(res)) return false;
   if (!res.ok || !res.body) return false;

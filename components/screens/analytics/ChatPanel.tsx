@@ -12,7 +12,7 @@ type ChatMessage =
   | { role: "user"; text: string }
   // `parts` drives the canned typewriter path; `text` drives the live-streamed
   // plain-text path. Exactly one is populated per assistant message.
-  | { role: "assistant"; parts?: Part[]; text?: string; model: string; streaming: boolean };
+  | { role: "assistant"; parts?: Part[]; text?: string; streaming: boolean };
 
 const SUGGESTIONS = [
   { icon: "TrendingDown", text: "Why did this batch underperform?" },
@@ -41,13 +41,11 @@ const CANNED: { default: Part[] } = {
 };
 
 export function ChatPanel({
-  model,
   targets,
   batchIds,
   open,
   onClose,
 }: {
-  model: string;
   targets: Batch[];
   batchIds: string[];
   open: boolean;
@@ -91,11 +89,11 @@ export function ChatPanel({
     // Optimistically append the user turn + an empty assistant placeholder that
     // onDelta will fill in (live path). The placeholder index is the new length.
     const placeholderIdx = messages.length + 1;
-    setMessages((m: ChatMessage[]) => [...m, userMsg, { role: "assistant", text: "", model, streaming: true }]);
+    setMessages((m: ChatMessage[]) => [...m, userMsg, { role: "assistant", text: "", streaming: true }]);
     setInput("");
     setStreaming(true);
 
-    streamChat(batchIds, model, q, history, (delta) => {
+    streamChat(batchIds, q, history, (delta) => {
       setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: (msg.text ?? "") + delta } : msg)));
     })
       .then((live) => {

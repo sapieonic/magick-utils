@@ -290,12 +290,12 @@ describe("generateInsights", () => {
     const fetchMock = makeFetch({ "/api/health": () => jsonRes(HEALTH_BACKEND_ONLY) });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.generateInsights(["AI-1"], "gpt")).toBeNull();
+    expect(await api.generateInsights(["AI-1"])).toBeNull();
   });
 
-  it("llm on + ok → insight; body {batchIds,model,refresh}", async () => {
+  it("llm on + ok → insight; body {batchIds,refresh}", async () => {
     let captured: RequestInit | undefined;
-    const insight = { key: "k:gpt", narrative: "hi" };
+    const insight = { key: "k", narrative: "hi" };
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/insights": (_u, init) => {
@@ -305,9 +305,9 @@ describe("generateInsights", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    const out = await api.generateInsights(["AI-1"], "deepseek", true);
+    const out = await api.generateInsights(["AI-1"], true);
     expect(out).toEqual(insight);
-    expect(JSON.parse(String(captured?.body))).toEqual({ batchIds: ["AI-1"], model: "deepseek", refresh: true });
+    expect(JSON.parse(String(captured?.body))).toEqual({ batchIds: ["AI-1"], refresh: true });
   });
 
   it("non-ok → null", async () => {
@@ -317,7 +317,28 @@ describe("generateInsights", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.generateInsights(["AI-1"], "gpt")).toBeNull();
+    expect(await api.generateInsights(["AI-1"])).toBeNull();
+  });
+});
+
+// --- compareInsights ------------------------------------------------------
+
+describe("compareInsights", () => {
+  it("llm on + ok → comparison insight; body {batchIds,baselineBatchIds,refresh}", async () => {
+    let captured: RequestInit | undefined;
+    const insight = { key: "k", narrative: "changed" };
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/insights/compare": (_u, init) => {
+        captured = init;
+        return jsonRes({ insight });
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    const out = await api.compareInsights(["AI-1"], ["AI-0"], true);
+    expect(out).toEqual(insight);
+    expect(JSON.parse(String(captured?.body))).toEqual({ batchIds: ["AI-1"], baselineBatchIds: ["AI-0"], refresh: true });
   });
 });
 
@@ -351,7 +372,7 @@ describe("streamChat", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     const onDelta = vi.fn();
-    expect(await api.streamChat(["AI-1"], "gpt", "hello", [], onDelta)).toBe(false);
+    expect(await api.streamChat(["AI-1"], "hello", [], onDelta)).toBe(false);
     expect(onDelta).not.toHaveBeenCalled();
   });
 
@@ -362,7 +383,7 @@ describe("streamChat", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.streamChat(["AI-1"], "gpt", "hi", [], vi.fn())).toBe(false);
+    expect(await api.streamChat(["AI-1"], "hi", [], vi.fn())).toBe(false);
   });
 
   it("no body → false", async () => {
@@ -372,7 +393,7 @@ describe("streamChat", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.streamChat(["AI-1"], "gpt", "hi", [], vi.fn())).toBe(false);
+    expect(await api.streamChat(["AI-1"], "hi", [], vi.fn())).toBe(false);
   });
 
   it("parses SSE data frames, calls onDelta per delta, returns true", async () => {
@@ -387,7 +408,7 @@ describe("streamChat", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     const onDelta = vi.fn();
-    const ok = await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
+    const ok = await api.streamChat(["AI-1"], "hi", [], onDelta);
     expect(ok).toBe(true);
     expect(onDelta.mock.calls.map((c: string[]) => c[0])).toEqual(["Hello", " world"]);
   });
@@ -401,7 +422,7 @@ describe("streamChat", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     const onDelta = vi.fn();
-    await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
+    await api.streamChat(["AI-1"], "hi", [], onDelta);
     expect(onDelta.mock.calls.map((c: string[]) => c[0])).toEqual(["Hi", "!"]);
   });
 
@@ -419,12 +440,12 @@ describe("streamChat", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     const onDelta = vi.fn();
-    const ok = await api.streamChat(["AI-1"], "gpt", "hi", [], onDelta);
+    const ok = await api.streamChat(["AI-1"], "hi", [], onDelta);
     expect(ok).toBe(true);
     expect(onDelta.mock.calls.map((c: string[]) => c[0])).toEqual(["A"]);
   });
 
-  it("POSTs {batchIds,model,message,history}", async () => {
+  it("POSTs {batchIds,message,history}", async () => {
     let captured: RequestInit | undefined;
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
@@ -436,11 +457,10 @@ describe("streamChat", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     const history = [{ role: "user" as const, content: "prev" }];
-    await api.streamChat(["AI-1"], "gpt", "hi", history, vi.fn());
+    await api.streamChat(["AI-1"], "hi", history, vi.fn());
     expect(captured?.method).toBe("POST");
     expect(JSON.parse(String(captured?.body))).toEqual({
       batchIds: ["AI-1"],
-      model: "gpt",
       message: "hi",
       history,
     });

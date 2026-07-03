@@ -13,13 +13,11 @@ import { DeltaGrid } from "./DeltaGrid";
 import { ReachHeatmap } from "./ReachHeatmap";
 
 export function InsightsTab({
-  model,
   targets,
   currency,
   batchIds,
   analytics,
 }: {
-  model: string;
   targets: Batch[];
   currency: Currency;
   batchIds: string[];
@@ -80,7 +78,7 @@ export function InsightsTab({
     const refresh = cmpRefreshRef.current;
     cmpRefreshRef.current = false;
     (async () => {
-      const [agg, ins] = await Promise.all([getAnalytics([baselineId]), compareInsights(batchIds, [baselineId], model, refresh)]);
+      const [agg, ins] = await Promise.all([getAnalytics([baselineId]), compareInsights(batchIds, [baselineId], refresh)]);
       if (!alive) return;
       setBaselineAgg(agg);
       setCmpInsight(ins);
@@ -92,7 +90,7 @@ export function InsightsTab({
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baselineId, idsKey, model, cmpRegen]);
+  }, [baselineId, idsKey, cmpRegen]);
 
   const diff = useMemo(
     () => (analytics && baselineAgg ? diffAggregates(analytics, baselineAgg) : null),
@@ -108,10 +106,10 @@ export function InsightsTab({
     let alive = true;
     setGen("loading");
     setInsight(null);
-    // refresh is forced only by an explicit Regenerate — not by model/selection changes.
+    // refresh is forced only by an explicit Regenerate — not by selection changes.
     const refresh = refreshRef.current;
     refreshRef.current = false;
-    generateInsights(batchIds, model, refresh)
+    generateInsights(batchIds, refresh)
       .then((res) => {
         if (!alive) return;
         setInsight(res); // null when LLM off → fall back to hardcoded block
@@ -127,7 +125,7 @@ export function InsightsTab({
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model, idsKey, regen]);
+  }, [idsKey, regen]);
 
   const name = targets.length === 1 ? targets[0].name : `${targets.length} combined campaigns`;
   const baselineLabel = baselineBatch ? `${baselineBatch.name} (${baselineBatch.batchId})` : "baseline";

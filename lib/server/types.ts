@@ -91,7 +91,7 @@ export interface Job {
    *  tokens / service credentials are an iterate-later concern). */
   idToken?: string;
   batchIds: string[];
-  /** For insights jobs: the selected model. */
+  /** For insights jobs: the backend-configured model. */
   model?: string;
   status: JobStatus;
   total: number;
