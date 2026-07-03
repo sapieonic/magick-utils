@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/server/env", () => ({
+  env: { llm: { model: "backend-model" } },
   isBackendConfigured: vi.fn(),
   isLlmConfigured: vi.fn(),
 }));
@@ -43,6 +44,7 @@ vi.mock("@/lib/server/llm", () => ({ getLLM: () => ({ structured }), INSIGHT_SCH
 import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getBatch, getInsight, getRecords, setInsight } from "@/lib/server/repositories";
+import { compareKey } from "@/lib/server/fingerprint";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 const AGG = { totalRecords: 100, successRate: 0.5, statusMix: [], spendInr: 100, telephonyInr: 60, aiInr: 40, batchIds: ["b"] };
@@ -120,9 +122,10 @@ describe("POST /api/insights/compare", () => {
     vi.mocked(getBatch).mockResolvedValue({ selType: "ai" } as never);
     vi.mocked(getInsight).mockResolvedValue({ narrative: "cached cmp" } as never);
     const { POST } = await import("@/app/api/insights/compare/route");
-    const res = await POST(req(body));
+    const res = await POST(req({ ...body, model: "client-model" }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ insight: { narrative: "cached cmp" }, cached: true });
+    expect(compareKey).toHaveBeenCalledWith(["cur"], ["base"], "backend-model");
     expect(structured).not.toHaveBeenCalled();
   });
 
@@ -145,13 +148,15 @@ describe("POST /api/insights/compare", () => {
     vi.mocked(getAggregates).mockResolvedValue(AGG as never);
     structured.mockResolvedValue({ narrative: "what changed", anomalies: [], recommendations: [{ title: "r", detail: "d" }] });
     const { POST } = await import("@/app/api/insights/compare/route");
-    const res = await POST(req(body));
+    const res = await POST(req({ ...body, model: "client-model" }));
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.cached).toBe(false);
     expect(json.insight.narrative).toBe("what changed");
     expect(json.insight.tenantId).toBe("t1");
     expect(json.insight.key).toBe("compare-key");
+    expect(json.insight.model).toBe("backend-model");
+    expect(compareKey).toHaveBeenCalledWith(["cur"], ["base"], "backend-model");
     expect(setInsight).toHaveBeenCalled();
   });
 

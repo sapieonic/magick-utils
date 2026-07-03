@@ -46,8 +46,8 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
 | `/api/jobs/[id]` | GET | job status/progress (idToken stripped) |
 | `/api/export` | GET/POST `{batchIds,columns}` | streamed CSV from Mongo records (409 if not ingested) |
 | `/api/analytics` | POST `{batchIds,refresh?}` | compute/cache aggregates (409 if not ingested) |
-| `/api/insights` | POST `{batchIds,model,refresh?}` | LLM insight, cached by fingerprint+model |
-| `/api/chat` | POST `{batchIds,model,message,history?}` | SSE-streamed grounded Q&A |
+| `/api/insights` | POST `{batchIds,refresh?}` | LLM insight, cached by fingerprint + configured `LLM_MODEL` |
+| `/api/chat` | POST `{batchIds,message,history?}` | SSE-streamed grounded Q&A |
 | `/api/cron/cleanup` | POST | prune stale data (Bearer `CRON_SECRET`); returns `{deleted}` counts |
 
 Typical flow: log in → pick workspace → `GET /api/campaigns` → `POST /api/ingest` for a selection →
@@ -94,7 +94,7 @@ mock/canned output when the backend/LLM is off.
    curl -s localhost:3000/api/analytics -X POST -H 'Content-Type: application/json' \
         -H 'Cookie: mu_session=...' -d '{"batchIds":["<sourceId>"]}'
    curl -s localhost:3000/api/insights -X POST -H 'Content-Type: application/json' \
-        -H 'Cookie: mu_session=...' -d '{"batchIds":["<sourceId>"],"model":"default"}'
+        -H 'Cookie: mu_session=...' -d '{"batchIds":["<sourceId>"]}'
    curl -s 'localhost:3000/api/export?batchIds=<sourceId>'  -H 'Cookie: mu_session=...'
    ```
    (Everything is read-only against magick-master; only our own Mongo is written.)
@@ -106,5 +106,4 @@ mock/canned output when the backend/LLM is off.
   display id later.
 - `statusSummary` proxy path is best-effort (tolerates 404). Fingerprints currently recompute from
   ingested counts. CSV export requires prior ingestion (no on-the-fly proxy passthrough yet).
-- The UI model selector is passed as a cache-key/echo; the actual provider+model are env-fixed (the
-  openai-compatible adapter can point at DeepSeek/Kimi/OpenRouter via `LLM_BASE_URL`).
+- The provider and model are fully backend-controlled via `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_BASE_URL`.

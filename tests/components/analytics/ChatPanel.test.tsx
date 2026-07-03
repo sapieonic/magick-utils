@@ -20,7 +20,7 @@ const two: Batch[] = [CAMPAIGNS[0], CAMPAIGNS[1]];
 function renderPanel(props: Partial<React.ComponentProps<typeof ChatPanel>> = {}) {
   const onClose = vi.fn();
   const utils = render(
-    <ChatPanel model="claude" targets={one} batchIds={[one[0].id]} open onClose={onClose} {...props} />,
+    <ChatPanel targets={one} batchIds={[one[0].id]} open onClose={onClose} {...props} />,
   );
   return { onClose, ...utils };
 }
@@ -50,7 +50,7 @@ describe("ChatPanel — empty state & suggestions", () => {
   });
 
   it("clicking a suggestion sends it through streamChat with the batch ids and renders both turns", async () => {
-    mockStreamChat.mockImplementation(async (_ids: string[], _model: string, _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Because the dialer was throttled.");
       return true; // live path
     });
@@ -63,7 +63,7 @@ describe("ChatPanel — empty state & suggestions", () => {
     // …and is forwarded with the exact batch ids.
     expect(mockStreamChat).toHaveBeenCalledTimes(1);
     expect(mockStreamChat.mock.calls[0][0]).toEqual(["b_1", "b_2"]);
-    expect(mockStreamChat.mock.calls[0][2]).toBe("What is the best time to call?");
+    expect(mockStreamChat.mock.calls[0][1]).toBe("What is the best time to call?");
 
     // The streamed assistant reply lands.
     await waitFor(() => expect(screen.getByText("Because the dialer was throttled.")).toBeInTheDocument());
@@ -72,7 +72,7 @@ describe("ChatPanel — empty state & suggestions", () => {
 
 describe("ChatPanel — composer", () => {
   it("submits typed input and clears the field", async () => {
-    mockStreamChat.mockImplementation(async (_ids: string[], _model: string, _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Answer.");
       return true;
     });
@@ -101,7 +101,7 @@ describe("ChatPanel — composer", () => {
 
 describe("ChatPanel — clear", () => {
   it("wipes the conversation back to the empty state", async () => {
-    mockStreamChat.mockImplementation(async (_ids: string[], _model: string, _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Settled answer.");
       return true;
     });

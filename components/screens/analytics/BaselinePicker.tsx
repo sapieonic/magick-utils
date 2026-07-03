@@ -6,8 +6,7 @@ import type { Batch } from "@/lib/types";
 
 /** Baseline batch picker for Comparative Insights (4a). Candidates are filtered
  *  to the SAME selType as the current selection (the hard combine/analyze rule),
- *  so an apples-to-oranges comparison is impossible by construction. Mirrors the
- *  ModelSelect dropdown pattern. */
+ *  so an apples-to-oranges comparison is impossible by construction. */
 export function BaselinePicker({
   candidates,
   selectedId,

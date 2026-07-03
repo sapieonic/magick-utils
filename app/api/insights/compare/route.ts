@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
+import { env, isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getBatch, getInsight, getRecords, setAggregates, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
@@ -61,7 +61,7 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   if (!ctx) return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
   setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
 
-  let body: { batchIds?: string[]; baselineBatchIds?: string[]; model?: string; refresh?: boolean };
+  let body: { batchIds?: string[]; baselineBatchIds?: string[]; refresh?: boolean };
   try {
     body = await req.json();
   } catch {
@@ -71,7 +71,7 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   const baselineBatchIds = (body.baselineBatchIds ?? []).filter(Boolean);
   if (batchIds.length === 0) return NextResponse.json({ error: "no_batches" }, { status: 400 });
   if (baselineBatchIds.length === 0) return NextResponse.json({ error: "no_baseline" }, { status: 400 });
-  const model = body.model ?? "default";
+  const model = env.llm.model;
 
   // Server-side selType guard — never trust the client. Recompute from the
   // cached BatchDocs; any cross-type set across the two sides is rejected.

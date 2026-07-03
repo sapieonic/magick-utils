@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/server/env", () => ({
+  env: { llm: { model: "backend-model" } },
   isBackendConfigured: vi.fn(),
   isLlmConfigured: vi.fn(),
 }));
@@ -90,9 +91,10 @@ describe("POST /api/insights", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getInsight).mockResolvedValue({ narrative: "old" } as never);
     const { POST } = await import("@/app/api/insights/route");
-    const res = await POST(req({ batchIds: ["b1"] }));
+    const res = await POST(req({ batchIds: ["b1"], model: "client-model" }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ insight: { narrative: "old" }, cached: true });
+    expect(getInsight).toHaveBeenCalledWith("t1", "a1", "set-key:backend-model");
   });
 
   it("409 not_ingested when no aggregates and no records", async () => {
@@ -120,12 +122,14 @@ describe("POST /api/insights", () => {
       recommendations: [{ title: "r", detail: "d" }],
     });
     const { POST } = await import("@/app/api/insights/route");
-    const res = await POST(req({ batchIds: ["b1"] }));
+    const res = await POST(req({ batchIds: ["b1"], model: "client-model" }));
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.cached).toBe(false);
     expect(json.insight.narrative).toBe("all good");
     expect(json.insight.tenantId).toBe("t1");
+    expect(json.insight.key).toBe("set-key:backend-model");
+    expect(json.insight.model).toBe("backend-model");
     expect(setInsight).toHaveBeenCalled();
   });
 

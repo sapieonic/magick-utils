@@ -59,9 +59,6 @@ export default function Page() {
   // Toggleable AI chat sidebar. Starts closed (a floating "Ask AI" button and a
   // header button surface it); docks beside content on xl, overlays below.
   const [chatOpen, setChatOpen] = useState(false);
-  // Opaque cache key for insights/chat (server picks the actual model via LLM_MODEL).
-  // Not user-selectable and never shown — the analytics UI exposes no model names.
-  const model = "claude";
 
   // ingestion job
   const [ingest, setIngest] = useState(0);
@@ -264,7 +261,7 @@ export default function Page() {
       {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
       {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
       {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} />}
-      {tab === "insights" && <InsightsTab key={idsKey} model={model} targets={targets} currency={currency} batchIds={ids} analytics={analytics} />}
+      {tab === "insights" && <InsightsTab key={idsKey} targets={targets} currency={currency} batchIds={ids} analytics={analytics} />}
 
       {/* Floating toggle — persistent entry point when the panel is closed. */}
       {!chatOpen && (
@@ -280,7 +277,7 @@ export default function Page() {
       )}
 
       {/* Toggleable AI chat sidebar — docks on xl, overlays as a drawer below. */}
-      <ChatPanel model={model} targets={targets} batchIds={ids} open={chatOpen} onClose={() => setChatOpen(false)} />
+      <ChatPanel targets={targets} batchIds={ids} open={chatOpen} onClose={() => setChatOpen(false)} />
     </div>
   );
 }

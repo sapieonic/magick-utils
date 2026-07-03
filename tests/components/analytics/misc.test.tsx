@@ -1,13 +1,10 @@
 // @vitest-environment jsdom
 import { render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 
 import { Legend } from "@/components/screens/analytics/Legend";
 import { Num } from "@/components/screens/analytics/Num";
 import { ChartTip } from "@/components/screens/analytics/ChartTip";
-import { MODELS } from "@/components/screens/analytics/models";
-import { ModelSelect } from "@/components/screens/analytics/ModelSelect";
 
 describe("analytics/Legend", () => {
   it("renders one entry per item with its label and color swatch", () => {
@@ -57,25 +54,5 @@ describe("analytics/ChartTip", () => {
     expect(screen.getByText("calls")).toBeInTheDocument();
     // fmtNum(1234) en-IN grouping + suffix
     expect(screen.getByText(/1,234 records/)).toBeInTheDocument();
-  });
-});
-
-describe("analytics/models + ModelSelect", () => {
-  it("MODELS has the expected ids", () => {
-    expect(MODELS.map((m) => m.id)).toEqual(["claude", "deepseek", "kimi"]);
-  });
-
-  it("shows the selected model name in the trigger", () => {
-    render(<ModelSelect model="deepseek" setModel={() => {}} />);
-    expect(screen.getByText("DeepSeek V3")).toBeInTheDocument();
-  });
-
-  it("opens the menu and calls setModel with the chosen id", async () => {
-    const setModel = vi.fn();
-    render(<ModelSelect model="claude" setModel={setModel} />);
-    // open dropdown via the trigger button
-    await userEvent.click(screen.getByText("Claude Sonnet 4.5"));
-    await userEvent.click(screen.getByText("Kimi K2"));
-    expect(setModel).toHaveBeenCalledWith("kimi");
   });
 });
