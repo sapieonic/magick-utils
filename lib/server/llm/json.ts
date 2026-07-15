@@ -17,6 +17,47 @@ export function stripCodeFences(text: string): string {
   return trimmed;
 }
 
+/**
+ * Extract the first balanced JSON object or array embedded in `text`. Models
+ * sometimes wrap their JSON in prose ("We found ...{...}") or trail commentary
+ * after it, which defeats a bare `JSON.parse`. Scans from the first `{`/`[` and
+ * tracks depth while honouring string literals and escapes so braces inside
+ * strings don't throw off the balance. Returns the substring of the first
+ * complete top-level value, or `null` if none is found.
+ */
+export function extractJsonCandidate(text: string): string | null {
+  const start = text.search(/[{[]/);
+  if (start === -1) return null;
+
+  const open = text[start];
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === open) {
+      depth += 1;
+    } else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+
+  return null;
+}
+
 /** Convert a zod schema to a JSON Schema object for prompting / tool input. */
 export function toJsonSchema(schema: ZodType<unknown>): Record<string, unknown> {
   // zod v4 ships z.toJSONSchema. Target draft-2020-12 and inline refs so the
@@ -53,8 +94,21 @@ export function tryParse<T>(
   try {
     parsed = JSON.parse(cleaned);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, reason: `Output was not valid JSON (${msg}).` };
+    // Direct parse failed — the model may have wrapped the JSON in prose (e.g.
+    // "We found ...{...}") or trailed commentary after it. Try to recover the
+    // first balanced object/array before giving up.
+    const candidate = extractJsonCandidate(cleaned);
+    if (candidate) {
+      try {
+        parsed = JSON.parse(candidate);
+      } catch {
+        // Fall through to the original error below.
+      }
+    }
+    if (parsed === undefined) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, reason: `Output was not valid JSON (${msg}).` };
+    }
   }
   const result = schema.safeParse(parsed);
   if (result.success) return { ok: true, value: result.data };

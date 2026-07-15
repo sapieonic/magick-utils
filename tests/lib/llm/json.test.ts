@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import {
   stripCodeFences,
+  extractJsonCandidate,
   toJsonSchema,
   schemaPrompt,
   formatZodError,
@@ -64,6 +65,51 @@ describe("stripCodeFences", () => {
 
   it("leaves non-JSON plain text untouched (just trimmed) when unfenced", () => {
     expect(stripCodeFences("  hello world  ")).toBe("hello world");
+  });
+});
+
+describe("extractJsonCandidate", () => {
+  it("extracts an object prefixed by prose", () => {
+    // The exact failure from the production logs: a stray word before the JSON.
+    expect(extractJsonCandidate('We{"a":1}')).toBe('{"a":1}');
+  });
+
+  it("extracts an object with trailing commentary", () => {
+    expect(extractJsonCandidate('{"a":1} — hope this helps!')).toBe('{"a":1}');
+  });
+
+  it("extracts an object surrounded by prose on both sides", () => {
+    expect(extractJsonCandidate('Here you go: {"a":1}. Done.')).toBe('{"a":1}');
+  });
+
+  it("extracts a top-level array", () => {
+    expect(extractJsonCandidate("result: [1,2,3] ok")).toBe("[1,2,3]");
+  });
+
+  it("respects nested braces and stops at the matching close", () => {
+    expect(extractJsonCandidate('x {"a":{"b":[1,2]},"c":3} y')).toBe(
+      '{"a":{"b":[1,2]},"c":3}',
+    );
+  });
+
+  it("ignores braces that appear inside string values", () => {
+    expect(extractJsonCandidate('pre {"a":"}{ not real"} post')).toBe(
+      '{"a":"}{ not real"}',
+    );
+  });
+
+  it("handles escaped quotes inside strings", () => {
+    expect(extractJsonCandidate('{"a":"she said \\"hi\\""} tail')).toBe(
+      '{"a":"she said \\"hi\\""}',
+    );
+  });
+
+  it("returns null when there is no object/array delimiter", () => {
+    expect(extractJsonCandidate("just some prose")).toBeNull();
+  });
+
+  it("returns null for an unbalanced (truncated) object", () => {
+    expect(extractJsonCandidate('{"a":1')).toBeNull();
   });
 });
 
@@ -166,6 +212,33 @@ describe("tryParse", () => {
     if (r.ok) return;
     expect(r.reason).toContain("did not match the required schema");
     expect(r.reason).toContain("count:");
+  });
+
+  it("recovers a valid object prefixed with prose (the production 'We{...}' case)", () => {
+    const raw =
+      "We" +
+      JSON.stringify({ name: "n", count: 3, tags: ["x"], severity: "medium" });
+    const r = tryParse(raw, sampleSchema);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value).toEqual({ name: "n", count: 3, tags: ["x"], severity: "medium" });
+  });
+
+  it("recovers a valid object with trailing commentary", () => {
+    const raw =
+      JSON.stringify({ name: "n", count: 1, tags: [], severity: "low" }) +
+      "\n\nLet me know if you need anything else.";
+    const r = tryParse(raw, sampleSchema);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.count).toBe(1);
+  });
+
+  it("still reports 'not valid JSON' when no recoverable object exists", () => {
+    const r = tryParse("there is no json here at all", sampleSchema);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toContain("not valid JSON");
   });
 
   it("parses input wrapped in code fences", () => {
