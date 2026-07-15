@@ -1,3 +1,10 @@
+## [1.2.2](https://github.com/sapieonic/magick-utils/compare/v1.2.1...v1.2.2) (2026-07-15)
+
+
+### Bug Fixes
+
+* Recover JSON from prose-wrapped LLM output ([#19](https://github.com/sapieonic/magick-utils/issues/19)) ([398816a](https://github.com/sapieonic/magick-utils/commit/398816a045ea930194cf9b5b7332e85a2e27b992))
+
 ## [1.2.1](https://github.com/sapieonic/magick-utils/compare/v1.2.0...v1.2.1) (2026-07-03)
 
 
