@@ -54,12 +54,28 @@ describe("GET /api/jobs/[id]", () => {
       status: "running",
       total: 10,
       done: 3,
+      createdAt: "2026-08-12T12:00:00.000Z",
+      updatedAt: "2026-08-12T12:01:00.000Z",
+      cursor: 100,
+      batchIndex: 1,
+      leaseId: "secret-lease",
     } as never);
     const { GET } = await import("@/app/api/jobs/[id]/route");
     const res = await GET(dynReq, params("j1"));
     expect(res.status).toBe(200);
     const json = await res.json();
-    expect(json.idToken).toBeUndefined();
-    expect(json).toMatchObject({ jobId: "j1", status: "running", total: 10, done: 3 });
+    expect(json).toEqual({
+      jobId: "j1",
+      type: "ingest",
+      status: "running",
+      total: 10,
+      done: 3,
+      retryAt: null,
+      retryCount: 0,
+      error: null,
+      result: null,
+      createdAt: "2026-08-12T12:00:00.000Z",
+      updatedAt: "2026-08-12T12:01:00.000Z",
+    });
   });
 });

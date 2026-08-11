@@ -21,13 +21,15 @@ export class MagickApiError extends Error {
   readonly status: number;
   readonly body: string;
   readonly url: string;
+  readonly retryAfterMs: number | null;
 
-  constructor(status: number, body: string, url: string) {
+  constructor(status: number, body: string, url: string, retryAfter: string | null = null) {
     super(`magick-master ${status} for ${url}: ${body.slice(0, 500)}`);
     this.name = "MagickApiError";
     this.status = status;
     this.body = body;
     this.url = url;
+    this.retryAfterMs = parseRetryAfter(retryAfter);
   }
 }
 
@@ -261,6 +263,15 @@ export interface StatsParams {
 
 const PAGE_SIZE = 100;
 
+export function parseRetryAfter(value: string | null, now = Date.now()): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? Math.ceil(seconds * 1000) : null;
+  const date = Date.parse(value);
+  if (Number.isNaN(date)) return null;
+  return Math.max(0, date - now);
+}
+
 function baseUrl(): string {
   if (!isAuthConfigured()) {
     throw new Error(
@@ -324,7 +335,7 @@ async function raw(url: string, headers: Record<string, string>): Promise<Respon
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new MagickApiError(res.status, body, url);
+    throw new MagickApiError(res.status, body, url, res.headers.get("retry-after"));
   }
   return res;
 }
@@ -357,7 +368,7 @@ export async function authSession(idToken: string): Promise<AuthSessionResponse>
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new MagickApiError(res.status, body, url);
+    throw new MagickApiError(res.status, body, url, res.headers.get("retry-after"));
   }
   return (await res.json()) as AuthSessionResponse;
 }

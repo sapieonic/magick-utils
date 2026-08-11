@@ -79,7 +79,7 @@ export interface NormalizedRecord {
 }
 
 export type JobType = "ingest" | "merge" | "insights";
-export type JobStatus = "queued" | "running" | "done" | "error";
+export type JobStatus = "queued" | "running" | "rate_limited" | "done" | "error";
 
 export interface Job {
   jobId: string;
@@ -96,7 +96,12 @@ export interface Job {
   status: JobStatus;
   total: number;
   done: number;
-  cursor?: number; // resumable pagination offset
+  cursor?: number;
+  batchIndex?: number;
+  retryAt?: string | null;
+  retryCount?: number;
+  leaseUntil?: string | null;
+  leaseId?: string | null;
   fingerprint?: string;
   error?: string | null;
   result?: unknown; // e.g. merge → { columns, rowCount }; insights → Insight

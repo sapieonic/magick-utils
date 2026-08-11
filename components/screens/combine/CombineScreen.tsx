@@ -37,15 +37,28 @@ export function CombineScreen() {
   const { currency, combineTargets, setCombineTargets } = useApp();
 
   const [selectedCols, setSelectedCols] = useState<Set<string> | null>(null);
-  const [phase, setPhase] = useState<"build" | "working" | "done">("build");
+  const [phase, setPhase] = useState<"build" | "working" | "done">(() =>
+    typeof window !== "undefined" && sessionStorage.getItem("combineJobId") ? "working" : "build",
+  );
   const [prog, setProg] = useState(0);
   // Start empty — never seed with mock. listCampaigns() supplies mock only when
   // the backend is off; on a live backend mock data never enters this screen.
   const [batches, setBatches] = useState<Batch[]>([]);
   const [loading, setLoading] = useState(true);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() =>
+    typeof window === "undefined" ? null : sessionStorage.getItem("combineJobId"),
+  );
   const [error, setError] = useState<string | null>(null);
+  const [rateLimitRetryAt, setRateLimitRetryAt] = useState<string | null>(null);
   const [mockMode, setMockMode] = useState(false); // confirmed backend-off ⇒ run the simulation
+
+  useEffect(() => {
+    if (jobId) {
+      sessionStorage.setItem("combineJobId", jobId);
+    } else {
+      sessionStorage.removeItem("combineJobId");
+    }
+  }, [jobId]);
 
   // load live batches (falls back to mock automatically when backend is off)
   useEffect(() => {
@@ -110,54 +123,67 @@ export function CombineScreen() {
     return () => clearInterval(iv);
   }, [phase, live, mockMode]);
 
-  // real job polling — runs once a live jobId exists. Capped so a wedged job
-  // (never reaching done/error) surfaces an error instead of polling forever.
   useEffect(() => {
     if (phase !== "working" || !jobId) return;
     let stopped = false;
-    let attempts = 0;
-    const MAX_ATTEMPTS = 600; // ~10 min at 1s
-    const iv = setInterval(async () => {
-      attempts += 1;
-      const job = await getJob(jobId);
-      if (stopped) return;
-      if (job) {
-        setProg(job.total > 0 ? (job.done / job.total) * 100 : 0);
-        if (job.status === "done") {
-          clearInterval(iv);
-          setProg(100);
-          setPhase("done");
-          return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      let delay = 1000;
+      try {
+        const job = await getJob(jobId);
+        if (stopped) return;
+        if (job) {
+          setError(null);
+          setProg((current) => Math.max(current, job.total > 0 ? (job.done / job.total) * 100 : 0));
+          setRateLimitRetryAt(job.status === "rate_limited" ? job.retryAt : null);
+          if (job.status === "done") {
+            setProg(100);
+            setPhase("done");
+            setJobId(null);
+            return;
+          }
+          if (job.status === "error") {
+            setError(job.error || "Merge failed");
+            setJobId(null);
+            return;
+          }
+          if (job.status === "rate_limited" && job.retryAt) {
+            const untilRetry = Date.parse(job.retryAt) - Date.now();
+            delay = Number.isFinite(untilRetry) ? Math.max(1000, Math.min(30_000, untilRetry)) : 3000;
+          }
+        } else {
+          setError("Unable to refresh progress. Retrying automatically…");
+          delay = 3000;
         }
-        if (job.status === "error") {
-          clearInterval(iv);
-          setProg(0);
-          setError(job.error || "Merge failed");
-          return;
-        }
+      } catch {
+        if (!stopped) setError("Unable to refresh progress. Retrying automatically…");
+        delay = 3000;
       }
-      if (attempts >= MAX_ATTEMPTS) {
-        clearInterval(iv);
-        setProg(0);
-        setError("Merge timed out — please try again.");
-      }
-    }, 1000);
+      if (!stopped) timer = setTimeout(poll, delay);
+    };
+    void poll();
     return () => {
       stopped = true;
-      clearInterval(iv);
+      if (timer) clearTimeout(timer);
     };
   }, [phase, jobId]);
 
   const onGenerate = async () => {
     setError(null);
+    setRateLimitRetryAt(null);
     setProg(0);
     setMockMode(false);
     setPhase("working");
     // Resolve the job BEFORE the sim can start: success ⇒ set jobId (poll path);
     // null ⇒ confirmed backend-off ⇒ flip mockMode so the simulation runs.
-    const res = await createIngestJob(campaigns.map((c: Batch) => c.id), "merge");
-    if (res) setJobId(res.jobId);
-    else setMockMode(true);
+    try {
+      const res = await createIngestJob(campaigns.map((c: Batch) => c.id), "merge");
+      if (res) setJobId(res.jobId);
+      else setMockMode(true);
+    } catch {
+      setPhase("build");
+      setError("Unable to schedule merge. Please try again.");
+    }
   };
 
   const reset = () => {
@@ -166,6 +192,7 @@ export function CombineScreen() {
     setJobId(null);
     setMockMode(false);
     setError(null);
+    setRateLimitRetryAt(null);
   };
 
   const removeChip = (id: string) => setCombineTargets(combineTargets.filter((x) => x !== id));
@@ -384,6 +411,15 @@ export function CombineScreen() {
                       status={`${Math.round(prog)}%`}
                       sub={`${fmtNum(rowsDone)} / ${fmtNum(totalRows)} rows merged…`}
                     />
+                    {rateLimitRetryAt && (
+                      <div className="mt-3 flex items-start gap-2 text-[13px] text-amber-700">
+                        <Icon name="Clock3" size={15} className="mt-0.5 shrink-0" />
+                        <span>
+                          Rate limit reached. This job will retry automatically at{" "}
+                          {new Date(rateLimitRetryAt).toLocaleTimeString()}. Keep this page open; no refresh is needed.
+                        </span>
+                      </div>
+                    )}
                     {error && (
                       <div className="mt-3 flex items-start gap-2 text-[13px] text-red-600">
                         <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />

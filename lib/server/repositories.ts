@@ -2,6 +2,7 @@
 // touches a tenant-scoped document filters by tenantId + accountId so data can
 // never leak across tenants. Server-only.
 
+import { randomUUID } from "node:crypto";
 import type { AnyBulkWriteOperation, FindCursor, WithId } from "mongodb";
 import {
   aggregates,
@@ -66,6 +67,15 @@ export async function getBatch(
  * Each record is upserted within the (tenant, account, batch, record) scope so
  * re-ingesting a batch overwrites in place without cross-tenant leakage.
  */
+export async function deleteBatchRecords(
+  tenantId: string,
+  accountId: string,
+  batchId: string
+): Promise<void> {
+  const col = await records();
+  await col.deleteMany({ tenantId, accountId, batchId });
+}
+
 export async function replaceBatchRecords(
   tenantId: string,
   accountId: string,
@@ -168,7 +178,8 @@ export async function updateJob(
 ): Promise<Job | null> {
   const col = await jobs();
   // Never let a caller rewrite the immutable jobId via the patch.
-  const { jobId: _ignored, ...rest } = patch;
+  const rest = { ...patch };
+  delete rest.jobId;
   return col.findOneAndUpdate(
     { jobId },
     { $set: { ...rest, updatedAt: nowIso() } },
@@ -176,16 +187,53 @@ export async function updateJob(
   );
 }
 
-/**
- * Atomically claim the oldest queued job, flipping it to running. Concurrency-
- * safe: findOneAndUpdate is a single atomic op, so two workers can't claim the
- * same job. Returns the claimed (now-running) job, or null if none are queued.
- */
-export async function claimNextJob(): Promise<Job | null> {
+export async function updateClaimedJob(
+  jobId: string,
+  leaseId: string,
+  patch: Partial<Job>
+): Promise<Job | null> {
+  const col = await jobs();
+  const rest = { ...patch };
+  delete rest.jobId;
+  return col.findOneAndUpdate(
+    { jobId, status: "running", leaseId },
+    { $set: { ...rest, updatedAt: nowIso() } },
+    { returnDocument: "after" }
+  );
+}
+
+export async function checkpointJob(
+  jobId: string,
+  leaseId: string,
+  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil">>
+): Promise<Job | null> {
   const col = await jobs();
   return col.findOneAndUpdate(
-    { status: "queued" },
-    { $set: { status: "running", updatedAt: nowIso() } },
+    { jobId, status: "running", leaseId, done: { $lte: patch.done } },
+    { $set: { ...patch, updatedAt: nowIso() } },
+    { returnDocument: "after" }
+  );
+}
+
+/**
+ * Atomically claim the oldest queued or due job, including running work whose
+ * lease expired. findOneAndUpdate prevents concurrent workers claiming it.
+ */
+export async function claimNextJob(leaseMs = 60_000): Promise<Job | null> {
+  const col = await jobs();
+  const now = nowIso();
+  const leaseUntil = new Date(Date.now() + leaseMs).toISOString();
+  const leaseId = randomUUID();
+  return col.findOneAndUpdate(
+    {
+      $or: [
+        { status: "queued" },
+        { status: "rate_limited", retryAt: { $lte: now } },
+        { status: "running", leaseUntil: { $lte: now } },
+        { status: "running", leaseUntil: { $exists: false } },
+      ],
+    },
+    { $set: { status: "running", retryAt: null, leaseUntil, leaseId, updatedAt: now } },
     { sort: { createdAt: 1 }, returnDocument: "after" }
   );
 }
