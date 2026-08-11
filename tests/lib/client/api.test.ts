@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { CAMPAIGNS } from "@/lib/data";
 
 // --- helpers -------------------------------------------------------------
@@ -190,14 +190,14 @@ describe("createIngestJob", () => {
     expect(JSON.parse(String(captured?.body)).type).toBe("ingest");
   });
 
-  it("non-ok → null", async () => {
+  it("non-ok throws instead of silently entering mock mode", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
-      "/api/ingest": () => jsonRes({}, { ok: false, status: 400 }),
+      "/api/ingest": () => jsonRes({}, { ok: false, status: 500 }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.createIngestJob(["AI-1"])).toBeNull();
+    await expect(api.createIngestJob(["AI-1"])).rejects.toThrow("ingest 500");
   });
 });
 

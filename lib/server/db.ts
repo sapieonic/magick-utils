@@ -126,6 +126,7 @@ export async function ensureIndexes(): Promise<void> {
       jobsCol.createIndexes([
         { key: { jobId: 1 }, name: "uniq_jobId", unique: true },
         { key: { status: 1, type: 1 }, name: "status_type" },
+        { key: { status: 1, retryAt: 1, leaseUntil: 1, createdAt: 1 }, name: "status_due_lease_created" },
       ])
     ),
     safeCreateIndexes(() =>

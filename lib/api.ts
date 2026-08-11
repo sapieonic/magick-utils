@@ -4,7 +4,21 @@
 
 import { CAMPAIGNS } from "@/lib/data";
 import type { Batch } from "@/lib/types";
-import type { AggregatesDoc, Insight, Job } from "@/lib/server/types";
+import type { AggregatesDoc, Insight, JobStatus, JobType } from "@/lib/server/types";
+
+export interface JobDto {
+  jobId: string;
+  type: JobType;
+  status: JobStatus;
+  total: number;
+  done: number;
+  retryAt: string | null;
+  retryCount: number;
+  error: string | null;
+  result: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
 
 let _status: { backend: boolean; llm: boolean } | null = null;
 
@@ -57,11 +71,11 @@ export async function createIngestJob(batchIds: string[], type: "ingest" | "merg
     body: JSON.stringify({ batchIds, type }),
   });
   if (handleSessionExpiry(res)) return null;
-  if (!res.ok) return null;
+  if (!res.ok) throw new Error(`ingest ${res.status}`);
   return res.json();
 }
 
-export async function getJob(jobId: string): Promise<Job | null> {
+export async function getJob(jobId: string): Promise<JobDto | null> {
   const res = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
   if (handleSessionExpiry(res)) return null;
   if (!res.ok) return null;

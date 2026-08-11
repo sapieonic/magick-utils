@@ -16,9 +16,18 @@ export const GET = withLogging(
     if (!job || job.tenantId !== ctx.tenantId || job.accountId !== ctx.accountId) {
       return NextResponse.json({ error: "not_found" }, { status: 404 });
     }
-    // never leak the stored idToken
-    const { idToken: _omit, ...safe } = job;
-    void _omit;
-    return NextResponse.json(safe);
+    return NextResponse.json({
+      jobId: job.jobId,
+      type: job.type,
+      status: job.status,
+      total: job.total,
+      done: job.done,
+      retryAt: job.retryAt ?? null,
+      retryCount: job.retryCount ?? 0,
+      error: job.error ?? null,
+      result: job.result ?? null,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    });
   },
 );
