@@ -1,3 +1,10 @@
+## [1.2.3](https://github.com/sapieonic/magick-utils/compare/v1.2.2...v1.2.3) (2026-08-11)
+
+
+### Bug Fixes
+
+* resume jobs after upstream rate limits ([#20](https://github.com/sapieonic/magick-utils/issues/20)) ([be07772](https://github.com/sapieonic/magick-utils/commit/be07772c12222761350d35ceb461871200d050bc))
+
 ## [1.2.2](https://github.com/sapieonic/magick-utils/compare/v1.2.1...v1.2.2) (2026-07-15)
 
 
