@@ -1,3 +1,10 @@
+## [1.2.5](https://github.com/sapieonic/magick-utils/compare/v1.2.4...v1.2.5) (2026-08-12)
+
+
+### Bug Fixes
+
+* Harden ingestion publication flow ([#25](https://github.com/sapieonic/magick-utils/issues/25)) ([9feace7](https://github.com/sapieonic/magick-utils/commit/9feace7195c2345ae196de24a7357b39bd92bee3))
+
 ## [1.2.4](https://github.com/sapieonic/magick-utils/compare/v1.2.3...v1.2.4) (2026-08-12)
 
 
