@@ -18,6 +18,7 @@ const repositories = vi.hoisted(() => ({
   updateClaimedJob: vi.fn(),
 }));
 const client = vi.hoisted(() => ({ listCalls: vi.fn(), listMessages: vi.fn() }));
+const logFns = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 
 vi.mock("@/lib/server/repositories", () => repositories);
 vi.mock("@/lib/server/magick-client", async (importOriginal) => {
@@ -31,7 +32,7 @@ vi.mock("@/lib/server/normalize", () => ({
 }));
 vi.mock("@/lib/server/logger", () => ({
   logger: { info: vi.fn(), error: vi.fn() },
-  log: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  log: () => logFns,
 }));
 vi.mock("@/lib/server/observability/request-context", () => ({ runWithRequestContext: vi.fn() }));
 
@@ -271,11 +272,54 @@ describe("processJob resume", () => {
 
   it("stops before fetching when a newer worker owns the batch", async () => {
     repositories.beginBatchIngestion.mockResolvedValueOnce(false);
+    repositories.getBatch
+      .mockResolvedValueOnce(batch("b1"))
+      .mockResolvedValueOnce({
+        ...batch("b1"),
+        ingestJobId: "newer-job",
+        ingestLeaseId: "newer-lease",
+        ingestLeaseUntil: "2099-01-01T00:00:00.000Z",
+      });
 
     await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(
       "newer worker owns batch ingestion",
     );
     expect(client.listCalls).not.toHaveBeenCalled();
+    expect(repositories.getBatch).toHaveBeenCalledTimes(2);
+    expect(logFns.warn).toHaveBeenCalledWith(
+      {
+        batchId: "b1",
+        ingestJobId: "newer-job",
+        ingestLeaseId: "newer-lease",
+        ingestLeaseUntil: "2099-01-01T00:00:00.000Z",
+      },
+      "[worker] batch ingestion ownership lost",
+    );
+  });
+
+  it("logs the snapshot ownership when a re-read after denial fails", async () => {
+    repositories.beginBatchIngestion.mockResolvedValueOnce(false);
+    repositories.getBatch
+      .mockResolvedValueOnce({
+        ...batch("b1"),
+        ingestJobId: "old-job",
+        ingestLeaseId: "old-lease",
+        ingestLeaseUntil: "2026-08-12T12:00:00.000Z",
+      })
+      .mockRejectedValueOnce(new Error("mongo down"));
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(
+      "newer worker owns batch ingestion",
+    );
+    expect(logFns.warn).toHaveBeenCalledWith(
+      {
+        batchId: "b1",
+        ingestJobId: "old-job",
+        ingestLeaseId: "old-lease",
+        ingestLeaseUntil: "2026-08-12T12:00:00.000Z",
+      },
+      "[worker] batch ingestion ownership lost",
+    );
   });
 });
 
