@@ -87,7 +87,7 @@ describe("Checkbox", () => {
     expect(container.querySelector("svg")).toBeInTheDocument();
   });
 
-  // The clickable target is the box span (it carries the onClick), not the label text.
+  // The visual box is nested in the native checkbox label.
   const box = (container: HTMLElement) => container.querySelector("label > span")! as HTMLElement;
 
   it("fires onChange with the toggled value when clicked", async () => {
@@ -109,6 +109,15 @@ describe("Checkbox", () => {
     const { container } = render(<Checkbox disabled onChange={onChange} label="pick me" />);
     await userEvent.click(box(container));
     expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("is exposed as a native keyboard-operable checkbox", async () => {
+    const onChange = vi.fn();
+    render(<Checkbox checked={false} onChange={onChange} label="Keyboard selection" />);
+    const input = screen.getByRole("checkbox", { name: "Keyboard selection" });
+    input.focus();
+    await userEvent.keyboard(" ");
+    expect(onChange).toHaveBeenCalledWith(true);
   });
 
   it("indeterminate (unchecked) renders neither check nor crash", () => {

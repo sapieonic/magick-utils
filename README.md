@@ -70,7 +70,7 @@ Copy `.env.example` → `.env.local` and fill in:
 
 - `MAGICK_MASTER_BASE_URL`, `SESSION_SECRET` (≥32 chars) — auth
 - `MONGODB_URI` — durable state
-- `LLM_API_KEY`, `LLM_MODEL`, (optional) `LLM_BASE_URL` — insights / chat
+- `LLM_API_KEY`, `LLM_MODEL`, (optional) `LLM_BASE_URL`, `LLM_PROJECT_ID` — insights / chat
 - `NEXT_PUBLIC_FIREBASE_*` — web login config
 - `CRON_SECRET` — shared secret guarding the scheduled cleanup endpoint (see below)
 

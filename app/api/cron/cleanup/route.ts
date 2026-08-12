@@ -4,6 +4,7 @@ import { env, isBackendConfigured, isCronConfigured } from "@/lib/server/env";
 import {
   deleteAggregatesOlderThan,
   deleteInsightsOlderThan,
+  deleteRetiredRecordRevisionsOlderThan,
   deleteTerminalJobsOlderThan,
 } from "@/lib/server/repositories";
 import { withLogging } from "@/lib/server/http-log";
@@ -19,6 +20,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const AGGREGATES_RETENTION_DAYS = 7; // recomputed on the next analytics request
 const JOBS_RETENTION_DAYS = 1; // done/error jobs are just history once polled
 const INSIGHTS_RETENTION_DAYS = 30; // regen costs an LLM call, so keep longer
+const RETIRED_RECORD_REVISION_RETENTION_DAYS = 1; // grace for in-flight CSV/read cursors
 
 /** Constant-time Bearer-token check against CRON_SECRET. */
 function isAuthorized(req: Request): boolean {
@@ -49,12 +51,13 @@ export const POST = withLogging("cron/cleanup", async (req: Request) => {
   const now = Date.now();
   const cutoff = (days: number) => new Date(now - days * DAY_MS).toISOString();
 
-  const [aggregates, jobs, insights] = await Promise.all([
+  const [aggregates, jobs, insights, recordRevisions] = await Promise.all([
     deleteAggregatesOlderThan(cutoff(AGGREGATES_RETENTION_DAYS)),
     deleteTerminalJobsOlderThan(cutoff(JOBS_RETENTION_DAYS)),
     deleteInsightsOlderThan(cutoff(INSIGHTS_RETENTION_DAYS)),
+    deleteRetiredRecordRevisionsOlderThan(new Date(now - RETIRED_RECORD_REVISION_RETENTION_DAYS * DAY_MS)),
   ]);
 
-  log().info({ deleted: { aggregates, jobs, insights } }, "cron cleanup pruned stale data");
-  return NextResponse.json({ ok: true, deleted: { aggregates, jobs, insights } });
+  log().info({ deleted: { aggregates, jobs, insights, recordRevisions } }, "cron cleanup pruned stale data");
+  return NextResponse.json({ ok: true, deleted: { aggregates, jobs, insights, recordRevisions } });
 });

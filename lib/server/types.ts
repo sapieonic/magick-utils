@@ -32,7 +32,16 @@ export interface BatchDoc {
   avgDuration: number | null;
   avgTalkTime: number | null;
   fingerprint: string; // changes when a running batch's counts change
+  /** Revision of the upstream bulk-job summary, distinct from the committed
+   * normalized dataset fingerprint above. */
+  sourceFingerprint?: string;
+  /** Immutable record revision currently visible to readers. Older documents
+   * without this field use the legacy unversioned record set. */
+  publishedRevision?: string;
   ingestStatus: "none" | "ingesting" | "ready" | "error";
+  /** Current worker ownership, used for conditional revision publication. */
+  ingestJobId?: string;
+  ingestLeaseId?: string;
   updatedAt: string;
 }
 
@@ -42,6 +51,12 @@ export interface NormalizedRecord {
   tenantId: string;
   accountId: string;
   batchId: string;
+  /** Staging/publication revision. Missing only on legacy records. */
+  revision?: string;
+  /** Creation time for grace-period cleanup of retired immutable revisions. */
+  revisionCreatedAt?: Date;
+  /** Set only after a newer revision is published; GC never targets staging. */
+  retiredAt?: Date;
   fingerprint: string;
   recordId: string; // call_id or message_id
   selType: SelType;
@@ -50,6 +65,12 @@ export interface NormalizedRecord {
   recipientEmail?: string | null;
   status: StatusKey | string;
   outcome?: string | null;
+  /** Timestamp at which the outbound activity was placed/sent. Analytics use
+   *  this rather than completion/read time so volume and reach windows reflect
+   *  when the customer actually initiated contact. */
+  activityTimestamp?: string | null;
+  /** Indexed canonical activity instant used by dashboard range queries. */
+  activityDate?: Date | null;
   timestamp?: string | null;
   provider?: string | null;
   totalCostInr?: number | null;
@@ -109,6 +130,26 @@ export interface Job {
   updatedAt: string;
 }
 
+/** Unique batch-scoped admission lock preventing overlapping ingestion jobs. */
+export interface IngestionLock {
+  tenantId: string;
+  accountId: string;
+  batchId: string;
+  jobId: string;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+export interface AiUsageWindow {
+  key: string;
+  tenantId: string;
+  accountId: string;
+  kind: "chat" | "insight" | "comparison";
+  count: number;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
 /** One weekday×hour-band cell of the best-time-to-reach matrix (feature 4b).
  *  `weekday` is UTC `getUTCDay()` (0=Sun…6=Sat); `band` indexes fixed-width
  *  hour bands (`band * bandHours`–`(band+1) * bandHours`, UTC). A cell with
@@ -131,6 +172,22 @@ export interface ReachByTimeOfDay {
   minSamples: number; // sample gate below which a cell is lowSample
   totalPlaced: number; // records with a usable timestamp
   cells: ReachCell[]; // sparse — only weekday×band combos with records
+}
+
+export interface DashboardVolume {
+  timezone: "UTC";
+  range: string;
+  start: string | null;
+  end: string;
+  totalRecords: number;
+  totalCalls: number;
+  totalMessages: number;
+  successRate: number;
+  spendInr: number;
+  telephonyInr: number;
+  aiInr: number;
+  statusMix: { key: string; value: number }[];
+  points: { date: string; calls: number; messages: number }[];
 }
 
 /** Precomputed analytics for a selection, keyed by fingerprint of the batch set. */

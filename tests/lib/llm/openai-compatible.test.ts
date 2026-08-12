@@ -4,11 +4,14 @@ import { z } from "zod";
 // Shared mock for the OpenAI chat.completions.create method. Each test sets its
 // queued responses; the mock returns them in order.
 const createMock = vi.fn();
+const clientConfigMock = vi.fn();
 
 vi.mock("openai", () => ({
   default: class MockOpenAI {
     chat = { completions: { create: createMock } };
-    constructor(_cfg: unknown) {}
+    constructor(config: unknown) {
+      clientConfigMock(config);
+    }
   },
 }));
 
@@ -31,6 +34,32 @@ function makeProvider() {
 
 beforeEach(() => {
   createMock.mockReset();
+  clientConfigMock.mockReset();
+});
+
+describe("OpenAICompatibleProvider configuration", () => {
+  it("sends an optional project id using the OpenAI-Project header", () => {
+    new OpenAICompatibleProvider({
+      apiKey: "sk-test",
+      baseUrl: "https://bedrock-mantle.ap-south-1.api.aws/v1",
+      model: "openai.gpt-oss-120b",
+      projectId: "proj_test",
+    });
+
+    expect(clientConfigMock).toHaveBeenCalledWith({
+      apiKey: "sk-test",
+      baseURL: "https://bedrock-mantle.ap-south-1.api.aws/v1",
+      defaultHeaders: { "OpenAI-Project": "proj_test" },
+    });
+  });
+
+  it("does not send an empty project header", () => {
+    makeProvider();
+
+    expect(clientConfigMock).toHaveBeenCalledWith(
+      expect.objectContaining({ defaultHeaders: undefined }),
+    );
+  });
 });
 
 describe("OpenAICompatibleProvider.structured", () => {

@@ -2,12 +2,11 @@
 // Shared UI primitives — ported from the handoff components.jsx.
 import {
   useEffect,
-  useMemo,
+  useId,
   useRef,
   useState,
   type CSSProperties,
   type InputHTMLAttributes,
-  type MouseEvent,
   type ReactNode,
 } from "react";
 import {
@@ -203,7 +202,7 @@ export function StatusStackBar({ breakdown, width = 130, height = 8, showLegend 
 
 // ---------- Sparkline ----------
 export function Sparkline({ data, color = "var(--accent)", width = 96, height = 34 }: { data: { i: number; v: number }[]; color?: string; width?: number; height?: number }) {
-  const id = useMemo(() => "sp" + Math.random().toString(36).slice(2, 8), []);
+  const id = `sp-${useId().replace(/:/g, "")}`;
   return (
     <div style={{ width, height }}>
       <ResponsiveContainer width="100%" height="100%">
@@ -334,7 +333,7 @@ export function Modal({ open, onClose, title, subtitle, icon, children, footer, 
               <div className="text-[17px] font-bold text-slate-900">{title}</div>
               {subtitle && <div className="text-[13px] text-slate-400 mt-0.5">{subtitle}</div>}
             </div>
-            <button onClick={onClose} className="text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg p-1.5 -mt-1 -mr-1.5 transition-colors">
+            <button onClick={onClose} aria-label="Close dialog" className="text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg p-1.5 -mt-1 -mr-1.5 transition-colors">
               <Icon name="X" size={18} />
             </button>
           </div>
@@ -347,20 +346,25 @@ export function Modal({ open, onClose, title, subtitle, icon, children, footer, 
 }
 
 // ---------- Checkbox ----------
-export function Checkbox({ checked, indeterminate, onChange, label, sub, className, disabled, title }: { checked?: boolean; indeterminate?: boolean; onChange?: (v: boolean) => void; label?: ReactNode; sub?: ReactNode; className?: string; disabled?: boolean; title?: string }) {
+export function Checkbox({ checked, indeterminate, onChange, label, sub, className, disabled, title, ariaLabel }: { checked?: boolean; indeterminate?: boolean; onChange?: (v: boolean) => void; label?: ReactNode; sub?: ReactNode; className?: string; disabled?: boolean; title?: string; ariaLabel?: string }) {
   const ref = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
     if (ref.current) ref.current.indeterminate = !!indeterminate && !checked;
   }, [indeterminate, checked]);
   return (
     <label title={title} className={cx("flex items-start gap-2.5 select-none group", disabled ? "cursor-not-allowed opacity-40" : "cursor-pointer", className)}>
+      <input
+        ref={ref}
+        type="checkbox"
+        className="sr-only"
+        checked={Boolean(checked)}
+        disabled={disabled}
+        aria-label={ariaLabel ?? (typeof label === "string" ? label : "Select row")}
+        onChange={(event) => onChange?.(event.target.checked)}
+      />
       <span
-        onClick={(e: MouseEvent<HTMLSpanElement>) => {
-          e.preventDefault();
-          if (!disabled) onChange && onChange(!checked);
-        }}
         className={cx(
-          "mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[6px] border transition-all",
+          "mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[6px] border transition-all group-focus-within:ring-2 group-focus-within:ring-[var(--accent-ring)]",
           checked || indeterminate ? "border-transparent text-white" : "border-slate-300 bg-white",
           !disabled && !(checked || indeterminate) && "group-hover:border-slate-400",
         )}

@@ -49,6 +49,9 @@ export interface Batch {
   aiInr: number;
   avgDuration: number | null;
   avgTalkTime: number | null;
+  /** Whether normalized records are ready for analytics/export. Live batches
+   *  carry this value; seeded demo batches omit it. */
+  ingestStatus?: "none" | "ingesting" | "ready" | "error";
 }
 
 export interface Workspace {

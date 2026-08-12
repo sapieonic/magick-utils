@@ -25,13 +25,18 @@ export function getLLM(): LLMProvider {
     );
   }
 
-  const { provider, model, baseUrl, apiKey } = env.llm;
+  const { provider, model, baseUrl, apiKey, projectId } = env.llm;
 
   switch (provider) {
     case "anthropic":
       return new AnthropicProvider({ apiKey, model, baseUrl });
     case "openai-compatible":
-      return new OpenAICompatibleProvider({ apiKey, model, baseUrl });
+      return new OpenAICompatibleProvider({
+        apiKey,
+        model,
+        baseUrl,
+        projectId,
+      });
     default: {
       // Exhaustiveness guard — surfaces a clear error if a new provider value
       // is added to env without a matching adapter.

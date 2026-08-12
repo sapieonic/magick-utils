@@ -12,12 +12,14 @@ vi.mock("@/lib/server/repositories", () => ({
   deleteAggregatesOlderThan: vi.fn().mockResolvedValue(2),
   deleteTerminalJobsOlderThan: vi.fn().mockResolvedValue(3),
   deleteInsightsOlderThan: vi.fn().mockResolvedValue(1),
+  deleteRetiredRecordRevisionsOlderThan: vi.fn().mockResolvedValue(4),
 }));
 
 import { isBackendConfigured, isCronConfigured } from "@/lib/server/env";
 import {
   deleteAggregatesOlderThan,
   deleteInsightsOlderThan,
+  deleteRetiredRecordRevisionsOlderThan,
   deleteTerminalJobsOlderThan,
 } from "@/lib/server/repositories";
 
@@ -65,7 +67,7 @@ describe("POST /api/cron/cleanup", () => {
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({
       ok: true,
-      deleted: { aggregates: 2, jobs: 3, insights: 1 },
+      deleted: { aggregates: 2, jobs: 3, insights: 1, recordRevisions: 4 },
     });
     // each pruner is called once with an ISO cutoff in the past
     for (const fn of [
@@ -77,5 +79,7 @@ describe("POST /api/cron/cleanup", () => {
       const cutoff = vi.mocked(fn).mock.calls[0][0];
       expect(new Date(cutoff).getTime()).toBeLessThan(Date.now());
     }
+    expect(deleteRetiredRecordRevisionsOlderThan).toHaveBeenCalledTimes(1);
+    expect(deleteRetiredRecordRevisionsOlderThan).toHaveBeenCalledWith(expect.any(Date));
   });
 });

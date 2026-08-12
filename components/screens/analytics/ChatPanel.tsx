@@ -4,15 +4,10 @@ import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "r
 import { Button, Icon, cx } from "@/components/ui";
 import { streamChat } from "@/lib/api";
 import type { Batch } from "@/lib/types";
-import { Num } from "./Num";
-
-type Part = { t: string; num?: boolean; tone?: "good" | "bad" };
 
 type ChatMessage =
   | { role: "user"; text: string }
-  // `parts` drives the canned typewriter path; `text` drives the live-streamed
-  // plain-text path. Exactly one is populated per assistant message.
-  | { role: "assistant"; parts?: Part[]; text?: string; streaming: boolean };
+  | { role: "assistant"; text: string; streaming: boolean };
 
 const SUGGESTIONS = [
   { icon: "TrendingDown", text: "Why did this batch underperform?" },
@@ -20,25 +15,6 @@ const SUGGESTIONS = [
   { icon: "MessageSquareWarning", text: "Summarize the negative conversations" },
   { icon: "Wallet", text: "How can I cut cost without losing connect rate?" },
 ];
-
-const CANNED: { default: Part[] } = {
-  default: [
-    { t: "Two things held this batch back. " },
-    { t: "First, " },
-    { t: "no-answer rate", num: true, tone: "bad" },
-    { t: " hit " },
-    { t: "38%", num: true, tone: "bad" },
-    { t: " on Day 4 (vs a " },
-    { t: "61%", num: true },
-    { t: " baseline) — a dialer throttle in the 3–5pm slot. Second, " },
-    { t: "312 calls", num: true, tone: "bad" },
-    { t: " were tagged “wrong amount”, 2.4× the usual share, dragging sentiment to " },
-    { t: "19% negative", num: true, tone: "bad" },
-    { t: ". Fixing the dunning sync and shifting dials to the " },
-    { t: "11am–1pm", num: true, tone: "good" },
-    { t: " window should recover most of the gap." },
-  ],
-};
 
 export function ChatPanel({
   targets,
@@ -84,7 +60,7 @@ export function ChatPanel({
     const history = messages.map((msg: ChatMessage) =>
       msg.role === "user"
         ? { role: "user" as const, content: msg.text }
-        : { role: "assistant" as const, content: msg.text ?? (msg.parts ?? []).map((p: Part) => p.t).join("") },
+        : { role: "assistant" as const, content: msg.text },
     );
     // Optimistically append the user turn + an empty assistant placeholder that
     // onDelta will fill in (live path). The placeholder index is the new length.
@@ -97,14 +73,9 @@ export function ChatPanel({
       setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: (msg.text ?? "") + delta } : msg)));
     })
       .then((live) => {
-        if (live) {
-          // Live path done: mark the streamed message as settled.
-          setStreaming(false);
-          setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
-        } else {
-          // LLM off → replace the placeholder with the canned typewriter message.
-          setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, text: undefined, parts: CANNED.default } : msg)));
-        }
+        if (!live) throw new Error("The campaign assistant is unavailable. No demo answer is being substituted.");
+        setStreaming(false);
+        setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === placeholderIdx && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
       })
       .catch(() => {
         // Network/stream error mid-flight: settle gracefully so input re-enables
@@ -113,16 +84,17 @@ export function ChatPanel({
         setMessages((m: ChatMessage[]) =>
           m.map((msg: ChatMessage, i: number) =>
             i === placeholderIdx && msg.role === "assistant"
-              ? { ...msg, streaming: false, text: msg.text && msg.text.length ? msg.text : "Sorry — I couldn't reach the assistant. Please try again." }
+              ? {
+                  ...msg,
+                  streaming: false,
+                  text: msg.text && msg.text.length
+                    ? `${msg.text}\n\n[Response interrupted before completion. Please retry.]`
+                    : "Sorry — I couldn't reach the assistant. Please try again.",
+                }
               : msg,
           ),
         );
       });
-  };
-
-  const onStreamDone = () => {
-    setStreaming(false);
-    setMessages((m: ChatMessage[]) => m.map((msg: ChatMessage, i: number) => (i === m.length - 1 && msg.role === "assistant" ? { ...msg, streaming: false } : msg)));
   };
 
   return (
@@ -216,18 +188,10 @@ export function ChatPanel({
                       <Icon name="Sparkles" size={14} />
                     </span>
                     <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-slate-200 bg-white px-3.5 py-2.5 text-[13.5px] leading-relaxed text-slate-600">
-                      {msg.parts ? (
-                        msg.streaming ? (
-                          <StreamParts parts={msg.parts} onDone={onStreamDone} />
-                        ) : (
-                          <RenderParts parts={msg.parts} />
-                        )
-                      ) : (
-                        <span className="whitespace-pre-wrap">
-                          {msg.text}
-                          {msg.streaming && <span className="caret" />}
-                        </span>
-                      )}
+                      <span className="whitespace-pre-wrap">
+                        {msg.text}
+                        {msg.streaming && <span className="caret" />}
+                      </span>
                     </div>
                   </div>
                 ),
@@ -262,33 +226,5 @@ export function ChatPanel({
         </div>
       </aside>
     </>
-  );
-}
-
-function RenderParts({ parts }: { parts: Part[] }) {
-  return (
-    <span>
-      {parts.map((p, i) => (p.num ? <Num key={i} tone={p.tone}>{p.t}</Num> : <span key={i}>{p.t}</span>))}
-    </span>
-  );
-}
-
-export function StreamParts({ parts, onDone }: { parts: Part[]; onDone?: () => void }) {
-  const [n, setN] = useState(0);
-  useEffect(() => {
-    if (n >= parts.length) {
-      onDone && onDone();
-      return;
-    }
-    const t = setTimeout(() => setN(n + 1), 90 + Math.random() * 110);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [n, parts.length]);
-  const shown = parts.slice(0, n);
-  return (
-    <span>
-      {shown.map((p, i) => (p.num ? <Num key={i} tone={p.tone}>{p.t}</Num> : <span key={i}>{p.t}</span>))}
-      {n < parts.length && <span className="caret" />}
-    </span>
   );
 }

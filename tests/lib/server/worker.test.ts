@@ -3,9 +3,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const repositories = vi.hoisted(() => ({
   checkpointJob: vi.fn(),
   claimNextJob: vi.fn(),
-  deleteBatchRecords: vi.fn(),
+  deleteBatchRevisionRecords: vi.fn(),
+  deleteUnpublishedBatchRevision: vi.fn(),
+  failBatchIfOwned: vi.fn(),
   getBatch: vi.fn(),
-  getRecords: vi.fn(),
+  getRecordsForRevision: vi.fn(),
+  publishBatchIfOwned: vi.fn(),
+  releaseIngestionLocks: vi.fn(),
+  renewIngestionLocks: vi.fn(),
+  retireBatchRevision: vi.fn(),
   replaceBatchRecords: vi.fn(),
   updateClaimedJob: vi.fn(),
   upsertBatch: vi.fn(),
@@ -55,7 +61,7 @@ const batch = (batchId: string) => ({
   batchId,
   sourceId: `source-${batchId}`,
   selType: "ai",
-  total: 200,
+  total: 1,
   fingerprint: "fp",
 });
 
@@ -63,9 +69,15 @@ beforeEach(() => {
   vi.clearAllMocks();
   repositories.checkpointJob.mockResolvedValue(job());
   repositories.updateClaimedJob.mockResolvedValue(job());
-  repositories.deleteBatchRecords.mockResolvedValue(undefined);
+  repositories.deleteBatchRevisionRecords.mockResolvedValue(undefined);
+  repositories.deleteUnpublishedBatchRevision.mockResolvedValue(undefined);
   repositories.getBatch.mockImplementation((_t, _a, id) => Promise.resolve(batch(id)));
-  repositories.getRecords.mockResolvedValue([]);
+  repositories.failBatchIfOwned.mockResolvedValue(undefined);
+  repositories.getRecordsForRevision.mockResolvedValue([{ recordId: "1", status: "done" }]);
+  repositories.publishBatchIfOwned.mockResolvedValue(true);
+  repositories.releaseIngestionLocks.mockResolvedValue(undefined);
+  repositories.renewIngestionLocks.mockResolvedValue(undefined);
+  repositories.retireBatchRevision.mockResolvedValue(undefined);
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
   repositories.upsertBatch.mockResolvedValue(undefined);
 });
@@ -73,13 +85,17 @@ beforeEach(() => {
 describe("processJob resume", () => {
   it("resumes at the durable offset and derives progress without double counting", async () => {
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "101" }], total: 101 });
+    repositories.getRecordsForRevision.mockResolvedValue(
+      Array.from({ length: 101 }, (_, index) => ({ recordId: String(index + 1), status: "done" })),
+    );
     await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 101 }));
 
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 100 });
-    expect(repositories.deleteBatchRecords).not.toHaveBeenCalled();
+    expect(repositories.deleteBatchRevisionRecords).not.toHaveBeenCalled();
     expect(repositories.replaceBatchRecords).toHaveBeenCalledTimes(1);
     expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({ done: 101, cursor: 101, batchIndex: 0 }));
-    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(2, "j1", "lease-1", { done: 101, cursor: 0, batchIndex: 1 });
+    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(2, "j1", "lease-1", expect.objectContaining({ done: 101, cursor: 101, batchIndex: 0 }));
+    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(3, "j1", "lease-1", { done: 101, cursor: 0, batchIndex: 1 });
     expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({ status: "done", done: 101 }));
   });
 
@@ -89,7 +105,7 @@ describe("processJob resume", () => {
     expect(repositories.getBatch).toHaveBeenCalledTimes(1);
     expect(repositories.getBatch).toHaveBeenCalledWith("t1", "a1", "b2");
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b2", limit: 100, offset: 0 });
-    expect(repositories.deleteBatchRecords).toHaveBeenCalledWith("t1", "a1", "b2");
+    expect(repositories.deleteBatchRevisionRecords).toHaveBeenCalledWith("t1", "a1", "b2", "j1");
     expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({ done: 101 }));
   });
 
@@ -98,6 +114,38 @@ describe("processJob resume", () => {
     repositories.checkpointJob.mockResolvedValueOnce(null);
     await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow("job lease lost while checkpointing");
     expect(repositories.updateClaimedJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects a premature empty page instead of publishing a truncated dataset", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 100 });
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 100 });
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 100 }))).rejects.toThrow(
+      "received 0 of 100",
+    );
+    expect(repositories.getRecordsForRevision).not.toHaveBeenCalled();
+    expect(repositories.upsertBatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ ingestStatus: "ready" }),
+    );
+  });
+
+  it("publishes only when the unique staged-record count matches the upstream total", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 2 });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "dup" }, { id: "dup" }], total: 2 });
+    repositories.getRecordsForRevision.mockResolvedValue([{ recordId: "dup", status: "done" }]);
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 2 }))).rejects.toThrow(
+      "stored 1 of 2",
+    );
+  });
+
+  it("does not publish after another worker replaces the batch lease owner", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+    repositories.publishBatchIfOwned.mockResolvedValueOnce(false);
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(
+      "lease lost during batch publication",
+    );
   });
 });
 
@@ -121,5 +169,14 @@ describe("runClaimedJob 429", () => {
     client.listCalls.mockRejectedValueOnce(new MagickApiError(429, "limited", "url", "1"));
     repositories.updateClaimedJob.mockResolvedValueOnce(null);
     await expect(runClaimedJob(job({ batchIds: ["b1"] }))).rejects.toThrow("job lease lost before rate-limit scheduling");
+  });
+});
+
+describe("runClaimedJob terminal failures", () => {
+  it("marks a partially written batch as errored", async () => {
+    client.listCalls.mockRejectedValueOnce(new Error("upstream failed"));
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), ingestStatus: "ingesting" });
+    await runClaimedJob(job({ batchIds: ["b1"] }));
+    expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
   });
 });

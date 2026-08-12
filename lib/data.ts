@@ -97,8 +97,9 @@ export const WORKSPACES: Workspace[] = [
 
 // ---- generate campaigns ----
 function daysAgoISO(d: number) {
-  const dt = new Date("2026-06-09T10:00:00");
-  dt.setDate(dt.getDate() - d);
+  const dt = new Date();
+  dt.setUTCHours(10, 0, 0, 0);
+  dt.setUTCDate(dt.getUTCDate() - d);
   return dt.toISOString();
 }
 
@@ -208,16 +209,17 @@ export function sparkline(seed: number, n = 14, base = 50, amp = 30) {
   return out;
 }
 
-export function callsOverTime() {
+export function callsOverTime(days = 30) {
   const r = mulberry32(7788);
   const out: { date: string; calls: number; messages: number }[] = [];
-  for (let d = 29; d >= 0; d--) {
-    const dt = new Date("2026-06-09");
-    dt.setDate(dt.getDate() - d);
-    const weekday = dt.getDay();
+  for (let d = Math.max(1, days) - 1; d >= 0; d--) {
+    const dt = new Date();
+    dt.setUTCHours(0, 0, 0, 0);
+    dt.setUTCDate(dt.getUTCDate() - d);
+    const weekday = dt.getUTCDay();
     const weekendDip = weekday === 0 || weekday === 6 ? 0.5 : 1;
     out.push({
-      date: dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      date: dt.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" }),
       calls: Math.round((1200 + r() * 2600) * weekendDip),
       messages: Math.round((2600 + r() * 5200) * weekendDip),
     });

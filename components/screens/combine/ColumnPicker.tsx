@@ -25,7 +25,8 @@ export function ColumnPicker({
   const toggle = (k: string) =>
     setSelected((s) => {
       const n = new Set(s);
-      n.has(k) ? n.delete(k) : n.add(k);
+      if (n.has(k)) n.delete(k);
+      else n.add(k);
       return n;
     });
   return (
@@ -51,7 +52,8 @@ export function ColumnPicker({
                   onClick={() =>
                     setSelected((s) => {
                       const n = new Set(s);
-                      groupAll ? groupKeys.forEach((k) => n.delete(k)) : groupKeys.forEach((k) => n.add(k));
+                      if (groupAll) groupKeys.forEach((k) => n.delete(k));
+                      else groupKeys.forEach((k) => n.add(k));
                       return n;
                     })
                   }

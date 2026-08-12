@@ -58,6 +58,8 @@ describe("bestReachWindow", () => {
     ]);
     const win = bestReachWindow(r)!;
     expect(win.dayRange).toBe("Tue–Wed");
+    expect(win.total).toBe(200);
+    expect(win.rate).toBeCloseTo(147 / 200, 5);
     expect(win.liftPp).toBeGreaterThan(0);
   });
 });

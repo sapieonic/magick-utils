@@ -3,18 +3,17 @@
 import { useEffect, useState } from "react";
 import { Button, Icon, JobProgress, Modal } from "@/components/ui";
 import { fmtNum, selType } from "@/lib/data";
-import type { Batch, Currency } from "@/lib/types";
+import { createIngestJob, downloadCsv, getJob } from "@/lib/api";
+import type { Batch } from "@/lib/types";
 import { ColumnPicker, relevantGroups } from "./ColumnPicker";
 
 type Phase = "pick" | "working" | "done";
 
 export function DownloadModal({
   campaign,
-  currency,
   onClose,
 }: {
   campaign: Batch;
-  currency: Currency;
   onClose: () => void;
 }) {
   const groups = relevantGroups(selType(campaign));
@@ -23,23 +22,73 @@ export function DownloadModal({
   );
   const [phase, setPhase] = useState<Phase>("pick");
   const [prog, setProg] = useState(0);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
-    if (phase !== "working") return;
-    setProg(0);
-    const iv = setInterval(() => {
-      setProg((p: number) => {
-        const next = p + Math.random() * 16 + 4;
-        if (next >= 100) {
-          clearInterval(iv);
-          setTimeout(() => setPhase("done"), 350);
-          return 100;
+    if (phase !== "working" || !jobId) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const job = await getJob(jobId);
+        if (stopped || !job) return;
+        setProg(job.total > 0 ? Math.min(99, (job.done / job.total) * 100) : 0);
+        if (job.status === "done") {
+          setProg(100);
+          setJobId(null);
+          setPhase("done");
+          return;
         }
-        return next;
-      });
-    }, 180);
-    return () => clearInterval(iv);
-  }, [phase]);
+        if (job.status === "error") {
+          setError(job.error || "CSV preparation failed.");
+          setJobId(null);
+          setPhase("pick");
+          return;
+        }
+      } catch (pollError) {
+        if (!stopped) setError(pollError instanceof Error ? pollError.message : "Unable to refresh export progress.");
+      }
+      if (!stopped) timer = setTimeout(poll, 1500);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [jobId, phase]);
+
+  const prepare = async () => {
+    setError(null);
+    setProg(0);
+    setPhase("working");
+    try {
+      const result = await createIngestJob([campaign.id], "merge");
+      if (!result) throw new Error("CSV download requires the live backend; demo rows cannot be exported.");
+      if (result.ready || !result.jobId) {
+        setProg(100);
+        setPhase("done");
+      } else {
+        setJobId(result.jobId);
+      }
+    } catch (prepareError) {
+      setError(prepareError instanceof Error ? prepareError.message : "Unable to prepare CSV.");
+      setPhase("pick");
+    }
+  };
+
+  const download = async () => {
+    setDownloading(true);
+    setError(null);
+    try {
+      await downloadCsv([campaign.id], [...selected]);
+    } catch (downloadError) {
+      setError(downloadError instanceof Error ? downloadError.message : "CSV download failed.");
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   const total = campaign.total;
   const rows = Math.round((prog / 100) * total);
@@ -64,7 +113,7 @@ export function DownloadModal({
             <Button variant="secondary" onClick={onClose}>
               Cancel
             </Button>
-            <Button icon="Download" disabled={selected.size === 0} onClick={() => setPhase("working")}>
+            <Button icon="Download" disabled={selected.size === 0} onClick={() => void prepare()}>
               Download {selected.size} columns
             </Button>
           </>
@@ -73,7 +122,7 @@ export function DownloadModal({
             <Button variant="secondary" onClick={onClose}>
               Close
             </Button>
-            <Button icon="Download">Download {campaign.batchId}.csv</Button>
+            <Button icon="Download" loading={downloading} onClick={() => void download()}>Download {campaign.batchId}.csv</Button>
           </>
         ) : (
           <Button variant="secondary" onClick={onClose}>
@@ -82,6 +131,11 @@ export function DownloadModal({
         )
       }
     >
+      {error && (
+        <div className="mb-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">
+          <Icon name="TriangleAlert" size={15} className="mt-0.5" /> {error}
+        </div>
+      )}
       {phase === "pick" && <ColumnPicker groups={groups} selected={selected} setSelected={setSelected} />}
       {phase === "working" && (
         <div className="py-8">

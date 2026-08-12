@@ -4,7 +4,7 @@
 
 import { CAMPAIGNS } from "@/lib/data";
 import type { Batch } from "@/lib/types";
-import type { AggregatesDoc, Insight, JobStatus, JobType } from "@/lib/server/types";
+import type { AggregatesDoc, DashboardVolume, Insight, JobStatus, JobType } from "@/lib/server/types";
 
 export interface JobDto {
   jobId: string;
@@ -21,6 +21,30 @@ export interface JobDto {
 }
 
 let _status: { backend: boolean; llm: boolean } | null = null;
+let _statusAt = 0;
+const STATUS_TTL_MS = 30_000;
+
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
+async function responseError(res: Response, fallback: string): Promise<ApiRequestError> {
+  let body: { error?: string; message?: string } = {};
+  try {
+    const readable = typeof res.clone === "function" ? res.clone() : res;
+    body = await readable.json();
+  } catch {
+    // A non-JSON upstream error still gets the safe caller-supplied fallback.
+  }
+  return new ApiRequestError(body.message ?? fallback, res.status, body.error);
+}
 
 /** When a live BFF data call comes back 401, the magick-master session has
  *  expired (or was never authenticated) — the server has already cleared the
@@ -36,33 +60,43 @@ function handleSessionExpiry(res: Response): boolean {
 }
 
 export async function backendStatus(): Promise<{ backend: boolean; llm: boolean }> {
-  if (_status) return _status;
+  if (_status && Date.now() - _statusAt < STATUS_TTL_MS) return _status;
   try {
     const res = await fetch("/api/health", { cache: "no-store" });
+    if (!res.ok) throw await responseError(res, "Unable to check backend availability.");
     const j = await res.json();
     _status = { backend: !!j.backend, llm: !!j.llm };
-  } catch {
-    _status = { backend: false, llm: false };
+    _statusAt = Date.now();
+    return _status;
+  } catch (error) {
+    // A network fault is not proof that this is a demo environment. Do not
+    // cache or replace production data with convincing seeded rows.
+    throw error instanceof ApiRequestError
+      ? error
+      : new ApiRequestError("Backend availability could not be verified.", 503, "health_unavailable");
   }
-  return _status;
 }
 
 /** List campaigns/batches. Falls back to mock data when the backend is off. */
 export async function listCampaigns(): Promise<{ batches: Batch[]; source: "live" | "mock" }> {
   const { backend } = await backendStatus();
   if (!backend) return { batches: CAMPAIGNS, source: "mock" };
-  try {
-    const res = await fetch("/api/campaigns", { cache: "no-store" });
-    if (handleSessionExpiry(res)) return { batches: CAMPAIGNS, source: "mock" };
-    if (!res.ok) throw new Error(`campaigns ${res.status}`);
-    const j = await res.json();
-    return { batches: j.batches as Batch[], source: "live" };
-  } catch {
-    return { batches: CAMPAIGNS, source: "mock" };
-  }
+  const res = await fetch("/api/campaigns", { cache: "no-store" });
+  if (handleSessionExpiry(res)) throw new Error("session_expired");
+  if (!res.ok) throw await responseError(res, "Unable to load campaigns.");
+  const j = await res.json();
+  return { batches: j.batches as Batch[], source: "live" };
 }
 
-export async function createIngestJob(batchIds: string[], type: "ingest" | "merge" = "ingest"): Promise<{ jobId: string; total: number } | null> {
+export interface IngestJobResult {
+  jobId: string | null;
+  total: number;
+  /** A merge preparation can complete immediately when every batch already has
+   * normalized records. */
+  ready?: boolean;
+}
+
+export async function createIngestJob(batchIds: string[], type: "ingest" | "merge" = "ingest"): Promise<IngestJobResult | null> {
   const { backend } = await backendStatus();
   if (!backend) return null;
   const res = await fetch("/api/ingest", {
@@ -71,14 +105,14 @@ export async function createIngestJob(batchIds: string[], type: "ingest" | "merg
     body: JSON.stringify({ batchIds, type }),
   });
   if (handleSessionExpiry(res)) return null;
-  if (!res.ok) throw new Error(`ingest ${res.status}`);
+  if (!res.ok) throw await responseError(res, "Unable to schedule ingestion.");
   return res.json();
 }
 
 export async function getJob(jobId: string): Promise<JobDto | null> {
   const res = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
   if (handleSessionExpiry(res)) return null;
-  if (!res.ok) return null;
+  if (!res.ok) throw await responseError(res, "Unable to refresh job progress.");
   return res.json();
 }
 
@@ -91,21 +125,35 @@ export async function getAnalytics(batchIds: string[], refresh = false): Promise
     body: JSON.stringify({ batchIds, refresh }),
   });
   if (handleSessionExpiry(res)) return null;
-  if (!res.ok) return null;
+  if (!res.ok) throw await responseError(res, "Unable to load analytics.");
   const j = await res.json();
   return j.aggregates as AggregatesDoc;
 }
 
+export async function getDashboardVolume(range: string): Promise<DashboardVolume | null> {
+  const { backend } = await backendStatus();
+  if (!backend) return null;
+  const res = await fetch("/api/dashboard", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ range }),
+  });
+  if (handleSessionExpiry(res)) return null;
+  if (!res.ok) throw new Error(`dashboard ${res.status}`);
+  const json = await res.json();
+  return json.volume as DashboardVolume;
+}
+
 export async function generateInsights(batchIds: string[], refresh = false): Promise<Insight | null> {
   const { llm } = await backendStatus();
-  if (!llm) return null;
+  if (!llm) throw new ApiRequestError("AI insights are not configured for this environment.", 503, "llm_not_configured");
   const res = await fetch("/api/insights", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, refresh }),
   });
-  if (handleSessionExpiry(res)) return null;
-  if (!res.ok) return null;
+  if (handleSessionExpiry(res)) throw new ApiRequestError("Your session expired.", 401, "session_expired");
+  if (!res.ok) throw await responseError(res, "AI insight generation failed.");
   const j = await res.json();
   return j.insight as Insight;
 }
@@ -120,14 +168,14 @@ export async function compareInsights(
   refresh = false,
 ): Promise<Insight | null> {
   const { llm } = await backendStatus();
-  if (!llm) return null;
+  if (!llm) throw new ApiRequestError("AI insights are not configured for this environment.", 503, "llm_not_configured");
   const res = await fetch("/api/insights/compare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, baselineBatchIds, refresh }),
   });
-  if (handleSessionExpiry(res)) return null;
-  if (!res.ok) return null;
+  if (handleSessionExpiry(res)) throw new ApiRequestError("Your session expired.", 401, "session_expired");
+  if (!res.ok) throw await responseError(res, "AI comparison generation failed.");
   const j = await res.json();
   return j.insight as Insight;
 }
@@ -141,33 +189,54 @@ export async function streamChat(
   onDelta: (text: string) => void,
 ): Promise<boolean> {
   const { llm } = await backendStatus();
-  if (!llm) return false;
+  if (!llm) throw new ApiRequestError("The campaign assistant is not configured.", 503, "llm_not_configured");
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batchIds, message, history }),
   });
-  if (handleSessionExpiry(res)) return false;
-  if (!res.ok || !res.body) return false;
+  if (handleSessionExpiry(res)) throw new ApiRequestError("Your session expired.", 401, "session_expired");
+  if (!res.ok) throw await responseError(res, "The campaign assistant is unavailable.");
+  if (!res.body) throw new ApiRequestError("The campaign assistant returned no response.", 502, "empty_stream");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const events = buf.split("\n\n");
-    buf = events.pop() ?? "";
-    for (const evt of events) {
-      const line = evt.split("\n").find((l) => l.startsWith("data: "));
-      if (!line) continue;
-      try {
-        const payload = JSON.parse(line.slice(6));
-        if (payload.delta) onDelta(payload.delta as string);
-      } catch {
-        /* ignore non-data frames (done/error) */
-      }
+  let doneSeen = false;
+  const processEvent = (evt: string) => {
+    const lines = evt.split("\n");
+    if (lines.some((line) => line.trim() === "event: error")) {
+      throw new ApiRequestError("The campaign assistant stream failed.", 502, "stream_failed");
     }
+    if (lines.some((line) => line.trim() === "event: done")) doneSeen = true;
+    const line = lines.find((candidate) => candidate.startsWith("data: "));
+    if (!line) return;
+    try {
+      const payload = JSON.parse(line.slice(6));
+      if (payload.delta) onDelta(payload.delta as string);
+    } catch {
+      // Terminal frames carry an empty object; malformed data is ignored here,
+      // but the required done frame below still prevents a false success.
+    }
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const events = buf.split("\n\n");
+      buf = events.pop() ?? "";
+      for (const evt of events) processEvent(evt);
+    }
+    buf += decoder.decode();
+    for (const evt of buf.split("\n\n").filter((event) => event.trim())) processEvent(evt);
+    if (!doneSeen) {
+      throw new ApiRequestError("The campaign assistant response ended early.", 502, "incomplete_stream");
+    }
+  } catch (error) {
+    await reader.cancel?.().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock?.();
   }
   return true;
 }
@@ -251,4 +320,19 @@ export async function fetchMe(): Promise<{ authenticated: boolean; user?: Sessio
 export function downloadCsvUrl(batchIds: string[], columns: string[]): string {
   const q = new URLSearchParams({ batchIds: batchIds.join(","), columns: columns.join(",") });
   return `/api/export?${q.toString()}`;
+}
+
+/** Fetch a prepared CSV without navigating away on an API error. */
+export async function downloadCsv(batchIds: string[], columns: string[]): Promise<void> {
+  const url = downloadCsvUrl(batchIds, columns);
+  const preflightUrl = `${url}&preflight=1`;
+  const res = await fetch(preflightUrl, { cache: "no-store" });
+  if (handleSessionExpiry(res)) throw new ApiRequestError("Your session expired.", 401, "session_expired");
+  if (!res.ok) throw await responseError(res, "CSV download failed.");
+  // Native navigation streams the response directly into the browser download
+  // manager; never buffer a potentially multi-gigabyte CSV in tab memory.
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "";
+  anchor.click();
 }

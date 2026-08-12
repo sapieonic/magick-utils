@@ -2,7 +2,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 
 import { StepBadge } from "@/components/screens/combine/StepBadge";
 import { SummaryRow } from "@/components/screens/combine/SummaryRow";

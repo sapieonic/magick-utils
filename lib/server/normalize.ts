@@ -96,6 +96,15 @@ function transcriptFromLog(
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
+function isoTimestamp(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const normalized = /^\d{4}-\d{2}-\d{2} /.test(trimmed) ? trimmed.replace(" ", "T") : trimmed;
+  const withZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized : `${normalized}Z`;
+  const parsed = new Date(withZone);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
 export interface NormalizeCallOpts {
   selType: "ai" | "ivr";
   batchId: string;
@@ -112,6 +121,10 @@ export function normalizeCall(
   const sentiment = common?.overall_sentiment?.label ?? null;
   const keyTopics = Array.isArray(common?.key_topics) ? common?.key_topics ?? null : null;
   const timestamp = raw.timestamps?.ended_at ?? raw.created_at ?? null;
+  const activityTimestamp = isoTimestamp(
+    raw.timestamps?.initiated_at ?? raw.timestamps?.queued_at ?? raw.created_at ?? raw.timestamps?.ended_at,
+  );
+  const activityDate = activityTimestamp ? new Date(activityTimestamp) : null;
 
   return {
     tenantId: ctx.tenantId,
@@ -125,6 +138,8 @@ export function normalizeCall(
     recipientEmail: null,
     status: normalizeStatus(raw.status ?? "", "call"),
     outcome: raw.outcome ?? null,
+    activityTimestamp,
+    activityDate,
     timestamp,
     provider: raw.telephony_provider ?? null,
     totalCostInr: raw.total_cost_inr ?? null,
@@ -158,8 +173,11 @@ export function normalizeMessage(
   opts: NormalizeMessageOpts,
 ): NormalizedRecord {
   const messageId = raw.message_id ?? raw.wamid ?? raw.id ?? null;
-  const timestamp =
-    raw.read_at ?? raw.delivered_at ?? raw.sent_at ?? raw.failed_at ?? raw.created_at ?? null;
+  const timestamp = raw.read_at ?? raw.delivered_at ?? raw.sent_at ?? raw.failed_at ?? raw.created_at ?? null;
+  const activityTimestamp = isoTimestamp(
+    raw.sent_at ?? raw.created_at ?? raw.delivered_at ?? raw.read_at ?? raw.failed_at,
+  );
+  const activityDate = activityTimestamp ? new Date(activityTimestamp) : null;
   const bounceReason = raw.error_message ?? raw.error_code ?? null;
 
   return {
@@ -174,6 +192,8 @@ export function normalizeMessage(
     recipientEmail: raw.to_email ?? null,
     status: normalizeStatus(raw.status ?? "", "message"),
     outcome: null,
+    activityTimestamp,
+    activityDate,
     timestamp,
     provider: raw.provider ?? opts.channel,
     totalCostInr: null,
@@ -183,6 +203,7 @@ export function normalizeMessage(
     messageId,
     deliveredAt: raw.delivered_at ?? null,
     readAt: raw.read_at ?? null,
+    replyText: raw.reply_text ?? null,
     templateName: raw.template_name ?? null,
     bounceReason,
     raw: raw as Record<string, unknown>,
@@ -238,6 +259,8 @@ export interface BuildBatchDocOpts {
   provider: string;
   date: string; // ISO
   fingerprint: string;
+  sourceFingerprint?: string;
+  publishedRevision?: string;
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
   total?: number;
@@ -291,6 +314,8 @@ export function buildBatchDoc(
     avgDuration: isMessage ? null : avg(durations),
     avgTalkTime: isMessage ? null : avg(talkTimes),
     fingerprint: opts.fingerprint,
+    sourceFingerprint: opts.sourceFingerprint,
+    publishedRevision: opts.publishedRevision,
     ingestStatus: opts.ingestStatus ?? "ready",
     updatedAt: new Date().toISOString(),
   };

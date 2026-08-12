@@ -24,7 +24,7 @@ import {
   selType,
   typeKey,
 } from "@/lib/data";
-import { createIngestJob, downloadCsvUrl, getJob, listCampaigns } from "@/lib/api";
+import { createIngestJob, downloadCsv, getJob, listCampaigns } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
 
@@ -44,13 +44,23 @@ export function CombineScreen() {
   // Start empty — never seed with mock. listCampaigns() supplies mock only when
   // the backend is off; on a live backend mock data never enters this screen.
   const [batches, setBatches] = useState<Batch[]>([]);
+  const [source, setSource] = useState<"live" | "mock">("mock");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
   const [jobId, setJobId] = useState<string | null>(() =>
     typeof window === "undefined" ? null : sessionStorage.getItem("combineJobId"),
   );
   const [error, setError] = useState<string | null>(null);
   const [rateLimitRetryAt, setRateLimitRetryAt] = useState<string | null>(null);
-  const [mockMode, setMockMode] = useState(false); // confirmed backend-off ⇒ run the simulation
+  const [prepared, setPrepared] = useState<{ batchIds: string[]; columns: string[]; totalRows: number; batchCount: number } | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      return JSON.parse(sessionStorage.getItem("combinePrepared") ?? "null");
+    } catch {
+      return null;
+    }
+  });
 
   useEffect(() => {
     if (jobId) {
@@ -60,12 +70,24 @@ export function CombineScreen() {
     }
   }, [jobId]);
 
+  useEffect(() => {
+    if (prepared) sessionStorage.setItem("combinePrepared", JSON.stringify(prepared));
+    else sessionStorage.removeItem("combinePrepared");
+  }, [prepared]);
+
   // load live batches (falls back to mock automatically when backend is off)
   useEffect(() => {
     let alive = true;
     listCampaigns()
-      .then(({ batches }) => {
-        if (alive) setBatches(batches);
+      .then(({ batches, source }) => {
+        if (alive) {
+          setBatches(batches);
+          setSource(source);
+          setLoadError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (alive) setLoadError(error instanceof Error ? error.message : "Unable to load batches.");
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -79,6 +101,10 @@ export function CombineScreen() {
     () => combineTargets.map((id) => batches.find((c: Batch) => c.id === id)).filter((c): c is Batch => Boolean(c)),
     [combineTargets, batches],
   );
+  const missingTargetIds = useMemo(
+    () => combineTargets.filter((id) => !batches.some((batch) => batch.id === id)),
+    [batches, combineTargets],
+  );
   const batchType: SelType = campaigns.length ? selType(campaigns[0]) : "ai";
   const totalRows = campaigns.reduce((a: number, c: Batch) => a + c.total, 0);
 
@@ -86,11 +112,18 @@ export function CombineScreen() {
 
   // init / reconcile selected columns when groups change
   useEffect(() => {
-    setSelectedCols((prev: Set<string> | null) => {
-      const valid = new Set(groups.flatMap((g: ColumnGroup) => g.columns.map((c: ColumnDef) => c.key)));
-      if (!prev) return new Set(groups.flatMap((g: ColumnGroup) => g.columns.filter((c: ColumnDef) => c.default).map((c: ColumnDef) => c.key)));
-      return new Set([...prev].filter((k: string) => valid.has(k)));
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      setSelectedCols((prev: Set<string> | null) => {
+        const valid = new Set(groups.flatMap((g: ColumnGroup) => g.columns.map((c: ColumnDef) => c.key)));
+        if (!prev) return new Set(groups.flatMap((g: ColumnGroup) => g.columns.filter((c: ColumnDef) => c.default).map((c: ColumnDef) => c.key)));
+        return new Set([...prev].filter((k: string) => valid.has(k)));
+      });
     });
+    return () => {
+      active = false;
+    };
   }, [groups]);
 
   const colOrder = useMemo(
@@ -98,30 +131,9 @@ export function CombineScreen() {
     [groups, selectedCols],
   );
   const previewRows = useMemo(
-    () => (colOrder.length ? buildPreviewRows(campaigns, colOrder, 6) : []),
-    [campaigns, colOrder],
+    () => (source === "mock" && colOrder.length ? buildPreviewRows(campaigns, colOrder, 6) : []),
+    [campaigns, colOrder, source],
   );
-
-  const live = jobId !== null;
-
-  // simulated progress — only once we've CONFIRMED the backend is off (mockMode),
-  // so it never races the real job before createIngestJob resolves.
-  useEffect(() => {
-    if (phase !== "working" || live || !mockMode) return;
-    setProg(0);
-    const iv = setInterval(() => {
-      setProg((p: number) => {
-        const next = p + Math.random() * 11 + 3;
-        if (next >= 100) {
-          clearInterval(iv);
-          setTimeout(() => setPhase("done"), 400);
-          return 100;
-        }
-        return next;
-      });
-    }, 220);
-    return () => clearInterval(iv);
-  }, [phase, live, mockMode]);
 
   useEffect(() => {
     if (phase !== "working" || !jobId) return;
@@ -169,19 +181,36 @@ export function CombineScreen() {
   }, [phase, jobId]);
 
   const onGenerate = async () => {
+    if (missingTargetIds.length > 0) {
+      setError(`The selection is incomplete. Missing: ${missingTargetIds.join(", ")}. Return to Campaigns and select the batches again.`);
+      return;
+    }
     setError(null);
     setRateLimitRetryAt(null);
     setProg(0);
-    setMockMode(false);
+    const snapshot = {
+      batchIds: campaigns.map((campaign) => campaign.id),
+      columns: [...colOrder],
+      totalRows,
+      batchCount: campaigns.length,
+    };
+    setPrepared(snapshot);
     setPhase("working");
-    // Resolve the job BEFORE the sim can start: success ⇒ set jobId (poll path);
-    // null ⇒ confirmed backend-off ⇒ flip mockMode so the simulation runs.
     try {
-      const res = await createIngestJob(campaigns.map((c: Batch) => c.id), "merge");
-      if (res) setJobId(res.jobId);
-      else setMockMode(true);
+      const res = await createIngestJob(snapshot.batchIds, "merge");
+      if (!res) {
+        setPhase("build");
+        setPrepared(null);
+        setError("CSV download requires the live backend; demo rows cannot be exported as customer data.");
+      } else if (res.ready || !res.jobId) {
+        setProg(100);
+        setPhase("done");
+      } else {
+        setJobId(res.jobId);
+      }
     } catch {
       setPhase("build");
+      setPrepared(null);
       setError("Unable to schedule merge. Please try again.");
     }
   };
@@ -190,16 +219,31 @@ export function CombineScreen() {
     setPhase("build");
     setProg(0);
     setJobId(null);
-    setMockMode(false);
+    setPrepared(null);
     setError(null);
     setRateLimitRetryAt(null);
   };
 
-  const removeChip = (id: string) => setCombineTargets(combineTargets.filter((x) => x !== id));
+  const editing = phase === "build";
+  const removeChip = (id: string) => editing && setCombineTargets(combineTargets.filter((x) => x !== id));
   const addCampaign = (id: string) =>
-    setCombineTargets(combineTargets.includes(id) ? combineTargets : [...combineTargets, id]);
+    editing && setCombineTargets(combineTargets.includes(id) ? combineTargets : [...combineTargets, id]);
   // only batches of the same selection type can be added to the merge
   const available = batches.filter((c: Batch) => !combineTargets.includes(c.id) && selType(c) === batchType);
+
+  const onDownload = async () => {
+    const batchIds = prepared?.batchIds ?? campaigns.map((campaign) => campaign.id);
+    const columns = prepared?.columns ?? colOrder;
+    setDownloading(true);
+    setError(null);
+    try {
+      await downloadCsv(batchIds, columns);
+    } catch (downloadError) {
+      setError(downloadError instanceof Error ? downloadError.message : "CSV download failed. Please try again.");
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   // Wait for the real batch list before deciding "nothing selected" — otherwise
   // the empty state flashes while live data loads.
@@ -208,6 +252,21 @@ export function CombineScreen() {
       <div className="mx-auto max-w-[1400px] px-6 py-6">
         <Card className="flex items-center justify-center gap-2.5 py-20 text-sm font-semibold text-slate-500">
           <Spinner size={16} /> Loading batches…
+        </Card>
+      </div>
+    );
+  }
+
+  if (loadError || missingTargetIds.length > 0) {
+    return (
+      <div className="mx-auto max-w-[1400px] px-6 py-6">
+        <Card>
+          <EmptyState
+            icon="TriangleAlert"
+            title={loadError ? "Batches are unavailable" : "The saved batch selection is incomplete"}
+            body={loadError ?? `These selected batches are no longer available: ${missingTargetIds.join(", ")}. Nothing has been silently omitted.`}
+            action={<Button icon="Table2" onClick={() => router.push("/campaigns")}>Return to Campaigns</Button>}
+          />
         </Card>
       </div>
     );
@@ -257,13 +316,15 @@ export function CombineScreen() {
                   <span className="text-[11px] font-mono text-slate-400">{fmtNum(c.total)}</span>
                   <button
                     onClick={() => removeChip(c.id)}
+                    disabled={!editing}
+                    aria-label={`Remove ${c.name}`}
                     className="ml-0.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-md p-1 transition-colors"
                   >
                     <Icon name="X" size={13} />
                   </button>
                 </span>
               ))}
-              <Dropdown
+              {editing && <Dropdown
                 align="left"
                 width={280}
                 trigger={
@@ -299,7 +360,7 @@ export function CombineScreen() {
                     ))}
                   </div>
                 )}
-              </Dropdown>
+              </Dropdown>}
             </div>
           </Card>
 
@@ -313,11 +374,13 @@ export function CombineScreen() {
               </div>
             </div>
             {selectedCols && (
+              <div className={editing ? undefined : "pointer-events-none opacity-60"}>
               <ColumnPicker
                 groups={groups}
                 selected={selectedCols}
                 setSelected={(updater) => setSelectedCols((prev: Set<string> | null) => updater(prev ?? new Set()))}
               />
+              </div>
             )}
           </Card>
 
@@ -328,14 +391,19 @@ export function CombineScreen() {
               <div>
                 <div className="text-[15px] font-bold text-slate-900">Preview merged rows</div>
                 <div className="text-xs text-slate-400">
-                  First {previewRows.length} of {fmtNum(totalRows)} rows · unified schema across all{" "}
-                  {SEL_LABEL[batchType]} batches
+                  {source === "live"
+                    ? `Selected schema for ${fmtNum(totalRows)} real rows`
+                    : `First ${previewRows.length} of ${fmtNum(totalRows)} demo rows`} · unified across all {SEL_LABEL[batchType]} batches
                 </div>
               </div>
             </div>
             {colOrder.length === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-200 py-10 text-center text-sm text-slate-400">
                 Select at least one column to preview
+              </div>
+            ) : source === "live" ? (
+              <div className="rounded-xl border border-dashed border-slate-200 py-10 px-6 text-center text-sm text-slate-400">
+                Live row values are not fabricated for preview. The downloaded CSV contains the normalized records for the selected batches and columns.
               </div>
             ) : (
               <div className="overflow-x-auto rounded-xl border border-slate-200">
@@ -392,15 +460,18 @@ export function CombineScreen() {
 
               <div className="mt-5">
                 {phase === "build" && (
-                  <Button
-                    size="lg"
-                    className="w-full"
-                    icon="GitMerge"
-                    disabled={!selectedCols || selectedCols.size === 0}
-                    onClick={onGenerate}
-                  >
-                    Generate &amp; Download
-                  </Button>
+                  <div className="space-y-2.5">
+                    <Button
+                      size="lg"
+                      className="w-full"
+                      icon="GitMerge"
+                      disabled={!selectedCols || selectedCols.size === 0 || campaigns.length < 2}
+                      onClick={onGenerate}
+                    >
+                      Generate &amp; Download
+                    </Button>
+                    {error && <div className="text-xs font-medium text-red-600">{error}</div>}
+                  </div>
                 )}
                 {phase === "working" && (
                   <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
@@ -424,7 +495,7 @@ export function CombineScreen() {
                       <div className="mt-3 flex items-start gap-2 text-[13px] text-red-600">
                         <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
                         <span className="flex-1">{error}</span>
-                        <Button variant="secondary" size="sm" icon="RotateCcw" onClick={reset} />
+                        <Button variant="secondary" size="sm" icon="RotateCcw" aria-label="Reset CSV preparation" onClick={reset} />
                       </div>
                     )}
                   </div>
@@ -435,20 +506,20 @@ export function CombineScreen() {
                       <Icon name="CircleCheck" size={17} /> Download ready
                     </div>
                     <div className="text-[13px] text-slate-500 mb-3">
-                      combined_export_{campaigns.length}_batches.csv · {fmtNum(totalRows)} rows
+                      combined_export_{prepared?.batchCount ?? campaigns.length}_batches.csv · {fmtNum(prepared?.totalRows ?? totalRows)} rows
                     </div>
                     <div className="flex gap-2">
                       <Button
                         className="flex-1"
                         icon="Download"
-                        onClick={() => {
-                          if (jobId) window.location.href = downloadCsvUrl(campaigns.map((c: Batch) => c.id), colOrder);
-                        }}
+                        loading={downloading}
+                        onClick={() => void onDownload()}
                       >
                         Download CSV
                       </Button>
-                      <Button variant="secondary" icon="RotateCcw" onClick={reset} />
+                      <Button variant="secondary" icon="RotateCcw" aria-label="Start another CSV" onClick={reset} />
                     </div>
+                    {error && <div className="mt-3 text-[13px] text-red-600">{error}</div>}
                   </div>
                 )}
               </div>

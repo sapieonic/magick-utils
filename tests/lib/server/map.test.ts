@@ -152,4 +152,19 @@ describe("bulkJobToBatchDoc", () => {
     expect(seg(doc, "delivered")).toBe(60);
     expect(seg(doc, "sent")).toBe(0); // not clobbered by the pre-ingestion estimate
   });
+
+  it("marks a committed dataset stale when the upstream revision changes", () => {
+    const first = bulkJobToBatchDoc({
+      id: "job-stale", dispatch_type: "ai_voice_call", status: "processing",
+      total_contacts: 10, updated_at: "2026-08-12T10:00:00Z",
+    }, ctx);
+    const committed: BatchDoc = { ...first, ingestStatus: "ready", fingerprint: "dataset-fp" };
+    const refreshed = bulkJobToBatchDoc({
+      id: "job-stale", dispatch_type: "ai_voice_call", status: "completed",
+      total_contacts: 12, updated_at: "2026-08-12T11:00:00Z",
+    }, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("none");
+    expect(refreshed.fingerprint).toBe("dataset-fp");
+    expect(refreshed.sourceFingerprint).not.toBe(committed.sourceFingerprint);
+  });
 });

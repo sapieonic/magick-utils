@@ -3,7 +3,22 @@
 // paginates magick-master, normalizes records, writes them to Mongo, and rebuilds
 // the BatchDoc summary. Insights/chat run synchronously in their route handlers.
 
-import { checkpointJob, claimNextJob, deleteBatchRecords, getBatch, getRecords, replaceBatchRecords, updateClaimedJob, upsertBatch } from "./repositories";
+import {
+  checkpointJob,
+  claimNextJob,
+  deleteBatchRevisionRecords,
+  deleteUnpublishedBatchRevision,
+  failBatchIfOwned,
+  getBatch,
+  getRecordsForRevision,
+  publishBatchIfOwned,
+  releaseIngestionLocks,
+  renewIngestionLocks,
+  retireBatchRevision,
+  replaceBatchRecords,
+  updateClaimedJob,
+  upsertBatch,
+} from "./repositories";
 import { MagickApiError, MagickClient } from "./magick-client";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
@@ -72,6 +87,9 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
   if (!claimed.leaseId) throw new Error("claimed job has no leaseId");
   try {
     await processJob(claimed);
+    await releaseIngestionLocks(claimed.jobId).catch((error) => {
+      log().warn({ error }, "[worker] completed job lock cleanup deferred to TTL");
+    });
     log().info({ durationMs: Date.now() - startedAt }, "[worker] job completed");
   } catch (err) {
     if (err instanceof MagickApiError && err.status === 429) {
@@ -87,6 +105,9 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
         error: null,
       });
       if (!scheduled) throw new Error("job lease lost before rate-limit scheduling");
+      await renewIngestionLocks(claimed.jobId, retryAfterMs + LEASE_MS).catch((error) => {
+        log().warn({ error }, "[worker] rate-limit lock renewal failed; existing lease retained");
+      });
       return;
     }
     log().error({ err, durationMs: Date.now() - startedAt }, "[worker] job failed");
@@ -97,6 +118,13 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
       error: String(err),
     });
     if (!failed) throw err;
+    await Promise.all(claimed.batchIds.map(async (batchId) => {
+      await failBatchIfOwned(claimed.tenantId, claimed.accountId, batchId, claimed.jobId, claimed.leaseId!);
+      await deleteUnpublishedBatchRevision(claimed.tenantId, claimed.accountId, batchId, claimed.jobId);
+    }));
+    await releaseIngestionLocks(claimed.jobId).catch((error) => {
+      log().warn({ error }, "[worker] failed job lock cleanup deferred to TTL");
+    });
   }
 }
 
@@ -137,10 +165,23 @@ async function ingestBatch(
 
   const startedAt = Date.now();
   log().info({ batchId, offset: initialOffset, selType: batch.selType, channel: batch.channel }, "[worker] ingesting batch");
-  await upsertBatch({ ...batch, ingestStatus: "ingesting", updatedAt: new Date().toISOString() });
-  if (initialOffset === 0) await deleteBatchRecords(ctx.tenantId, ctx.accountId, batchId);
+  // Keep an already-published revision readable during refresh. New/stale
+  // datasets remain blocked until their first complete revision is committed.
+  await upsertBatch({
+    ...batch,
+    ingestStatus: batch.ingestStatus === "ready" ? "ready" : "ingesting",
+    ingestJobId: jobId,
+    ingestLeaseId: leaseId,
+    updatedAt: new Date().toISOString(),
+  });
+  const revision = jobId;
+  const revisionCreatedAt = new Date();
+  if (initialOffset === 0) {
+    await deleteBatchRevisionRecords(ctx.tenantId, ctx.accountId, batchId, revision);
+  }
 
   let offset = initialOffset;
+  let expectedTotal = batch.total;
   for (;;) {
     let page: NormalizedRecord[];
     let total = 0;
@@ -148,15 +189,30 @@ async function ingestBatch(
       const response = await client.listMessages({ batchId: batch.sourceId, limit: PAGE_SIZE, offset });
       total = response.total ?? 0;
       const channel = batch.channel as "whatsapp" | "telegram" | "email";
-      page = (response.messages ?? []).map((raw) => normalizeMessage(raw, ctx, { channel, batchId, fingerprint: batch.fingerprint }));
+      page = (response.messages ?? []).map((raw) => ({
+        ...normalizeMessage(raw, ctx, { channel, batchId, fingerprint: batch.fingerprint }),
+        revision,
+        revisionCreatedAt,
+      }));
     } else {
       const params = batch.sourceId ? { jobId: batch.sourceId } : { batchId };
       const response = await client.listCalls({ ...params, limit: PAGE_SIZE, offset });
       total = response.total ?? 0;
       const selType = batch.selType as "ai" | "ivr";
-      page = (response.calls ?? []).map((raw) => normalizeCall(raw, ctx, { selType, batchId, fingerprint: batch.fingerprint }));
+      page = (response.calls ?? []).map((raw) => ({
+        ...normalizeCall(raw, ctx, { selType, batchId, fingerprint: batch.fingerprint }),
+        revision,
+        revisionCreatedAt,
+      }));
     }
-    if (page.length === 0) break;
+    expectedTotal = Math.max(expectedTotal, total);
+    if (page.length === 0) {
+      if (offset < expectedTotal) {
+        throw new Error(`incomplete upstream page for ${batchId}: received ${offset} of ${expectedTotal}`);
+      }
+      if (expectedTotal === 0) expectedTotal = offset;
+      break;
+    }
     await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, page);
     offset += page.length;
     const checkpoint = await checkpointJob(jobId, leaseId, {
@@ -166,17 +222,38 @@ async function ingestBatch(
       leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
     });
     if (!checkpoint) throw new Error("job lease lost while checkpointing");
-    if (page.length < PAGE_SIZE || (total > 0 && offset >= total)) break;
+    await renewIngestionLocks(jobId);
+    if (expectedTotal > 0 && offset >= expectedTotal) break;
+    if (expectedTotal === 0 && page.length < PAGE_SIZE) {
+      expectedTotal = offset;
+      break;
+    }
   }
 
-  const records = await getRecords(ctx.tenantId, ctx.accountId, [batchId]);
+  const records = await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision);
+  if (records.length !== expectedTotal) {
+    throw new Error(`incomplete ingestion for ${batchId}: stored ${records.length} of ${expectedTotal}`);
+  }
   const freshFp = fingerprint([
     records.length,
     ...records
-      .map((r) => r.status)
-      .sort()
-      .filter((s, i, a) => a.indexOf(s) === i)
-      .map((s) => `${s}:${records.filter((r) => r.status === s).length}`),
+      .sort((a, b) => a.recordId.localeCompare(b.recordId))
+      .map((r) =>
+        JSON.stringify([
+          r.recordId,
+          r.status,
+          r.activityTimestamp,
+          r.raw?.status,
+          r.totalCostInr,
+          r.telephonyCostInr,
+          r.aiCostInr,
+          r.sentiment,
+          r.keyTopics,
+          r.durationSeconds,
+          r.talkTimeSeconds,
+          r.replyText,
+        ]),
+      ),
   ]);
   const rebuilt = buildBatchDoc(records, ctx, {
     batchId: batch.batchId,
@@ -188,12 +265,31 @@ async function ingestBatch(
     provider: batch.provider,
     date: batch.date,
     fingerprint: freshFp,
+    sourceFingerprint: batch.sourceFingerprint,
+    publishedRevision: revision,
     ingestStatus: "ready",
-    total: records.length || batch.total,
+    total: records.length,
   });
-  await upsertBatch(rebuilt);
-  const transitioned = await checkpointJob(jobId, leaseId, { done: initialDone + offset, cursor: 0, batchIndex: batchIndex + 1 });
+  // Prove ownership immediately before publication. The conditional batch
+  // write below closes the remaining lease-expiry window during fingerprinting.
+  const ownership = await checkpointJob(jobId, leaseId, {
+    done: initialDone + records.length,
+    cursor: records.length,
+    batchIndex,
+    leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
+  });
+  if (!ownership) throw new Error("job lease lost before batch publication");
+  // One document update switches every reader from the previous immutable
+  // revision to the fully validated staging revision.
+  if (!(await publishBatchIfOwned(rebuilt, jobId, leaseId))) {
+    throw new Error("job lease lost during batch publication");
+  }
+  const previousRevision = batch.publishedRevision === revision ? undefined : batch.publishedRevision;
+  await retireBatchRevision(ctx.tenantId, ctx.accountId, batchId, previousRevision).catch((error) => {
+    log().warn({ error, batchId, revision: previousRevision }, "[worker] retired revision marking deferred");
+  });
+  const transitioned = await checkpointJob(jobId, leaseId, { done: initialDone + records.length, cursor: 0, batchIndex: batchIndex + 1 });
   if (!transitioned) throw new Error("job lease lost during batch transition");
   log().info({ batchId, records: records.length, durationMs: Date.now() - startedAt }, "[worker] batch ingested");
-  return offset;
+  return records.length;
 }

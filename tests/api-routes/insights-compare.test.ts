@@ -7,6 +7,7 @@ vi.mock("@/lib/server/env", () => ({
 }));
 vi.mock("@/lib/server/session", () => ({ getTenantContext: vi.fn() }));
 vi.mock("@/lib/server/repositories", () => ({
+  consumeAiQuota: vi.fn().mockResolvedValue(true),
   getAggregates: vi.fn(),
   getBatch: vi.fn(),
   getInsight: vi.fn(),
@@ -18,6 +19,11 @@ vi.mock("@/lib/server/aggregate", () => ({ computeAggregates: vi.fn() }));
 vi.mock("@/lib/server/fingerprint", () => ({
   aggregatesKey: vi.fn((ids: string[]) => `agg-${ids.join(",")}`),
   compareKey: vi.fn(() => "compare-key"),
+}));
+vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
+vi.mock("@/lib/server/selection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/selection")>()),
+  validateSelection: vi.fn().mockResolvedValue([]),
 }));
 // diffAggregates is exercised by its own unit tests; stub a fully-shaped diff
 // so the route's diffContext serialization runs without coupling to its math.
@@ -45,6 +51,7 @@ import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getBatch, getInsight, getRecords, setInsight } from "@/lib/server/repositories";
 import { compareKey } from "@/lib/server/fingerprint";
+import { SelectionError, validateSelection } from "@/lib/server/selection";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 const AGG = { totalRecords: 100, successRate: 0.5, statusMix: [], spendInr: 100, telephonyInr: 60, aiInr: 40, batchIds: ["b"] };
@@ -110,7 +117,7 @@ describe("POST /api/insights/compare", () => {
 
   it("400 seltype_mismatch when the two sides are different selTypes", async () => {
     authed();
-    vi.mocked(getBatch).mockImplementation((_t, _a, id) => Promise.resolve({ selType: id === "cur" ? "ai" : "message" } as never));
+    vi.mocked(validateSelection).mockRejectedValueOnce(new SelectionError(400, "seltype_mismatch", "Select batches of the same type."));
     const { POST } = await import("@/app/api/insights/compare/route");
     const res = await POST(req(body));
     expect(res.status).toBe(400);
@@ -120,12 +127,13 @@ describe("POST /api/insights/compare", () => {
   it("returns a cached comparison when present and no refresh", async () => {
     authed();
     vi.mocked(getBatch).mockResolvedValue({ selType: "ai" } as never);
+    vi.mocked(getAggregates).mockResolvedValue(AGG as never);
     vi.mocked(getInsight).mockResolvedValue({ narrative: "cached cmp" } as never);
     const { POST } = await import("@/app/api/insights/compare/route");
     const res = await POST(req({ ...body, model: "client-model" }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ insight: { narrative: "cached cmp" }, cached: true });
-    expect(compareKey).toHaveBeenCalledWith(["cur"], ["base"], "backend-model");
+    expect(compareKey).toHaveBeenCalledWith(["cur"], ["base"], "backend-model", "dataset", "dataset");
     expect(structured).not.toHaveBeenCalled();
   });
 
@@ -156,7 +164,7 @@ describe("POST /api/insights/compare", () => {
     expect(json.insight.tenantId).toBe("t1");
     expect(json.insight.key).toBe("compare-key");
     expect(json.insight.model).toBe("backend-model");
-    expect(compareKey).toHaveBeenCalledWith(["cur"], ["base"], "backend-model");
+    expect(compareKey).toHaveBeenCalledWith(["cur"], ["base"], "backend-model", "dataset", "dataset");
     expect(setInsight).toHaveBeenCalled();
   });
 

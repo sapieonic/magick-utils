@@ -87,15 +87,14 @@ describe("ChatPanel — composer", () => {
     await waitFor(() => expect(input.value).toBe(""));
   });
 
-  it("falls back to a canned answer when the LLM is off (streamChat resolves false)", async () => {
-    // Live path unavailable → canned typewriter message is rendered instead.
+  it("shows an explicit error instead of a canned answer when AI is unavailable", async () => {
     mockStreamChat.mockResolvedValue(false);
     renderPanel();
 
     fireEvent.click(screen.getByRole("button", { name: /Why did this batch underperform\?/ }));
 
-    // The canned default opens with this phrase (revealed progressively).
-    await waitFor(() => expect(screen.getByText(/Two things held this batch back/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/couldn't reach the assistant/i)).toBeInTheDocument());
+    expect(screen.queryByText(/Two things held this batch back/)).not.toBeInTheDocument();
   });
 });
 

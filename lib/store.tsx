@@ -51,6 +51,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // hydrate from sessionStorage on mount
   useEffect(() => {
     const s = load();
+    // Hydration intentionally applies one external sessionStorage snapshot.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (s.workspace) setWorkspaceState(s.workspace as Workspace);
     if (s.currency) setCurrencyState(s.currency as Currency);
     if (s.dateRange) setDateRangeState(s.dateRange as string);

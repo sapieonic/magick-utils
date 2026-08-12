@@ -5,8 +5,10 @@ import { describe, it, expect, vi } from "vitest";
 // next/image renders a real <img>; stub to a plain img to avoid the optimizer.
 vi.mock("next/image", () => ({
   default: (props: Record<string, unknown>) => {
+    const imgProps = { ...props };
+    delete imgProps.unoptimized;
     // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
-    return <img {...(props as Record<string, string>)} />;
+    return <img {...(imgProps as Record<string, string>)} />;
   },
 }));
 

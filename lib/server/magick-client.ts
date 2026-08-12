@@ -117,6 +117,7 @@ export interface RawMessage {
   failed_at?: string | null;
   error_code?: string | null;
   error_message?: string | null;
+  reply_text?: string | null;
   provider?: string | null;
   created_at?: string | null;
   [key: string]: unknown;
