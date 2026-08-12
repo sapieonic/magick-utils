@@ -1,3 +1,10 @@
+## [1.2.6](https://github.com/sapieonic/magick-utils/compare/v1.2.5...v1.2.6) (2026-08-12)
+
+
+### Bug Fixes
+
+* unblock analytics ingest stuck on legacy batch locks ([#26](https://github.com/sapieonic/magick-utils/issues/26)) ([fc2a2bd](https://github.com/sapieonic/magick-utils/commit/fc2a2bda951c450c9e5b2bd4c6e3470205485c18)), closes [Pre-#25](https://github.com/Pre-/issues/25)
+
 ## [1.2.5](https://github.com/sapieonic/magick-utils/compare/v1.2.4...v1.2.5) (2026-08-12)
 
 
