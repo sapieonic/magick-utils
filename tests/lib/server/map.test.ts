@@ -141,16 +141,38 @@ describe("bulkJobToBatchDoc", () => {
       provider: "whatsapp", date: "2026-06-10T00:00:00.000Z", total: 200,
       breakdown: [{ key: "read", value: 120 }, { key: "delivered", value: 60 }, { key: "failed", value: 20 }],
       successRate: 120 / 200, spendInr: 0, telephonyInr: 0, aiInr: 0,
-      avgDuration: null, avgTalkTime: null, fingerprint: "x",
+      avgDuration: null, avgTalkTime: null, fingerprint: "x", sourceFingerprint: "source-fp",
       ingestStatus: "ready", updatedAt: "2026-06-10T00:00:00.000Z",
     };
     const job: RawBulkJob = {
       id: "m4", dispatch_type: "whatsapp_message", status: "completed", total_contacts: 200,
     };
-    const doc = bulkJobToBatchDoc(job, ctx, existing);
+    const initial = bulkJobToBatchDoc(job, ctx);
+    const doc = bulkJobToBatchDoc(job, ctx, { ...existing, sourceFingerprint: initial.sourceFingerprint });
     expect(seg(doc, "read")).toBe(120);
     expect(seg(doc, "delivered")).toBe(60);
     expect(seg(doc, "sent")).toBe(0); // not clobbered by the pre-ingestion estimate
+  });
+
+  it("preserves the committed unique total when the upstream raw total includes duplicates", () => {
+    const job: RawBulkJob = {
+      id: "deduped", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 369,
+      updated_at: "2026-08-12T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source,
+      total: 359,
+      ingestStatus: "ready",
+      publishedRevision: "revision-1",
+      fingerprint: "dataset-fp",
+    };
+
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+
+    expect(refreshed.total).toBe(359);
+    expect(refreshed.ingestStatus).toBe("ready");
+    expect(refreshed.publishedRevision).toBe("revision-1");
   });
 
   it("marks a committed dataset stale when the upstream revision changes", () => {

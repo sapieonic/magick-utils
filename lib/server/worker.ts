@@ -4,8 +4,10 @@
 // the BatchDoc summary. Insights/chat run synchronously in their route handlers.
 
 import {
+  beginBatchIngestion,
   checkpointJob,
   claimNextJob,
+  countRecords,
   deleteBatchRevisionRecords,
   deleteUnpublishedBatchRevision,
   failBatchIfOwned,
@@ -17,7 +19,6 @@ import {
   retireBatchRevision,
   replaceBatchRecords,
   updateClaimedJob,
-  upsertBatch,
 } from "./repositories";
 import { MagickApiError, MagickClient } from "./magick-client";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
@@ -136,12 +137,25 @@ export async function processJob(job: Job) {
 
   let done = job.done ?? 0;
   const startBatch = job.batchIndex ?? 0;
+  // Published revisions are the durable source of truth for completed batches.
+  // Job progress can include a partially staged current batch and is therefore
+  // not sufficient to recover this value after a crash.
+  let completedDone = startBatch > 0
+    ? await countRecords(ctx.tenantId, ctx.accountId, job.batchIds.slice(0, startBatch))
+    : 0;
   for (let batchIndex = startBatch; batchIndex < job.batchIds.length; batchIndex += 1) {
     const batchId = job.batchIds[batchIndex];
-    const batchDone = job.cursor ?? 0;
-    const completedDone = done - batchDone;
-    const batchRows = await ingestBatch(client, ctx, job.jobId, job.leaseId, batchId, batchIndex, batchDone, completedDone);
-    done = completedDone + batchRows;
+    done = await ingestBatch(
+      client,
+      ctx,
+      job.jobId,
+      job.leaseId,
+      batchId,
+      batchIndex,
+      job.cursor ?? 0,
+      completedDone,
+    );
+    completedDone = done;
     job.cursor = 0;
   }
 
@@ -158,7 +172,7 @@ async function ingestBatch(
   batchId: string,
   batchIndex: number,
   initialOffset: number,
-  initialDone: number,
+  completedDone: number,
 ): Promise<number> {
   const batch = await getBatch(ctx.tenantId, ctx.accountId, batchId);
   if (!batch) throw new Error(`batch ${batchId} not found (list campaigns first)`);
@@ -167,13 +181,15 @@ async function ingestBatch(
   log().info({ batchId, offset: initialOffset, selType: batch.selType, channel: batch.channel }, "[worker] ingesting batch");
   // Keep an already-published revision readable during refresh. New/stale
   // datasets remain blocked until their first complete revision is committed.
-  await upsertBatch({
-    ...batch,
-    ingestStatus: batch.ingestStatus === "ready" ? "ready" : "ingesting",
-    ingestJobId: jobId,
-    ingestLeaseId: leaseId,
-    updatedAt: new Date().toISOString(),
-  });
+  // Renew and prove job ownership immediately before marking the batch. This
+  // closes the stale-worker window around the separately stored batch marker.
+  const batchLeaseUntil = new Date(Date.now() + LEASE_MS).toISOString();
+  if (!(await updateClaimedJob(jobId, leaseId, { leaseUntil: batchLeaseUntil }))) {
+    throw new Error("job lease lost before batch ingestion");
+  }
+  if (!(await beginBatchIngestion(batch, jobId, leaseId, batchLeaseUntil))) {
+    throw new Error("newer worker owns batch ingestion");
+  }
   const revision = jobId;
   const revisionCreatedAt = new Date();
   if (initialOffset === 0) {
@@ -188,6 +204,9 @@ async function ingestBatch(
     ? await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision)
     : [];
   const expectedRecordIds = new Set(stagedRecords.map((record) => record.recordId));
+  // `cursor` tracks the raw upstream offset, while `done` tracks unique records.
+  // Keeping them separate prevents duplicate rows from moving progress backward
+  // at publication and preserves the correct offset after a worker restart.
   // Upstream totals are progress hints, not pagination boundaries. They can be
   // stale in either direction, so the returned pages determine completion.
   let reportedTotal = batch.total;
@@ -233,7 +252,7 @@ async function ingestBatch(
     await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, uniquePage);
     offset += page.length;
     const checkpoint = await checkpointJob(jobId, leaseId, {
-      done: initialDone + offset,
+      done: completedDone + expectedRecordIds.size,
       cursor: offset,
       batchIndex,
       leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
@@ -303,8 +322,8 @@ async function ingestBatch(
   // Prove ownership immediately before publication. The conditional batch
   // write below closes the remaining lease-expiry window during fingerprinting.
   const ownership = await checkpointJob(jobId, leaseId, {
-    done: initialDone + records.length,
-    cursor: records.length,
+    done: completedDone + records.length,
+    cursor: offset,
     batchIndex,
     leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
   });
@@ -318,8 +337,9 @@ async function ingestBatch(
   await retireBatchRevision(ctx.tenantId, ctx.accountId, batchId, previousRevision).catch((error) => {
     log().warn({ error, batchId, revision: previousRevision }, "[worker] retired revision marking deferred");
   });
-  const transitioned = await checkpointJob(jobId, leaseId, { done: initialDone + records.length, cursor: 0, batchIndex: batchIndex + 1 });
+  const done = completedDone + records.length;
+  const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
   if (!transitioned) throw new Error("job lease lost during batch transition");
   log().info({ batchId, records: records.length, durationMs: Date.now() - startedAt }, "[worker] batch ingested");
-  return records.length;
+  return done;
 }

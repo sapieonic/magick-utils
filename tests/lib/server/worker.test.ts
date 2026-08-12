@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const repositories = vi.hoisted(() => ({
+  beginBatchIngestion: vi.fn(),
   checkpointJob: vi.fn(),
   claimNextJob: vi.fn(),
+  countRecords: vi.fn(),
   deleteBatchRevisionRecords: vi.fn(),
   deleteUnpublishedBatchRevision: vi.fn(),
   failBatchIfOwned: vi.fn(),
@@ -14,7 +16,6 @@ const repositories = vi.hoisted(() => ({
   retireBatchRevision: vi.fn(),
   replaceBatchRecords: vi.fn(),
   updateClaimedJob: vi.fn(),
-  upsertBatch: vi.fn(),
 }));
 const client = vi.hoisted(() => ({ listCalls: vi.fn(), listMessages: vi.fn() }));
 
@@ -68,6 +69,8 @@ const batch = (batchId: string) => ({
 beforeEach(() => {
   vi.clearAllMocks();
   repositories.checkpointJob.mockResolvedValue(job());
+  repositories.beginBatchIngestion.mockResolvedValue(true);
+  repositories.countRecords.mockResolvedValue(0);
   repositories.updateClaimedJob.mockResolvedValue(job());
   repositories.deleteBatchRevisionRecords.mockResolvedValue(undefined);
   repositories.deleteUnpublishedBatchRevision.mockResolvedValue(undefined);
@@ -79,15 +82,18 @@ beforeEach(() => {
   repositories.renewIngestionLocks.mockResolvedValue(undefined);
   repositories.retireBatchRevision.mockResolvedValue(undefined);
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
-  repositories.upsertBatch.mockResolvedValue(undefined);
 });
 
 describe("processJob resume", () => {
   it("resumes at the durable offset and derives progress without double counting", async () => {
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "101" }], total: 101 });
-    repositories.getRecordsForRevision.mockResolvedValue(
-      Array.from({ length: 101 }, (_, index) => ({ recordId: String(index + 1), status: "done" })),
-    );
+    repositories.getRecordsForRevision
+      .mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, index) => ({ recordId: String(index + 1), status: "done" })),
+      )
+      .mockResolvedValueOnce(
+        Array.from({ length: 101 }, (_, index) => ({ recordId: String(index + 1), status: "done" })),
+      );
     await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 101 }));
 
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 100 });
@@ -99,9 +105,67 @@ describe("processJob resume", () => {
     expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({ status: "done", done: 101 }));
   });
 
+  it("keeps the raw pagination cursor separate from unique-record progress", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 3 });
+    client.listCalls.mockResolvedValueOnce({
+      calls: [{ id: "dup" }, { id: "dup" }, { id: "unique" }],
+      total: 3,
+    });
+    repositories.getRecordsForRevision.mockResolvedValue([
+      { recordId: "dup", status: "done" },
+      { recordId: "unique", status: "done" },
+    ]);
+
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+
+    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({
+      done: 2,
+      cursor: 3,
+      batchIndex: 0,
+    }));
+    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(2, "j1", "lease-1", expect.objectContaining({
+      done: 2,
+      cursor: 3,
+      batchIndex: 0,
+    }));
+    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(3, "j1", "lease-1", {
+      done: 2,
+      cursor: 0,
+      batchIndex: 1,
+    });
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({
+      status: "done",
+      done: 2,
+    }));
+  });
+
+  it("resumes duplicate-heavy pagination from the raw offset with unique progress", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "unique" }], total: 3 });
+    repositories.getRecordsForRevision
+      .mockResolvedValueOnce([{ recordId: "dup", status: "done" }])
+      .mockResolvedValueOnce([
+        { recordId: "dup", status: "done" },
+        { recordId: "unique", status: "done" },
+      ]);
+
+    await processJob(job({ done: 1, cursor: 2, batchIndex: 0, batchIds: ["b1"], total: 3 }));
+
+    expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 2 });
+    expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({
+      done: 2,
+      cursor: 3,
+    }));
+    expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith("j1", "lease-1", expect.objectContaining({
+      status: "done",
+      done: 2,
+    }));
+  });
+
   it("starts the next batch from zero after a durable batch transition", async () => {
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+    repositories.countRecords.mockResolvedValueOnce(100);
     await processJob(job({ done: 100, cursor: 0, batchIndex: 1 }));
+    expect(repositories.countRecords).toHaveBeenCalledWith("t1", "a1", ["b1"]);
     expect(repositories.getBatch).toHaveBeenCalledTimes(1);
     expect(repositories.getBatch).toHaveBeenCalledWith("t1", "a1", "b2");
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b2", limit: 100, offset: 0 });
@@ -113,7 +177,12 @@ describe("processJob resume", () => {
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
     repositories.checkpointJob.mockResolvedValueOnce(null);
     await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow("job lease lost while checkpointing");
-    expect(repositories.updateClaimedJob).not.toHaveBeenCalled();
+    expect(repositories.updateClaimedJob).toHaveBeenCalledTimes(1);
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      { leaseUntil: expect.any(String) },
+    );
   });
 
   it("treats paginated rows as authoritative when an upstream total is stale-high", async () => {
@@ -199,6 +268,15 @@ describe("processJob resume", () => {
       "lease lost during batch publication",
     );
   });
+
+  it("stops before fetching when a newer worker owns the batch", async () => {
+    repositories.beginBatchIngestion.mockResolvedValueOnce(false);
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(
+      "newer worker owns batch ingestion",
+    );
+    expect(client.listCalls).not.toHaveBeenCalled();
+  });
 });
 
 describe("runClaimedJob 429", () => {
@@ -219,7 +297,7 @@ describe("runClaimedJob 429", () => {
 
   it("surfaces scheduling persistence failure", async () => {
     client.listCalls.mockRejectedValueOnce(new MagickApiError(429, "limited", "url", "1"));
-    repositories.updateClaimedJob.mockResolvedValueOnce(null);
+    repositories.updateClaimedJob.mockResolvedValueOnce(job()).mockResolvedValueOnce(null);
     await expect(runClaimedJob(job({ batchIds: ["b1"] }))).rejects.toThrow("job lease lost before rate-limit scheduling");
   });
 });
@@ -228,6 +306,8 @@ describe("runClaimedJob terminal failures", () => {
   it("marks a partially written batch as errored", async () => {
     client.listCalls.mockRejectedValueOnce(new Error("upstream failed"));
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), ingestStatus: "ingesting" });
+    repositories.beginBatchIngestion.mockResolvedValue(true);
+    repositories.updateClaimedJob.mockResolvedValue(job());
     await runClaimedJob(job({ batchIds: ["b1"] }));
     expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
   });

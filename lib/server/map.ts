@@ -123,13 +123,30 @@ function messageBreakdown(status: string, total: number): BreakdownSeg[] {
 export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?: BatchDoc | null): BatchDoc {
   const map = dispatchTypeToType(job.dispatch_type);
   const sourceId = (job.id ?? "").toString();
-  const total = job.total_contacts ?? 0;
+  const sourceTotal = job.total_contacts ?? 0;
   const ingested = existing?.ingestStatus === "ready";
+  const sourceFp = fingerprint([
+    sourceId,
+    sourceTotal,
+    job.status,
+    job.updated_at,
+    JSON.stringify(job.status_summary ?? null),
+    JSON.stringify(job.call_status_counts ?? null),
+  ]);
+  // Records ingested before source fingerprints were introduced cannot be
+  // proven current. Invalidate them once so the next read rebuilds the source.
+  const sourceChanged = Boolean(
+    ingested && (!existing?.sourceFingerprint || existing.sourceFingerprint !== sourceFp),
+  );
+  const committed = Boolean(ingested && !sourceChanged && existing);
+  // Once committed, unique normalized records—not a possibly stale/raw contact
+  // count—are authoritative for readiness, analytics, and exports.
+  const total = committed ? existing!.total : sourceTotal;
 
   let breakdown: BreakdownSeg[];
   let successRate: number;
 
-  if (ingested && existing) {
+  if (committed && existing) {
     // Exact figures already computed by ingestion — don't clobber with the estimate.
     breakdown = existing.breakdown;
     successRate = existing.successRate;
@@ -156,24 +173,10 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     }
   }
 
-  const sourceFp = fingerprint([
-    sourceId,
-    total,
-    job.status,
-    job.updated_at,
-    JSON.stringify(job.status_summary ?? null),
-    JSON.stringify(job.call_status_counts ?? null),
-  ]);
   // Key by the upstream source id so the campaigns listing, ingestion worker, and
   // frontend batch ids all align. (humanBatchId is kept for a future display id.)
   const batchId = existing?.batchId ?? sourceId;
 
-  // Records ingested before source fingerprints were introduced cannot be proven
-  // current. Invalidate them once so the next read is rebuilt from the source.
-  const sourceChanged = Boolean(
-    existing?.ingestStatus === "ready"
-      && (!existing.sourceFingerprint || existing.sourceFingerprint !== sourceFp),
-  );
   return {
     tenantId: ctx.tenantId,
     accountId: ctx.accountId,
@@ -202,6 +205,7 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     ingestStatus: sourceChanged ? "none" : existing?.ingestStatus ?? "none",
     ingestJobId: existing?.ingestJobId,
     ingestLeaseId: existing?.ingestLeaseId,
+    ingestLeaseUntil: existing?.ingestLeaseUntil,
     updatedAt: new Date().toISOString(),
   };
 }

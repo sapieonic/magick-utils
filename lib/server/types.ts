@@ -42,6 +42,9 @@ export interface BatchDoc {
   /** Current worker ownership, used for conditional revision publication. */
   ingestJobId?: string;
   ingestLeaseId?: string;
+  /** Ordering token for batch ownership. A reclaimed worker always has a later
+   * lease deadline, so a stale worker cannot overwrite its ownership marker. */
+  ingestLeaseUntil?: string;
   updatedAt: string;
 }
 

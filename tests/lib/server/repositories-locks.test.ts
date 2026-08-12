@@ -9,7 +9,7 @@ const locks = vi.hoisted(() => ({
 }));
 const usage = vi.hoisted(() => ({ findOneAndUpdate: vi.fn() }));
 const jobs = vi.hoisted(() => ({ findOne: vi.fn() }));
-const batchDb = vi.hoisted(() => ({ find: vi.fn() }));
+const batchDb = vi.hoisted(() => ({ find: vi.fn(), findOne: vi.fn(), findOneAndUpdate: vi.fn(), updateOne: vi.fn() }));
 const recordDb = vi.hoisted(() => ({ deleteMany: vi.fn() }));
 
 vi.mock("@/lib/server/db", () => ({
@@ -24,10 +24,78 @@ vi.mock("@/lib/server/db", () => ({
 
 import {
   acquireIngestionLocks,
+  beginBatchIngestion,
   consumeAiQuota,
   deleteRetiredRecordRevisionsOlderThan,
   IngestionConflictError,
+  refreshBatchFromSource,
 } from "@/lib/server/repositories";
+
+describe("source batch refresh", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("updates only the exact source snapshot that was read", async () => {
+    const refreshed = { tenantId: "t1", accountId: "a1", batchId: "b1", updatedAt: "new" };
+    batchDb.findOneAndUpdate.mockResolvedValue(refreshed);
+
+    await expect(refreshBatchFromSource(refreshed as never, "old")).resolves.toBe(refreshed);
+
+    expect(batchDb.findOneAndUpdate).toHaveBeenCalledWith(
+      { tenantId: "t1", accountId: "a1", batchId: "b1", updatedAt: "old" },
+      { $set: refreshed },
+      { returnDocument: "after" },
+    );
+  });
+
+  it("returns a concurrently published batch instead of overwriting it", async () => {
+    const stale = { tenantId: "t1", accountId: "a1", batchId: "b1", updatedAt: "stale" };
+    const published = { ...stale, updatedAt: "published", publishedRevision: "r2" };
+    batchDb.findOneAndUpdate.mockResolvedValue(null);
+    batchDb.findOne.mockResolvedValue(published);
+
+    await expect(refreshBatchFromSource(stale as never, "old")).resolves.toBe(published);
+
+    expect(batchDb.findOneAndUpdate).toHaveBeenCalledOnce();
+    expect(batchDb.findOne).toHaveBeenCalledWith({ tenantId: "t1", accountId: "a1", batchId: "b1" });
+  });
+});
+
+describe("batch worker ownership", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("orders competing workers by their lease deadline", async () => {
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+    const doc = {
+      tenantId: "t1", accountId: "a1", batchId: "b1", ingestStatus: "none",
+      updatedAt: "old",
+    };
+
+    await expect(beginBatchIngestion(doc as never, "j1", "lease-new", "2026-08-12T12:02:00Z"))
+      .resolves.toBe(true);
+
+    expect(batchDb.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: "t1",
+        accountId: "a1",
+        batchId: "b1",
+        $or: expect.arrayContaining([{ ingestLeaseUntil: { $lt: "2026-08-12T12:02:00Z" } }]),
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          ingestJobId: "j1",
+          ingestLeaseId: "lease-new",
+          ingestLeaseUntil: "2026-08-12T12:02:00Z",
+        }),
+      }),
+    );
+  });
+
+  it("rejects a stale worker when its ownership update no longer matches", async () => {
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 0 });
+    await expect(beginBatchIngestion({ tenantId: "t1", accountId: "a1", batchId: "b1" } as never, "j1", "old", "2026-08-12T12:01:00Z"))
+      .resolves.toBe(false);
+  });
+});
 
 describe("ingestion admission locks", () => {
   beforeEach(() => {

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext } from "@/lib/server/session";
 import { MagickClient, MagickApiError } from "@/lib/server/magick-client";
-import { getBatch, upsertBatch } from "@/lib/server/repositories";
+import { getBatch, refreshBatchFromSource } from "@/lib/server/repositories";
 import { batchDocToBatch, bulkJobToBatchDoc } from "@/lib/server/map";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
@@ -30,8 +30,7 @@ export const GET = withLogging("campaigns", async () => {
         // figures (spend, exact breakdown) across refreshes.
         const existing = await getBatch(ctx.tenantId, ctx.accountId, sourceId).catch(() => null);
         const doc = bulkJobToBatchDoc(job, ctx, existing);
-        await upsertBatch(doc);
-        return doc;
+        return refreshBatchFromSource(doc, existing?.updatedAt ?? null);
       }),
     );
     const batches = docs
