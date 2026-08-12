@@ -13,6 +13,13 @@ import {
   jobs,
   records,
 } from "@/lib/server/db";
+import {
+  assembleDashboardQuality,
+  emptyDashboardVolume,
+  HANGUP_TALK_SECONDS,
+  IVR_HANGUP_NODE_KEYS,
+  SHORT_CALL_SECONDS,
+} from "@/lib/server/dashboard-quality";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -371,11 +378,7 @@ export async function getDashboardVolume(
   const readyBatches = (await listBatches(tenantId, accountId))
     .filter((batch) => batch.ingestStatus === "ready");
   if (readyBatches.length === 0) {
-    return {
-      timezone: "UTC", range, start: start?.toISOString() ?? null, end: end.toISOString(),
-      totalRecords: 0, totalCalls: 0, totalMessages: 0, successRate: 0,
-      spendInr: 0, telephonyInr: 0, aiInr: 0, statusMix: [], points: [],
-    };
+    return emptyDashboardVolume(range, start, end);
   }
   const eventDate = {
     $ifNull: [
@@ -430,14 +433,112 @@ export async function getDashboardVolume(
   };
   const dateMatch: Record<string, Date> = { $lte: end };
   if (start) dateMatch.$gte = start;
-  const rows = await col.aggregate<{
-    _id: { date: string; status: string };
-    calls: number;
-    messages: number;
-    total: number;
-    spendInr: number;
-    telephonyInr: number;
-    aiInr: number;
+  const durationBucketExpr = {
+    $switch: {
+      branches: [
+        { case: { $lt: ["$durationSeconds", 30] }, then: "0–30s" },
+        { case: { $lt: ["$durationSeconds", 60] }, then: "30–60s" },
+        { case: { $lt: ["$durationSeconds", 120] }, then: "1–2m" },
+        { case: { $lt: ["$durationSeconds", 180] }, then: "2–3m" },
+        { case: { $lt: ["$durationSeconds", 300] }, then: "3–5m" },
+      ],
+      default: "5m+",
+    },
+  };
+  const pathNorm = {
+    $replaceAll: {
+      input: {
+        $replaceAll: {
+          input: { $ifNull: ["$ivrPath", ""] },
+          find: "/",
+          replacement: ">",
+        },
+      },
+      find: "|",
+      replacement: ">",
+    },
+  };
+  const nodesExpr = {
+    $filter: {
+      input: {
+        $map: {
+          input: { $split: ["$_pathNorm", ">"] },
+          as: "n",
+          in: { $trim: { input: "$$n" } },
+        },
+      },
+      as: "n",
+      cond: { $gt: [{ $strLenCP: "$$n" }, 0] },
+    },
+  };
+  const endNodeExpr = {
+    $toLower: {
+      $replaceAll: {
+        input: {
+          $replaceAll: {
+            input: {
+              $trim: {
+                input: {
+                  $cond: [
+                    { $gt: [{ $strLenCP: { $trim: { input: { $ifNull: ["$completedNode", ""] } } } }, 0] },
+                    { $ifNull: ["$completedNode", ""] },
+                    { $ifNull: [{ $arrayElemAt: ["$_nodes", -1] }, ""] },
+                  ],
+                },
+              },
+            },
+            find: "-",
+            replacement: "_",
+          },
+        },
+        find: " ",
+        replacement: "_",
+      },
+    },
+  };
+  const outcomeKeyExpr = {
+    $toLower: {
+      $trim: {
+        input: {
+          $convert: { input: "$outcome", to: "string", onError: "", onNull: "" },
+        },
+      },
+    },
+  };
+  const facet = await col.aggregate<{
+    volume: Array<{
+      _id: { date: string; status: string };
+      calls: number;
+      messages: number;
+      total: number;
+      spendInr: number;
+      telephonyInr: number;
+      aiInr: number;
+    }>;
+    voiceConnect: Array<{ _id: string; value: number }>;
+    messageFunnel: Array<{ sent: number; delivered: number; read: number; replied: number }>;
+    outcomes: Array<{ _id: string; value: number }>;
+    shortCalls: Array<{
+      withDuration: number;
+      shortCount: number;
+      hangupCount: number;
+      withTalk: number;
+      durationSum: number;
+      talkSum: number;
+    }>;
+    shortCallBuckets: Array<{ _id: string; calls: number }>;
+    ivrEnds: Array<{ _id: string; value: number }>;
+    ivrPaths: Array<{ _id: string; value: number }>;
+    ivrDtmf: Array<{ _id: string; value: number }>;
+    ivrDepth: Array<{
+      total: number;
+      withPath: number;
+      hangupCount: number;
+      d1: number;
+      d2: number;
+      d3: number;
+      d4: number;
+    }>;
   }>([
     {
       $match: {
@@ -452,26 +553,194 @@ export async function getDashboardVolume(
     { $set: { _eventDate: eventDate } },
     { $match: { _eventDate: dateMatch } },
     {
-      $group: {
-        _id: {
-          date: { $dateToString: { date: "$_eventDate", format: "%Y-%m-%d", timezone: "UTC" } },
-          status: canonicalStatus,
-        },
-        calls: { $sum: { $cond: [{ $eq: ["$selType", "message"] }, 0, 1] } },
-        messages: { $sum: { $cond: [{ $eq: ["$selType", "message"] }, 1, 0] } },
-        total: { $sum: 1 },
-        spendInr: { $sum: { $ifNull: ["$totalCostInr", 0] } },
-        telephonyInr: { $sum: { $ifNull: ["$telephonyCostInr", 0] } },
-        aiInr: { $sum: { $ifNull: ["$aiCostInr", 0] } },
+      $set: {
+        _status: canonicalStatus,
+        _pathNorm: pathNorm,
+        _outcomeKey: outcomeKeyExpr,
       },
     },
-    { $sort: { "_id.date": 1 } },
+    { $set: { _nodes: nodesExpr } },
+    { $set: { _endNode: endNodeExpr } },
+    {
+      $facet: {
+        volume: [
+          {
+            $group: {
+              _id: {
+                date: { $dateToString: { date: "$_eventDate", format: "%Y-%m-%d", timezone: "UTC" } },
+                status: "$_status",
+              },
+              calls: { $sum: { $cond: [{ $eq: ["$selType", "message"] }, 0, 1] } },
+              messages: { $sum: { $cond: [{ $eq: ["$selType", "message"] }, 1, 0] } },
+              total: { $sum: 1 },
+              spendInr: { $sum: { $ifNull: ["$totalCostInr", 0] } },
+              telephonyInr: { $sum: { $ifNull: ["$telephonyCostInr", 0] } },
+              aiInr: { $sum: { $ifNull: ["$aiCostInr", 0] } },
+            },
+          },
+          { $sort: { "_id.date": 1 } },
+        ],
+        voiceConnect: [
+          { $match: { selType: { $ne: "message" } } },
+          { $group: { _id: "$_status", value: { $sum: 1 } } },
+        ],
+        messageFunnel: [
+          { $match: { selType: "message" } },
+          {
+            $group: {
+              _id: null,
+              sent: { $sum: 1 },
+              delivered: {
+                $sum: { $cond: [{ $in: ["$_status", ["delivered", "read"]] }, 1, 0] },
+              },
+              read: { $sum: { $cond: [{ $eq: ["$_status", "read"] }, 1, 0] } },
+              replied: {
+                $sum: {
+                  $cond: [
+                    {
+                      $gt: [
+                        {
+                          $strLenCP: {
+                            $trim: { input: { $ifNull: ["$replyText", ""] } },
+                          },
+                        },
+                        0,
+                      ],
+                    },
+                    1,
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        outcomes: [
+          { $match: { $expr: { $gt: [{ $strLenCP: "$_outcomeKey" }, 0] } } },
+          { $group: { _id: "$_outcomeKey", value: { $sum: 1 } } },
+        ],
+        shortCalls: [
+          {
+            $match: {
+              selType: { $ne: "message" },
+              _status: "completed",
+              durationSeconds: { $type: "number" },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              withDuration: { $sum: 1 },
+              shortCount: {
+                $sum: { $cond: [{ $lt: ["$durationSeconds", SHORT_CALL_SECONDS] }, 1, 0] },
+              },
+              withTalk: {
+                $sum: { $cond: [{ $isNumber: "$talkTimeSeconds" }, 1, 0] },
+              },
+              hangupCount: {
+                $sum: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $isNumber: "$talkTimeSeconds" },
+                        { $lt: ["$talkTimeSeconds", HANGUP_TALK_SECONDS] },
+                      ],
+                    },
+                    1,
+                    0,
+                  ],
+                },
+              },
+              durationSum: { $sum: "$durationSeconds" },
+              talkSum: {
+                $sum: {
+                  $cond: [
+                    { $isNumber: "$talkTimeSeconds" },
+                    "$talkTimeSeconds",
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        shortCallBuckets: [
+          {
+            $match: {
+              selType: { $ne: "message" },
+              _status: "completed",
+              durationSeconds: { $type: "number" },
+            },
+          },
+          { $group: { _id: durationBucketExpr, calls: { $sum: 1 } } },
+        ],
+        ivrEnds: [
+          { $match: { selType: "ivr", _endNode: { $ne: "" } } },
+          { $group: { _id: "$_endNode", value: { $sum: 1 } } },
+        ],
+        ivrPaths: [
+          { $match: { selType: "ivr", $expr: { $gt: [{ $size: "$_nodes" }, 0] } } },
+          { $group: { _id: { $reduce: {
+            input: "$_nodes",
+            initialValue: "",
+            in: {
+              $cond: [
+                { $eq: ["$$value", ""] },
+                "$$this",
+                { $concat: ["$$value", ">", "$$this"] },
+              ],
+            },
+          } }, value: { $sum: 1 } } },
+        ],
+        ivrDtmf: [
+          {
+            $match: {
+              selType: "ivr",
+              $expr: {
+                $gt: [{ $strLenCP: { $trim: { input: { $ifNull: ["$dtmfInput", ""] } } } }, 0],
+              },
+            },
+          },
+          { $group: { _id: { $trim: { input: "$dtmfInput" } }, value: { $sum: 1 } } },
+        ],
+        ivrDepth: [
+          { $match: { selType: "ivr" } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: 1 },
+              withPath: { $sum: { $cond: [{ $gt: [{ $size: "$_nodes" }, 0] }, 1, 0] } },
+              hangupCount: {
+                $sum: { $cond: [{ $in: ["$_endNode", [...IVR_HANGUP_NODE_KEYS]] }, 1, 0] },
+              },
+              d1: { $sum: { $cond: [{ $gte: [{ $size: "$_nodes" }, 1] }, 1, 0] } },
+              d2: { $sum: { $cond: [{ $gte: [{ $size: "$_nodes" }, 2] }, 1, 0] } },
+              d3: { $sum: { $cond: [{ $gte: [{ $size: "$_nodes" }, 3] }, 1, 0] } },
+              d4: { $sum: { $cond: [{ $gte: [{ $size: "$_nodes" }, 4] }, 1, 0] } },
+            },
+          },
+        ],
+      },
+    },
   ]).toArray();
+
+  const grouped = facet[0] ?? {
+    volume: [],
+    voiceConnect: [],
+    messageFunnel: [],
+    outcomes: [],
+    shortCalls: [],
+    shortCallBuckets: [],
+    ivrEnds: [],
+    ivrPaths: [],
+    ivrDtmf: [],
+    ivrDepth: [],
+  };
 
   const pointMap = new Map<string, { date: string; calls: number; messages: number }>();
   const statusMap = new Map<string, number>();
   let totalCalls = 0, totalMessages = 0, spendInr = 0, telephonyInr = 0, aiInr = 0, reached = 0;
-  for (const row of rows) {
+  for (const row of grouped.volume) {
     const point = pointMap.get(row._id.date) ?? { date: row._id.date, calls: 0, messages: 0 };
     point.calls += row.calls;
     point.messages += row.messages;
@@ -485,6 +754,7 @@ export async function getDashboardVolume(
     if (row._id.status === "completed" || row._id.status === "read") reached += row.total;
   }
   const totalRecords = totalCalls + totalMessages;
+  const quality = assembleDashboardQuality(grouped);
 
   return {
     timezone: "UTC",
@@ -500,6 +770,7 @@ export async function getDashboardVolume(
     aiInr,
     statusMix: [...statusMap].map(([key, value]) => ({ key, value })),
     points: [...pointMap.values()],
+    ...quality,
   };
 }
 

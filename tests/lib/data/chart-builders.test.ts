@@ -5,6 +5,7 @@ import {
   durationHistogram,
   sentimentData,
   messagingFunnel,
+  mockDashboardQuality,
   costBreakdown,
   TOPICS,
 } from "@/lib/data";
@@ -110,6 +111,17 @@ describe("messagingFunnel", () => {
       expect(f[i].value).toBeLessThan(f[i - 1].value);
     }
     f.forEach((s) => expect(s.color).toMatch(/^#[0-9a-f]{6}$/i));
+  });
+});
+
+describe("mockDashboardQuality", () => {
+  it("supplies the dashboard quality panels used in demo mode", () => {
+    const q = mockDashboardQuality();
+    expect(q.voiceConnectMix.some((s) => s.key === "completed" && s.value > 0)).toBe(true);
+    expect(q.messageFunnel.map((s) => s.stage)).toEqual(["Sent", "Delivered", "Read", "Replied"]);
+    expect(q.outcomes[0]?.key).toBe("promise_to_pay");
+    expect(q.shortCalls?.connectedWithDuration).toBeGreaterThan(0);
+    expect(q.ivrDropoff?.topPaths[0]?.path).toContain("›");
   });
 });
 

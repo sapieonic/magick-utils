@@ -4,6 +4,7 @@ vi.mock("@/lib/server/env", () => ({ isBackendConfigured: vi.fn() }));
 vi.mock("@/lib/server/session", () => ({ getTenantContext: vi.fn() }));
 vi.mock("@/lib/server/repositories", () => ({ getDashboardVolume: vi.fn() }));
 
+import { emptyDashboardQuality } from "@/lib/server/dashboard-quality";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getDashboardVolume } from "@/lib/server/repositories";
 import { getTenantContext } from "@/lib/server/session";
@@ -51,6 +52,7 @@ describe("POST /api/dashboard", () => {
       aiInr: 4,
       statusMix: [{ key: "completed", value: 2 }],
       points: [{ date: "2026-08-12", calls: 2, messages: 1 }],
+      ...emptyDashboardQuality(),
     });
     const { POST } = await import("@/app/api/dashboard/route");
     const res = await POST(request({ range: "Last 7 days" }));

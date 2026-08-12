@@ -6,7 +6,7 @@ import { Card, Button, TypeDot, TypeBadge, StatusStackBar, SkeletonRow, StatCard
 import {
   aggregate,
   callsOverTime,
-  statusMix,
+  mockDashboardQuality,
   sparkline,
   typeKey,
   fmtNum,
@@ -23,9 +23,13 @@ import { getDashboardVolume, listCampaigns } from "@/lib/api";
 import { inDashboardRange, isDashboardRange, rangeStart, type DashboardRange } from "@/lib/date-range";
 import type { DashboardVolume } from "@/lib/server/types";
 import { fillDashboardDays } from "@/lib/dashboard";
+import { FunnelBars } from "@/components/screens/dashboard/FunnelBars";
+import { IvrDropoffCard } from "@/components/screens/dashboard/IvrDropoffCard";
 import { Legend } from "@/components/screens/dashboard/Legend";
-import { VolumeChart } from "@/components/screens/dashboard/VolumeChart";
+import { RankedBars } from "@/components/screens/dashboard/RankedBars";
+import { ShortCallCard } from "@/components/screens/dashboard/ShortCallCard";
 import { StatusDonut } from "@/components/screens/dashboard/StatusDonut";
+import { VolumeChart } from "@/components/screens/dashboard/VolumeChart";
 
 export default function DashboardScreen() {
   const { currency, dateRange, setAnalyzeTargets, user } = useApp();
@@ -96,16 +100,18 @@ export default function DashboardScreen() {
       }),
     }));
   }, [selectedRange, source, volume]);
-  const mix = useMemo(
-    () => source === "mock"
-      ? statusMix(rangeBatches)
-      : (volume?.statusMix ?? []).map(({ key, value }) => ({
-          key,
-          value,
-          name: STATUS[key as StatusKey]?.label ?? key,
-          color: STATUS[key as StatusKey]?.color ?? "#94a3b8",
-        })),
-    [rangeBatches, source, volume],
+  const quality = useMemo(
+    () => (source === "mock" ? mockDashboardQuality() : volume),
+    [source, volume],
+  );
+  const voiceMix = useMemo(
+    () => (quality?.voiceConnectMix ?? []).map(({ key, value }) => ({
+      key,
+      value,
+      name: STATUS[key as StatusKey]?.label ?? key,
+      color: STATUS[key as StatusKey]?.color ?? "#94a3b8",
+    })),
+    [quality],
   );
   const recent = useMemo(
     () => [...rangeBatches].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).slice(0, 6),
@@ -180,17 +186,80 @@ export default function DashboardScreen() {
           )}
         </ChartCard>
 
-        <ChartCard title="Status mix" subtitle="All records this period">
+        <ChartCard title="Voice connect mix" subtitle="Why calls connected — or didn't · this period">
           {loading ? (
             <div className="skeleton h-[260px] w-full" />
           ) : liveVolumeUnavailable ? (
             <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              Status activity is temporarily unavailable. No estimated values are shown.
+              Voice connect mix is temporarily unavailable. No estimated values are shown.
+            </div>
+          ) : voiceMix.length === 0 ? (
+            <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
+              No ingested voice calls were placed in this period.
             </div>
           ) : (
-            <StatusDonut data={mix} />
+            <StatusDonut data={voiceMix} unit="calls" />
           )}
         </ChartCard>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+        <ChartCard title="Message funnel" subtitle="Sent → delivered → read → replied">
+          {loading ? (
+            <div className="skeleton h-[220px] w-full" />
+          ) : liveVolumeUnavailable ? (
+            <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
+              Message delivery is temporarily unavailable. No estimated values are shown.
+            </div>
+          ) : !quality?.messageFunnel?.length ? (
+            <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
+              No ingested messages were sent in this period.
+            </div>
+          ) : (
+            <FunnelBars data={quality.messageFunnel} />
+          )}
+        </ChartCard>
+        <ChartCard title="Business outcomes" subtitle="Per-call outcome from master · top reasons this period">
+          {loading ? (
+            <div className="skeleton h-[220px] w-full" />
+          ) : liveVolumeUnavailable ? (
+            <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
+              Outcomes are temporarily unavailable. No estimated values are shown.
+            </div>
+          ) : (
+            <RankedBars
+              items={(quality?.outcomes ?? []).map((o) => ({ label: o.label ?? o.key, value: o.value }))}
+              empty="No business outcomes were recorded on ingested calls in this period."
+            />
+          )}
+        </ChartCard>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+        {loading ? (
+          <>
+            <div className="skeleton h-[320px] w-full rounded-2xl" />
+            <div className="skeleton h-[320px] w-full rounded-2xl" />
+          </>
+        ) : liveVolumeUnavailable ? (
+          <>
+            <ChartCard title="Short calls & hang-ups" subtitle="Connected calls only">
+              <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
+                Short-call activity is temporarily unavailable. No estimated values are shown.
+              </div>
+            </ChartCard>
+            <ChartCard title="IVR drop-off" subtitle="Where IVR callers stopped">
+              <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
+                IVR drop-off is temporarily unavailable. No estimated values are shown.
+              </div>
+            </ChartCard>
+          </>
+        ) : (
+          <>
+            <ShortCallCard stats={quality?.shortCalls ?? null} />
+            <IvrDropoffCard dropoff={quality?.ivrDropoff ?? null} />
+          </>
+        )}
       </div>
 
       {/* recent campaigns */}

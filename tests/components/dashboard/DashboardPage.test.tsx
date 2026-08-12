@@ -18,6 +18,10 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/components/screens/dashboard/Legend", () => ({ Legend: () => null }));
 vi.mock("@/components/screens/dashboard/VolumeChart", () => ({ VolumeChart: () => null }));
 vi.mock("@/components/screens/dashboard/StatusDonut", () => ({ StatusDonut: () => null }));
+vi.mock("@/components/screens/dashboard/FunnelBars", () => ({ FunnelBars: () => null }));
+vi.mock("@/components/screens/dashboard/RankedBars", () => ({ RankedBars: () => null }));
+vi.mock("@/components/screens/dashboard/ShortCallCard", () => ({ ShortCallCard: () => null }));
+vi.mock("@/components/screens/dashboard/IvrDropoffCard", () => ({ IvrDropoffCard: () => null }));
 
 import DashboardScreen from "@/app/(app)/dashboard/page";
 import { getDashboardVolume, listCampaigns } from "@/lib/api";
@@ -40,6 +44,16 @@ describe("DashboardScreen live-data failures", () => {
 
     await waitFor(() => {
       expect(screen.getByText("Daily activity is temporarily unavailable. No estimated values are shown."))
+        .toBeInTheDocument();
+      expect(screen.getByText("Voice connect mix is temporarily unavailable. No estimated values are shown."))
+        .toBeInTheDocument();
+      expect(screen.getByText("Message delivery is temporarily unavailable. No estimated values are shown."))
+        .toBeInTheDocument();
+      expect(screen.getByText("Outcomes are temporarily unavailable. No estimated values are shown."))
+        .toBeInTheDocument();
+      expect(screen.getByText("Short-call activity is temporarily unavailable. No estimated values are shown."))
+        .toBeInTheDocument();
+      expect(screen.getByText("IVR drop-off is temporarily unavailable. No estimated values are shown."))
         .toBeInTheDocument();
     });
 

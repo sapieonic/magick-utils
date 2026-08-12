@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fillDashboardDays } from "@/lib/dashboard";
 import { inDashboardRange, rangeStart } from "@/lib/date-range";
+import { emptyDashboardQuality } from "@/lib/server/dashboard-quality";
 
 describe("dashboard date ranges", () => {
   const now = new Date("2026-08-12T12:00:00Z");
@@ -34,6 +35,7 @@ describe("dashboard date ranges", () => {
         { date: "2026-08-10", calls: 3, messages: 0 },
         { date: "2026-08-12", calls: 0, messages: 1 },
       ],
+      ...emptyDashboardQuality(),
     });
     expect(points).toEqual([
       { date: "2026-08-10", calls: 3, messages: 0 },
