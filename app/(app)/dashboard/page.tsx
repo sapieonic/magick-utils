@@ -19,10 +19,9 @@ import {
 } from "@/lib/data";
 import { useApp } from "@/lib/store";
 import type { Batch, StatusKey } from "@/lib/types";
-import { getDashboardVolume, listCampaigns } from "@/lib/api";
+import { listCampaigns } from "@/lib/api";
 import { inDashboardRange, isDashboardRange, rangeStart, type DashboardRange } from "@/lib/date-range";
-import type { DashboardVolume } from "@/lib/server/types";
-import { fillDashboardDays } from "@/lib/dashboard";
+import { dashboardVolumeFromCampaigns, fillDashboardDays } from "@/lib/dashboard";
 import { Legend } from "@/components/screens/dashboard/Legend";
 import { VolumeChart } from "@/components/screens/dashboard/VolumeChart";
 import { StatusDonut } from "@/components/screens/dashboard/StatusDonut";
@@ -37,31 +36,22 @@ export default function DashboardScreen() {
   // the backend is off; on a live backend mock data never enters this screen.
   const [batches, setBatches] = useState<Batch[]>([]);
   const [source, setSource] = useState<"live" | "mock">("mock");
-  const [volume, setVolume] = useState<DashboardVolume | null>(null);
-  const [volumeError, setVolumeError] = useState(false);
 
   // load via the data seam — returns mock when the backend is off, live data when on
   useEffect(() => {
     let active = true;
     const range: DashboardRange = isDashboardRange(dateRange) ? dateRange : "Last 30 days";
-    Promise.allSettled([listCampaigns(), getDashboardVolume(range)])
-      .then(([campaignResult, volumeResult]) => {
+    listCampaigns()
+      .then((result) => {
         if (!active) return;
-        if (campaignResult.status === "fulfilled") {
-          setBatches(campaignResult.value.batches);
-          setSource(campaignResult.value.source);
-        } else {
-          setBatches([]);
-          // A failed configured backend must never expose demo data as live data.
-          setSource("live");
-        }
-        if (volumeResult.status === "fulfilled") {
-          setVolume(volumeResult.value);
-          setVolumeError(false);
-        } else {
-          setVolume(null);
-          setVolumeError(true);
-        }
+        setBatches(result.batches);
+        setSource(result.source);
+      })
+      .catch(() => {
+        if (!active) return;
+        setBatches([]);
+        // A failed configured backend must never expose demo data as live data.
+        setSource("live");
       })
       .finally(() => {
         if (active) setLoadedRange(range);
@@ -76,6 +66,10 @@ export default function DashboardScreen() {
     [batches, selectedRange],
   );
   const agg = useMemo(() => aggregate(rangeBatches), [rangeBatches]);
+  const campaignVolume = useMemo(
+    () => dashboardVolumeFromCampaigns(rangeBatches, selectedRange),
+    [rangeBatches, selectedRange],
+  );
   const timeData = useMemo(() => {
     if (source === "mock") {
       const now = new Date();
@@ -86,7 +80,7 @@ export default function DashboardScreen() {
             : 180;
       return callsOverTime(mockDays);
     }
-    return (volume ? fillDashboardDays(volume) : []).map((point) => ({
+    return fillDashboardDays(campaignVolume).map((point) => ({
       ...point,
       date: new Date(`${point.date}T00:00:00Z`).toLocaleDateString("en-US", {
         month: "short",
@@ -95,17 +89,17 @@ export default function DashboardScreen() {
         timeZone: "UTC",
       }),
     }));
-  }, [selectedRange, source, volume]);
+  }, [campaignVolume, selectedRange, source]);
   const mix = useMemo(
     () => source === "mock"
       ? statusMix(rangeBatches)
-      : (volume?.statusMix ?? []).map(({ key, value }) => ({
+      : campaignVolume.statusMix.map(({ key, value }) => ({
           key,
           value,
           name: STATUS[key as StatusKey]?.label ?? key,
           color: STATUS[key as StatusKey]?.color ?? "#94a3b8",
         })),
-    [rangeBatches, source, volume],
+    [campaignVolume.statusMix, rangeBatches, source],
   );
   const recent = useMemo(
     () => [...rangeBatches].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).slice(0, 6),
@@ -121,18 +115,16 @@ export default function DashboardScreen() {
     return first ? `Good ${part}, ${first} 👋` : `Good ${part} 👋`;
   }, [user]);
 
-  const liveVolumeUnavailable = source === "live" && (volumeError || !volume);
-  const calls = source === "mock" ? agg.totalCalls : volume?.totalCalls;
-  const messages = source === "mock" ? agg.totalMessages : volume?.totalMessages;
-  const successRate = source === "mock" ? agg.successRate : volume?.successRate;
-  const spendInr = source === "mock" ? agg.spendInr : volume?.spendInr;
-  const unavailableSub = "Activity data temporarily unavailable.";
+  const calls = source === "mock" ? agg.totalCalls : campaignVolume.totalCalls;
+  const messages = source === "mock" ? agg.totalMessages : campaignVolume.totalMessages;
+  const successRate = source === "mock" ? agg.successRate : campaignVolume.successRate;
+  const spendInr = source === "mock" ? agg.spendInr : campaignVolume.spendInr;
   const stats = [
     { label: "Campaigns started", value: fmtNum(agg.totalCampaigns), icon: "Layers", delta: source === "mock" ? 12 : null, sub: "batch start date in this period", spark: source === "mock" ? sparkline(11, 14, 18, 8) : undefined },
-    { label: "Total calls", value: calls == null ? "—" : fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: calls == null ? unavailableSub : fmtNum(calls) + " calls placed in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
-    { label: "Total messages", value: messages == null ? "—" : fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: messages == null ? unavailableSub : fmtNum(messages) + " messages sent in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
-    { label: "Success / answer rate", value: successRate == null ? "—" : fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: successRate == null ? unavailableSub : "from activity in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
-    { label: "Total spend", value: spendInr == null ? "—" : fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: spendInr == null ? unavailableSub : fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
+    { label: "Total calls", value: fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: fmtNum(calls) + " from campaigns started in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
+    { label: "Total messages", value: fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: fmtNum(messages) + " from campaigns started in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
+    { label: "Success / answer rate", value: fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: "weighted across campaigns in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
+    { label: "Total spend", value: fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
   ];
 
   return (
@@ -162,18 +154,14 @@ export default function DashboardScreen() {
         <ChartCard
           className="lg:col-span-2"
           title="Calls & messages over time"
-          subtitle={`Daily placed/sent volume · ${dateRange.toLowerCase()} · UTC`}
+          subtitle={`Daily volume by campaign start date · ${dateRange.toLowerCase()} · UTC`}
           action={<Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#94a3b8", l: "Messages" }]} />}
         >
           {loading ? (
             <div className="skeleton h-[260px] w-full" />
-          ) : liveVolumeUnavailable ? (
-            <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              Daily activity is temporarily unavailable. No estimated values are shown.
-            </div>
           ) : timeData.length === 0 ? (
             <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              No ingested calls or messages were placed in this period.
+              No campaigns were started in this period.
             </div>
           ) : (
             <VolumeChart data={timeData} />
@@ -183,10 +171,6 @@ export default function DashboardScreen() {
         <ChartCard title="Status mix" subtitle="All records this period">
           {loading ? (
             <div className="skeleton h-[260px] w-full" />
-          ) : liveVolumeUnavailable ? (
-            <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              Status activity is temporarily unavailable. No estimated values are shown.
-            </div>
           ) : (
             <StatusDonut data={mix} />
           )}
