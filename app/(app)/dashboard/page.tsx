@@ -22,7 +22,7 @@ import type { Batch, StatusKey } from "@/lib/types";
 import { getDashboardVolume, listCampaigns } from "@/lib/api";
 import { inDashboardRange, isDashboardRange, rangeStart, type DashboardRange } from "@/lib/date-range";
 import type { DashboardVolume } from "@/lib/server/types";
-import { fillDashboardDays } from "@/lib/dashboard";
+import { dashboardVolumeFromCampaigns, fillDashboardDays } from "@/lib/dashboard";
 import { FunnelBars } from "@/components/screens/dashboard/FunnelBars";
 import { IvrDropoffCard } from "@/components/screens/dashboard/IvrDropoffCard";
 import { Legend } from "@/components/screens/dashboard/Legend";
@@ -41,10 +41,11 @@ export default function DashboardScreen() {
   // the backend is off; on a live backend mock data never enters this screen.
   const [batches, setBatches] = useState<Batch[]>([]);
   const [source, setSource] = useState<"live" | "mock">("mock");
-  const [volume, setVolume] = useState<DashboardVolume | null>(null);
-  const [volumeError, setVolumeError] = useState(false);
+  const [recordQuality, setRecordQuality] = useState<DashboardVolume | null>(null);
+  const [qualityError, setQualityError] = useState(false);
 
-  // load via the data seam — returns mock when the backend is off, live data when on
+  // Campaign list drives volume/stats so uningested batches still appear.
+  // Ingested records overlay outcomes, short-calls, and IVR drop-off.
   useEffect(() => {
     let active = true;
     const range: DashboardRange = isDashboardRange(dateRange) ? dateRange : "Last 30 days";
@@ -60,11 +61,11 @@ export default function DashboardScreen() {
           setSource("live");
         }
         if (volumeResult.status === "fulfilled") {
-          setVolume(volumeResult.value);
-          setVolumeError(false);
+          setRecordQuality(volumeResult.value);
+          setQualityError(false);
         } else {
-          setVolume(null);
-          setVolumeError(true);
+          setRecordQuality(null);
+          setQualityError(true);
         }
       })
       .finally(() => {
@@ -80,6 +81,10 @@ export default function DashboardScreen() {
     [batches, selectedRange],
   );
   const agg = useMemo(() => aggregate(rangeBatches), [rangeBatches]);
+  const campaignVolume = useMemo(
+    () => dashboardVolumeFromCampaigns(rangeBatches, selectedRange),
+    [rangeBatches, selectedRange],
+  );
   const timeData = useMemo(() => {
     if (source === "mock") {
       const now = new Date();
@@ -90,7 +95,7 @@ export default function DashboardScreen() {
             : 180;
       return callsOverTime(mockDays);
     }
-    return (volume ? fillDashboardDays(volume) : []).map((point) => ({
+    return fillDashboardDays(campaignVolume).map((point) => ({
       ...point,
       date: new Date(`${point.date}T00:00:00Z`).toLocaleDateString("en-US", {
         month: "short",
@@ -99,13 +104,23 @@ export default function DashboardScreen() {
         timeZone: "UTC",
       }),
     }));
-  }, [selectedRange, source, volume]);
-  const quality = useMemo(
-    () => (source === "mock" ? mockDashboardQuality() : volume),
-    [source, volume],
-  );
+  }, [campaignVolume, selectedRange, source]);
+  const quality = useMemo(() => {
+    if (source === "mock") return mockDashboardQuality();
+    return {
+      voiceConnectMix: recordQuality?.voiceConnectMix?.length
+        ? recordQuality.voiceConnectMix
+        : campaignVolume.voiceConnectMix,
+      messageFunnel: recordQuality?.messageFunnel?.length
+        ? recordQuality.messageFunnel
+        : campaignVolume.messageFunnel,
+      outcomes: recordQuality?.outcomes ?? [],
+      shortCalls: recordQuality?.shortCalls ?? null,
+      ivrDropoff: recordQuality?.ivrDropoff ?? null,
+    };
+  }, [campaignVolume, recordQuality, source]);
   const voiceMix = useMemo(
-    () => (quality?.voiceConnectMix ?? []).map(({ key, value }) => ({
+    () => (quality.voiceConnectMix ?? []).map(({ key, value }) => ({
       key,
       value,
       name: STATUS[key as StatusKey]?.label ?? key,
@@ -127,18 +142,17 @@ export default function DashboardScreen() {
     return first ? `Good ${part}, ${first} 👋` : `Good ${part} 👋`;
   }, [user]);
 
-  const liveVolumeUnavailable = source === "live" && (volumeError || !volume);
-  const calls = source === "mock" ? agg.totalCalls : volume?.totalCalls;
-  const messages = source === "mock" ? agg.totalMessages : volume?.totalMessages;
-  const successRate = source === "mock" ? agg.successRate : volume?.successRate;
-  const spendInr = source === "mock" ? agg.spendInr : volume?.spendInr;
-  const unavailableSub = "Activity data temporarily unavailable.";
+  const recordQualityUnavailable = source === "live" && qualityError;
+  const calls = source === "mock" ? agg.totalCalls : campaignVolume.totalCalls;
+  const messages = source === "mock" ? agg.totalMessages : campaignVolume.totalMessages;
+  const successRate = source === "mock" ? agg.successRate : campaignVolume.successRate;
+  const spendInr = source === "mock" ? agg.spendInr : campaignVolume.spendInr;
   const stats = [
     { label: "Campaigns started", value: fmtNum(agg.totalCampaigns), icon: "Layers", delta: source === "mock" ? 12 : null, sub: "batch start date in this period", spark: source === "mock" ? sparkline(11, 14, 18, 8) : undefined },
-    { label: "Total calls", value: calls == null ? "—" : fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: calls == null ? unavailableSub : fmtNum(calls) + " calls placed in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
-    { label: "Total messages", value: messages == null ? "—" : fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: messages == null ? unavailableSub : fmtNum(messages) + " messages sent in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
-    { label: "Success / answer rate", value: successRate == null ? "—" : fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: successRate == null ? unavailableSub : "from activity in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
-    { label: "Total spend", value: spendInr == null ? "—" : fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: spendInr == null ? unavailableSub : fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
+    { label: "Total calls", value: fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: fmtNum(calls) + " from campaigns started in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
+    { label: "Total messages", value: fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: fmtNum(messages) + " from campaigns started in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
+    { label: "Success / answer rate", value: fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: "weighted across campaigns in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
+    { label: "Total spend", value: fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
   ];
 
   return (
@@ -168,18 +182,14 @@ export default function DashboardScreen() {
         <ChartCard
           className="lg:col-span-2"
           title="Calls & messages over time"
-          subtitle={`Daily placed/sent volume · ${dateRange.toLowerCase()} · UTC`}
+          subtitle={`Daily volume by campaign start date · ${dateRange.toLowerCase()} · UTC`}
           action={<Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#94a3b8", l: "Messages" }]} />}
         >
           {loading ? (
             <div className="skeleton h-[260px] w-full" />
-          ) : liveVolumeUnavailable ? (
-            <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              Daily activity is temporarily unavailable. No estimated values are shown.
-            </div>
           ) : timeData.length === 0 ? (
             <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              No ingested calls or messages were placed in this period.
+              No campaigns were started in this period.
             </div>
           ) : (
             <VolumeChart data={timeData} />
@@ -189,13 +199,9 @@ export default function DashboardScreen() {
         <ChartCard title="Voice connect mix" subtitle="Why calls connected — or didn't · this period">
           {loading ? (
             <div className="skeleton h-[260px] w-full" />
-          ) : liveVolumeUnavailable ? (
-            <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              Voice connect mix is temporarily unavailable. No estimated values are shown.
-            </div>
           ) : voiceMix.length === 0 ? (
             <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              No ingested voice calls were placed in this period.
+              No voice campaigns were started in this period.
             </div>
           ) : (
             <StatusDonut data={voiceMix} unit="calls" />
@@ -207,13 +213,9 @@ export default function DashboardScreen() {
         <ChartCard title="Message funnel" subtitle="Sent → delivered → read → replied">
           {loading ? (
             <div className="skeleton h-[220px] w-full" />
-          ) : liveVolumeUnavailable ? (
+          ) : !quality.messageFunnel.length ? (
             <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              Message delivery is temporarily unavailable. No estimated values are shown.
-            </div>
-          ) : !quality?.messageFunnel?.length ? (
-            <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
-              No ingested messages were sent in this period.
+              No message campaigns were started in this period.
             </div>
           ) : (
             <FunnelBars data={quality.messageFunnel} />
@@ -222,13 +224,13 @@ export default function DashboardScreen() {
         <ChartCard title="Business outcomes" subtitle="Per-call outcome from master · top reasons this period">
           {loading ? (
             <div className="skeleton h-[220px] w-full" />
-          ) : liveVolumeUnavailable ? (
+          ) : recordQualityUnavailable ? (
             <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
               Outcomes are temporarily unavailable. No estimated values are shown.
             </div>
           ) : (
             <RankedBars
-              items={(quality?.outcomes ?? []).map((o) => ({ label: o.label ?? o.key, value: o.value }))}
+              items={quality.outcomes.map((o) => ({ label: o.label ?? o.key, value: o.value }))}
               empty="No business outcomes were recorded on ingested calls in this period."
             />
           )}
@@ -241,7 +243,7 @@ export default function DashboardScreen() {
             <div className="skeleton h-[320px] w-full rounded-2xl" />
             <div className="skeleton h-[320px] w-full rounded-2xl" />
           </>
-        ) : liveVolumeUnavailable ? (
+        ) : recordQualityUnavailable ? (
           <>
             <ChartCard title="Short calls & hang-ups" subtitle="Connected calls only">
               <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-slate-500">
@@ -256,8 +258,8 @@ export default function DashboardScreen() {
           </>
         ) : (
           <>
-            <ShortCallCard stats={quality?.shortCalls ?? null} />
-            <IvrDropoffCard dropoff={quality?.ivrDropoff ?? null} />
+            <ShortCallCard stats={quality.shortCalls} />
+            <IvrDropoffCard dropoff={quality.ivrDropoff} />
           </>
         )}
       </div>
