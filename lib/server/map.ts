@@ -203,9 +203,6 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     sourceFingerprint: sourceFp,
     publishedRevision: existing?.publishedRevision,
     ingestStatus: sourceChanged ? "none" : existing?.ingestStatus ?? "none",
-    ingestJobId: existing?.ingestJobId,
-    ingestLeaseId: existing?.ingestLeaseId,
-    ingestLeaseUntil: existing?.ingestLeaseUntil,
     updatedAt: new Date().toISOString(),
   };
 }

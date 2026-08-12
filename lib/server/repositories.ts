@@ -26,6 +26,16 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** Campaign-list refreshes must not copy a stale in-memory lease over the
+ *  worker's live ownership marker. begin/publish/fail are the only writers. */
+function withoutIngestionOwnership(doc: BatchDoc): Omit<BatchDoc, "ingestJobId" | "ingestLeaseId" | "ingestLeaseUntil"> {
+  const source = { ...doc };
+  delete source.ingestJobId;
+  delete source.ingestLeaseId;
+  delete source.ingestLeaseUntil;
+  return source;
+}
+
 // ---------------------------------------------------------------------------
 // Batches
 // ---------------------------------------------------------------------------
@@ -56,17 +66,18 @@ export async function refreshBatchFromSource(
     accountId: doc.accountId,
     batchId: doc.batchId,
   };
+  const source = withoutIngestionOwnership(doc);
   if (expectedUpdatedAt == null) {
     const current = await col.findOneAndUpdate(
       key,
-      { $setOnInsert: doc },
+      { $setOnInsert: source },
       { upsert: true, returnDocument: "after" },
     );
     if (current) return current;
   } else {
     const updated = await col.findOneAndUpdate(
       { ...key, updatedAt: expectedUpdatedAt },
-      { $set: doc },
+      { $set: source },
       { returnDocument: "after" },
     );
     if (updated) return updated;
@@ -96,13 +107,20 @@ export async function beginBatchIngestion(
       batchId: doc.batchId,
       $or: [
         { ingestJobId: { $exists: false } },
+        { ingestJobId: { $type: "null" } },
         { ingestJobId: jobId, ingestLeaseId: leaseId },
+        // Pre-#25 workers wrote ingestJobId without ingestLeaseUntil. `$lt`
+        // does not match a missing field, so those markers blocked every later
+        // job (analytics generation failed immediately with "newer worker owns
+        // batch ingestion") until we treat "no deadline" as takeable.
+        { ingestLeaseUntil: { $exists: false } },
+        { ingestLeaseUntil: { $type: "null" } },
         { ingestLeaseUntil: { $lt: leaseUntil } },
       ],
     },
     {
       $set: {
-        ...doc,
+        ...withoutIngestionOwnership(doc),
         ingestStatus: doc.ingestStatus === "ready" ? "ready" : "ingesting",
         ingestJobId: jobId,
         ingestLeaseId: leaseId,
