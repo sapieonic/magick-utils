@@ -89,7 +89,7 @@ export default function Page() {
   // Real ingestion: create a job and poll it. When the backend is off,
   // createIngestJob returns null and we keep the simulated progress animation.
   useEffect(() => {
-    if (!ids.length || !batchesReady) return;
+    if (!ids.length || !batchesReady || missingTargetIds.length > 0) return;
     let alive = true;
     let simIv: ReturnType<typeof setInterval> | null = null;
     let pollIv: ReturnType<typeof setInterval> | null = null;

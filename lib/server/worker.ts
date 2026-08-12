@@ -181,7 +181,9 @@ async function ingestBatch(
   }
 
   let offset = initialOffset;
-  let expectedTotal = batch.total;
+  // Upstream totals are progress hints, not pagination boundaries. They can be
+  // stale in either direction, so the returned pages determine completion.
+  let reportedTotal = batch.total;
   for (;;) {
     let page: NormalizedRecord[];
     let total = 0;
@@ -205,12 +207,8 @@ async function ingestBatch(
         revisionCreatedAt,
       }));
     }
-    expectedTotal = Math.max(expectedTotal, total);
+    reportedTotal = Math.max(reportedTotal, total);
     if (page.length === 0) {
-      if (offset < expectedTotal) {
-        throw new Error(`incomplete upstream page for ${batchId}: received ${offset} of ${expectedTotal}`);
-      }
-      if (expectedTotal === 0) expectedTotal = offset;
       break;
     }
     await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, page);
@@ -223,16 +221,20 @@ async function ingestBatch(
     });
     if (!checkpoint) throw new Error("job lease lost while checkpointing");
     await renewIngestionLocks(jobId);
-    if (expectedTotal > 0 && offset >= expectedTotal) break;
-    if (expectedTotal === 0 && page.length < PAGE_SIZE) {
-      expectedTotal = offset;
-      break;
-    }
+    if (page.length < PAGE_SIZE) break;
   }
 
   const records = await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision);
-  if (records.length !== expectedTotal) {
-    throw new Error(`incomplete ingestion for ${batchId}: stored ${records.length} of ${expectedTotal}`);
+  // Compare Mongo's unique staged rows with the number actually fetched. This
+  // still catches duplicate ids / partial writes without trusting stale totals.
+  if (records.length !== offset) {
+    throw new Error(`incomplete ingestion for ${batchId}: stored ${records.length} of ${offset}`);
+  }
+  if (reportedTotal !== records.length) {
+    log().warn(
+      { batchId, reportedTotal, actualTotal: records.length },
+      "[worker] upstream total differed from paginated record count",
+    );
   }
   const freshFp = fingerprint([
     records.length,

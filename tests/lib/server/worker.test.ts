@@ -116,16 +116,40 @@ describe("processJob resume", () => {
     expect(repositories.updateClaimedJob).not.toHaveBeenCalled();
   });
 
-  it("rejects a premature empty page instead of publishing a truncated dataset", async () => {
+  it("treats paginated rows as authoritative when an upstream total is stale-high", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 100 });
     client.listCalls.mockResolvedValueOnce({ calls: [], total: 100 });
+    repositories.getRecordsForRevision.mockResolvedValue([]);
 
-    await expect(processJob(job({ batchIds: ["b1"], total: 100 }))).rejects.toThrow(
-      "received 0 of 100",
+    await expect(processJob(job({ batchIds: ["b1"], total: 100 }))).resolves.toBeUndefined();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 0 }),
+      "j1",
+      "lease-1",
     );
-    expect(repositories.getRecordsForRevision).not.toHaveBeenCalled();
-    expect(repositories.upsertBatch).not.toHaveBeenCalledWith(
-      expect.objectContaining({ ingestStatus: "ready" }),
+  });
+
+  it("continues past a stale-low upstream total while full pages are returned", async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ id: String(index + 1) }));
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 1 });
+    client.listCalls
+      .mockResolvedValueOnce({ calls: firstPage, total: 1 })
+      .mockResolvedValueOnce({ calls: [{ id: "101" }], total: 1 });
+    repositories.getRecordsForRevision.mockResolvedValue(
+      Array.from({ length: 101 }, (_, index) => ({ recordId: String(index + 1), status: "done" })),
+    );
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listCalls).toHaveBeenNthCalledWith(2, {
+      jobId: "source-b1",
+      limit: 100,
+      offset: 100,
+    });
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 101 }),
+      "j1",
+      "lease-1",
     );
   });
 

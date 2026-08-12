@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/api", () => ({
   createIngestJob: vi.fn(),
@@ -10,7 +10,7 @@ vi.mock("@/lib/api", () => ({
 }));
 
 import { DownloadModal } from "@/components/screens/campaigns/DownloadModal";
-import { createIngestJob, downloadCsv } from "@/lib/api";
+import { createIngestJob, downloadCsv, getJob } from "@/lib/api";
 import type { Batch } from "@/lib/types";
 
 const campaign: Batch = {
@@ -22,6 +22,7 @@ const campaign: Batch = {
 
 describe("DownloadModal", () => {
   beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.useRealTimers());
 
   it("prepares live data before triggering a browser CSV download", async () => {
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
@@ -33,5 +34,28 @@ describe("DownloadModal", () => {
 
     expect(createIngestJob).toHaveBeenCalledWith(["b1"], "merge");
     expect(downloadCsv).toHaveBeenCalledWith(["b1"], expect.arrayContaining(["record_id", "status"]));
+  });
+
+  it("keeps polling when a job lookup temporarily returns no job", async () => {
+    vi.useFakeTimers();
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: "j1", total: 10, ready: false });
+    vi.mocked(getJob)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        jobId: "j1", type: "merge", status: "done", total: 10, done: 10,
+        error: null, retryAt: null, retryCount: 0, result: null,
+        createdAt: "2026-08-12T00:00:00Z", updatedAt: "2026-08-12T00:00:01Z",
+      });
+    render(<DownloadModal campaign={campaign} onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Download \d+ columns/i }));
+    await act(async () => Promise.resolve());
+    expect(getJob).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+
+    expect(screen.getByRole("button", { name: /Download AI-1\.csv/i })).toBeInTheDocument();
+    expect(getJob).toHaveBeenCalledTimes(2);
   });
 });

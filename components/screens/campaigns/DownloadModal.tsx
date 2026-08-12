@@ -33,7 +33,13 @@ export function DownloadModal({
     const poll = async () => {
       try {
         const job = await getJob(jobId);
-        if (stopped || !job) return;
+        if (stopped) return;
+        // Session handling can temporarily return no job while navigation is
+        // being coordinated. Keep polling instead of stranding the modal.
+        if (!job) {
+          timer = setTimeout(poll, 1500);
+          return;
+        }
         setProg(job.total > 0 ? Math.min(99, (job.done / job.total) * 100) : 0);
         if (job.status === "done") {
           setProg(100);

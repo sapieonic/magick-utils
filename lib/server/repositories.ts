@@ -489,8 +489,9 @@ export async function releaseIngestionLocks(jobId: string): Promise<void> {
   await col.deleteMany({ jobId });
 }
 
-/** Distributed fixed-window quota. Cached insight reads call this only after a
- * cache miss, so they do not consume paid-generation allowance. */
+/** Distributed fixed-window attempt quota. Cached insight reads call this only
+ * after a cache miss. A reserved attempt remains counted if the provider later
+ * fails: refunding outages would permit an unbounded retry/cost storm. */
 export async function consumeAiQuota(
   tenantId: string,
   accountId: string,

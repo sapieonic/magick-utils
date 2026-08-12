@@ -121,16 +121,18 @@ export default function DashboardScreen() {
     return first ? `Good ${part}, ${first} 👋` : `Good ${part} 👋`;
   }, [user]);
 
-  const calls = source === "mock" ? agg.totalCalls : volume?.totalCalls ?? 0;
-  const messages = source === "mock" ? agg.totalMessages : volume?.totalMessages ?? 0;
-  const successRate = source === "mock" ? agg.successRate : volume?.successRate ?? 0;
-  const spendInr = source === "mock" ? agg.spendInr : volume?.spendInr ?? 0;
+  const liveVolumeUnavailable = source === "live" && (volumeError || !volume);
+  const calls = source === "mock" ? agg.totalCalls : volume?.totalCalls;
+  const messages = source === "mock" ? agg.totalMessages : volume?.totalMessages;
+  const successRate = source === "mock" ? agg.successRate : volume?.successRate;
+  const spendInr = source === "mock" ? agg.spendInr : volume?.spendInr;
+  const unavailableSub = "Activity data temporarily unavailable.";
   const stats = [
     { label: "Campaigns started", value: fmtNum(agg.totalCampaigns), icon: "Layers", delta: source === "mock" ? 12 : null, sub: "batch start date in this period", spark: source === "mock" ? sparkline(11, 14, 18, 8) : undefined },
-    { label: "Total calls", value: fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: fmtNum(calls) + " calls placed in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
-    { label: "Total messages", value: fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: fmtNum(messages) + " messages sent in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
-    { label: "Success / answer rate", value: fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: "from activity in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
-    { label: "Total spend", value: fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
+    { label: "Total calls", value: calls == null ? "—" : fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: calls == null ? unavailableSub : fmtNum(calls) + " calls placed in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
+    { label: "Total messages", value: messages == null ? "—" : fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: messages == null ? unavailableSub : fmtNum(messages) + " messages sent in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
+    { label: "Success / answer rate", value: successRate == null ? "—" : fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: successRate == null ? unavailableSub : "from activity in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
+    { label: "Total spend", value: spendInr == null ? "—" : fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: spendInr == null ? unavailableSub : fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
   ];
 
   return (
@@ -165,7 +167,7 @@ export default function DashboardScreen() {
         >
           {loading ? (
             <div className="skeleton h-[260px] w-full" />
-          ) : volumeError || (source === "live" && !volume) ? (
+          ) : liveVolumeUnavailable ? (
             <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
               Daily activity is temporarily unavailable. No estimated values are shown.
             </div>
@@ -179,7 +181,15 @@ export default function DashboardScreen() {
         </ChartCard>
 
         <ChartCard title="Status mix" subtitle="All records this period">
-          {loading ? <div className="skeleton h-[260px] w-full" /> : <StatusDonut data={mix} />}
+          {loading ? (
+            <div className="skeleton h-[260px] w-full" />
+          ) : liveVolumeUnavailable ? (
+            <div className="flex h-[260px] items-center justify-center px-6 text-center text-sm text-slate-500">
+              Status activity is temporarily unavailable. No estimated values are shown.
+            </div>
+          ) : (
+            <StatusDonut data={mix} />
+          )}
         </ChartCard>
       </div>
 
