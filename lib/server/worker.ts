@@ -188,6 +188,15 @@ async function ingestBatch(
     throw new Error("job lease lost before batch ingestion");
   }
   if (!(await beginBatchIngestion(batch, jobId, leaseId, batchLeaseUntil))) {
+    log().warn(
+      {
+        batchId,
+        ingestJobId: batch.ingestJobId,
+        ingestLeaseId: batch.ingestLeaseId,
+        ingestLeaseUntil: batch.ingestLeaseUntil,
+      },
+      "[worker] batch ingestion ownership lost",
+    );
     throw new Error("newer worker owns batch ingestion");
   }
   const revision = jobId;

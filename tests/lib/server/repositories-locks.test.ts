@@ -47,6 +47,27 @@ describe("source batch refresh", () => {
     );
   });
 
+  it("does not write worker ownership fields during a source-metadata refresh", async () => {
+    const refreshed = {
+      tenantId: "t1",
+      accountId: "a1",
+      batchId: "b1",
+      updatedAt: "new",
+      ingestJobId: "stale-job",
+      ingestLeaseId: "stale-lease",
+      ingestLeaseUntil: "stale-until",
+    };
+    batchDb.findOneAndUpdate.mockResolvedValue({ tenantId: "t1", accountId: "a1", batchId: "b1", updatedAt: "new" });
+
+    await refreshBatchFromSource(refreshed as never, "old");
+
+    const set = batchDb.findOneAndUpdate.mock.calls[0][1].$set;
+    expect(set).toEqual({ tenantId: "t1", accountId: "a1", batchId: "b1", updatedAt: "new" });
+    expect(set).not.toHaveProperty("ingestJobId");
+    expect(set).not.toHaveProperty("ingestLeaseId");
+    expect(set).not.toHaveProperty("ingestLeaseUntil");
+  });
+
   it("returns a concurrently published batch instead of overwriting it", async () => {
     const stale = { tenantId: "t1", accountId: "a1", batchId: "b1", updatedAt: "stale" };
     const published = { ...stale, updatedAt: "published", publishedRevision: "r2" };
@@ -78,7 +99,13 @@ describe("batch worker ownership", () => {
         tenantId: "t1",
         accountId: "a1",
         batchId: "b1",
-        $or: expect.arrayContaining([{ ingestLeaseUntil: { $lt: "2026-08-12T12:02:00Z" } }]),
+        $or: expect.arrayContaining([
+          { ingestJobId: { $exists: false } },
+          { ingestJobId: { $type: "null" } },
+          { ingestLeaseUntil: { $exists: false } },
+          { ingestLeaseUntil: { $type: "null" } },
+          { ingestLeaseUntil: { $lt: "2026-08-12T12:02:00Z" } },
+        ]),
       }),
       expect.objectContaining({
         $set: expect.objectContaining({
@@ -88,6 +115,25 @@ describe("batch worker ownership", () => {
         }),
       }),
     );
+  });
+
+  it("does not copy a stale lease from the batch snapshot onto the ownership write", async () => {
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+    const doc = {
+      tenantId: "t1",
+      accountId: "a1",
+      batchId: "b1",
+      ingestJobId: "old-job",
+      ingestLeaseId: "old-lease",
+      ingestLeaseUntil: "2026-08-12T11:00:00Z",
+    };
+
+    await beginBatchIngestion(doc as never, "j1", "lease-new", "2026-08-12T12:02:00Z");
+
+    const set = batchDb.updateOne.mock.calls[0][1].$set;
+    expect(set.ingestJobId).toBe("j1");
+    expect(set.ingestLeaseId).toBe("lease-new");
+    expect(set.ingestLeaseUntil).toBe("2026-08-12T12:02:00Z");
   });
 
   it("rejects a stale worker when its ownership update no longer matches", async () => {

@@ -189,4 +189,23 @@ describe("bulkJobToBatchDoc", () => {
     expect(refreshed.fingerprint).toBe("dataset-fp");
     expect(refreshed.sourceFingerprint).not.toBe(committed.sourceFingerprint);
   });
+
+  it("does not copy worker ownership fields from an existing batch", () => {
+    const job: RawBulkJob = {
+      id: "job-lock", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 1,
+    };
+    const existing: BatchDoc = {
+      tenantId: "t1", accountId: "a1", batchId: "job-lock", sourceId: "job-lock",
+      name: "Locked", channel: "voice", callType: "ai", selType: "ai",
+      provider: "voice", date: "2026-08-12T00:00:00.000Z", total: 1,
+      breakdown: [], successRate: 0, spendInr: 0, telephonyInr: 0, aiInr: 0,
+      avgDuration: null, avgTalkTime: null, fingerprint: "fp",
+      ingestStatus: "ingesting", ingestJobId: "old-job", ingestLeaseId: "old-lease",
+      ingestLeaseUntil: "2099-01-01T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z",
+    };
+    const doc = bulkJobToBatchDoc(job, ctx, existing);
+    expect(doc.ingestJobId).toBeUndefined();
+    expect(doc.ingestLeaseId).toBeUndefined();
+    expect(doc.ingestLeaseUntil).toBeUndefined();
+  });
 });
