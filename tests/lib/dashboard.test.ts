@@ -57,6 +57,11 @@ describe("dashboard date ranges", () => {
         { date: "2026-08-10", calls: 3, messages: 0 },
         { date: "2026-08-12", calls: 0, messages: 1 },
       ],
+      voiceConnectMix: [],
+      messageFunnel: [],
+      outcomes: [],
+      shortCalls: null,
+      ivrDropoff: null,
     });
     expect(points).toEqual([
       { date: "2026-08-10", calls: 3, messages: 0 },
@@ -104,6 +109,11 @@ describe("dashboardVolumeFromCampaigns", () => {
       { key: "busy", value: 1734 },
       { key: "noanswer", value: 1784 },
     ]));
+    expect(volume.voiceConnectMix).toEqual([
+      { key: "completed", value: 450 },
+      { key: "noanswer", value: 1784 },
+      { key: "busy", value: 1734 },
+    ]);
   });
 
   it("falls back to campaign total when the status breakdown is empty", () => {
@@ -127,47 +137,12 @@ describe("dashboardVolumeFromCampaigns", () => {
     expect(volume.totalCalls).toBe(0);
     expect(volume.totalMessages).toBe(80);
     expect(volume.points).toEqual([{ date: "2026-08-11", calls: 0, messages: 80 }]);
-  });
-});
-
-
-describe("dashboard date ranges", () => {
-  const now = new Date("2026-08-12T12:00:00Z");
-
-  it("uses inclusive UTC starts for rolling ranges", () => {
-    expect(rangeStart("Last 7 days", now)?.toISOString()).toBe("2026-08-06T00:00:00.000Z");
-    expect(inDashboardRange("2026-08-06T00:00:00Z", "Last 7 days", now)).toBe(true);
-    expect(inDashboardRange("2026-08-05T23:59:59Z", "Last 7 days", now)).toBe(false);
-    expect(inDashboardRange("2026-08-13T00:00:00Z", "Last 7 days", now)).toBe(false);
-  });
-
-  it("starts This quarter on the UTC quarter boundary", () => {
-    expect(rangeStart("This quarter", now)?.toISOString()).toBe("2026-07-01T00:00:00.000Z");
-  });
-
-  it("fills missing bounded days with explicit zeroes", () => {
-    const points = fillDashboardDays({
-      timezone: "UTC",
-      range: "Last 7 days",
-      start: "2026-08-10T00:00:00.000Z",
-      end: "2026-08-12T12:00:00.000Z",
-      totalRecords: 4,
-      totalCalls: 3,
-      totalMessages: 1,
-      successRate: 0.5,
-      spendInr: 0,
-      telephonyInr: 0,
-      aiInr: 0,
-      statusMix: [],
-      points: [
-        { date: "2026-08-10", calls: 3, messages: 0 },
-        { date: "2026-08-12", calls: 0, messages: 1 },
-      ],
-    });
-    expect(points).toEqual([
-      { date: "2026-08-10", calls: 3, messages: 0 },
-      { date: "2026-08-11", calls: 0, messages: 0 },
-      { date: "2026-08-12", calls: 0, messages: 1 },
+    expect(volume.messageFunnel).toEqual([
+      { stage: "Sent", value: 80 },
+      { stage: "Delivered", value: 80 },
+      { stage: "Read", value: 50 },
+      { stage: "Replied", value: 0 },
     ]);
+    expect(volume.voiceConnectMix).toEqual([]);
   });
 });

@@ -12,14 +12,19 @@ vi.mock("@/lib/store", () => ({
   }),
 }));
 vi.mock("@/lib/api", () => ({
+  getDashboardVolume: vi.fn(),
   listCampaigns: vi.fn(),
 }));
 vi.mock("@/components/screens/dashboard/Legend", () => ({ Legend: () => null }));
 vi.mock("@/components/screens/dashboard/VolumeChart", () => ({ VolumeChart: () => null }));
 vi.mock("@/components/screens/dashboard/StatusDonut", () => ({ StatusDonut: () => null }));
+vi.mock("@/components/screens/dashboard/FunnelBars", () => ({ FunnelBars: () => null }));
+vi.mock("@/components/screens/dashboard/RankedBars", () => ({ RankedBars: () => null }));
+vi.mock("@/components/screens/dashboard/ShortCallCard", () => ({ ShortCallCard: () => null }));
+vi.mock("@/components/screens/dashboard/IvrDropoffCard", () => ({ IvrDropoffCard: () => null }));
 
 import DashboardScreen from "@/app/(app)/dashboard/page";
-import { listCampaigns } from "@/lib/api";
+import { getDashboardVolume, listCampaigns } from "@/lib/api";
 import type { Batch } from "@/lib/types";
 
 const campaign: Batch = {
@@ -35,6 +40,7 @@ describe("DashboardScreen campaign volume", () => {
 
   it("shows campaign-list call volume without waiting on ingested records", async () => {
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(getDashboardVolume).mockRejectedValue(new Error("dashboard unavailable"));
     render(<DashboardScreen />);
 
     await waitFor(() => {
@@ -45,10 +51,13 @@ describe("DashboardScreen campaign volume", () => {
     });
     expect(screen.queryByText("Daily activity is temporarily unavailable. No estimated values are shown."))
       .not.toBeInTheDocument();
+    expect(screen.getByText("Short-call activity is temporarily unavailable. No estimated values are shown."))
+      .toBeInTheDocument();
   });
 
   it("shows zero campaign volume when the campaign list fails", async () => {
     vi.mocked(listCampaigns).mockRejectedValue(new Error("campaigns unavailable"));
+    vi.mocked(getDashboardVolume).mockRejectedValue(new Error("dashboard unavailable"));
     render(<DashboardScreen />);
 
     await waitFor(() => {

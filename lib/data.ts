@@ -272,6 +272,83 @@ export function messagingFunnel() {
   ];
 }
 
+/** Demo-mode dashboard quality panels (backend off). Mirrors the live
+ *  `DashboardVolume` quality fields so the home screen still looks complete. */
+export function mockDashboardQuality() {
+  return {
+    voiceConnectMix: [
+      { key: "completed", value: 8420 },
+      { key: "noanswer", value: 3910 },
+      { key: "busy", value: 1640 },
+      { key: "switchedoff", value: 980 },
+      { key: "voicemail", value: 410 },
+      { key: "failed", value: 240 },
+    ],
+    messageFunnel: messagingFunnel().map(({ stage, value }) => ({ stage, value })),
+    outcomes: [
+      { key: "promise_to_pay", label: "Promise To Pay", value: 1840 },
+      { key: "callback", label: "Callback", value: 1120 },
+      { key: "already_paid", label: "Already Paid", value: 760 },
+      { key: "not_interested", label: "Not Interested", value: 540 },
+      { key: "wrong_number", label: "Wrong Number", value: 310 },
+      { key: "hardship", label: "Hardship", value: 220 },
+    ],
+    shortCalls: {
+      connectedWithDuration: 8420,
+      shortCount: 1263,
+      shortRate: 1263 / 8420,
+      connectedWithTalk: 7980,
+      hangupCount: 958,
+      hangupRate: 958 / 7980,
+      avgDuration: 78.4,
+      avgTalkTime: 51.2,
+      talkRatio: 51.2 / 78.4,
+      thresholdSeconds: 15,
+      hangupTalkSeconds: 10,
+      durationHistogram: [
+        { bucket: "0–30s", calls: 1680 },
+        { bucket: "30–60s", calls: 2210 },
+        { bucket: "1–2m", calls: 2480 },
+        { bucket: "2–3m", calls: 1120 },
+        { bucket: "3–5m", calls: 640 },
+        { bucket: "5m+", calls: 290 },
+      ],
+    },
+    ivrDropoff: {
+      totalIvr: 3640,
+      withPath: 3410,
+      hangupCount: 620,
+      hangupRate: 620 / 3180,
+      depthFunnel: [
+        { stage: "Entered IVR", value: 3410 },
+        { stage: "2nd node", value: 2480 },
+        { stage: "3rd node", value: 1510 },
+        { stage: "4th node+", value: 420 },
+      ],
+      completedNodes: [
+        { key: "agent_transfer", label: "Agent Transfer", value: 1280 },
+        { key: "hangup", label: "Hangup", value: 620 },
+        { key: "self_serve", label: "Self Serve", value: 540 },
+        { key: "callback", label: "Callback", value: 410 },
+        { key: "optout", label: "Optout", value: 330 },
+      ],
+      topPaths: [
+        { path: "main › billing › agent", value: 820 },
+        { path: "main › optout", value: 410 },
+        { path: "main › repeat › end", value: 360 },
+        { path: "main › callback", value: 290 },
+        { path: "main › billing › self_serve", value: 210 },
+      ],
+      dtmf: [
+        { input: "1", value: 1420 },
+        { input: "2", value: 880 },
+        { input: "9", value: 310 },
+        { input: "3", value: 240 },
+      ],
+    },
+  };
+}
+
 // Mock best-time-to-reach matrix (feature 4b) — used when the backend is off so
 // the heatmap renders in demo mode. Mirrors the real `ReachByTimeOfDay` shape
 // from lib/server/types.ts; weekday is getUTCDay() (0=Sun…6=Sat), bands are

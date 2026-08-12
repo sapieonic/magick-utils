@@ -177,6 +177,42 @@ export interface ReachByTimeOfDay {
   cells: ReachCell[]; // sparse — only weekday×band combos with records
 }
 
+/** Named count used by dashboard mix / funnel / ranked-bar widgets. */
+export interface NamedCount {
+  key: string;
+  value: number;
+  label?: string;
+}
+
+/** Connected-call length quality (short calls + immediate hang-ups).
+ *  Unanswered rings are excluded — only `completed` calls with a duration. */
+export interface ShortCallStats {
+  connectedWithDuration: number;
+  shortCount: number;
+  shortRate: number;
+  connectedWithTalk: number;
+  hangupCount: number;
+  hangupRate: number;
+  avgDuration: number | null;
+  avgTalkTime: number | null;
+  talkRatio: number | null;
+  thresholdSeconds: number;
+  hangupTalkSeconds: number;
+  durationHistogram: { bucket: string; calls: number }[];
+}
+
+/** IVR journey drop-off: path depth, terminal node, top paths, DTMF. */
+export interface IvrDropoff {
+  totalIvr: number;
+  withPath: number;
+  hangupCount: number;
+  hangupRate: number;
+  depthFunnel: { stage: string; value: number }[];
+  completedNodes: NamedCount[];
+  topPaths: { path: string; value: number }[];
+  dtmf: { input: string; value: number }[];
+}
+
 export interface DashboardVolume {
   timezone: "UTC";
   range: string;
@@ -191,6 +227,16 @@ export interface DashboardVolume {
   aiInr: number;
   statusMix: { key: string; value: number }[];
   points: { date: string; calls: number; messages: number }[];
+  /** Voice-only status mix (connect vs no-answer / busy / failed / …). */
+  voiceConnectMix: NamedCount[];
+  /** Message delivery funnel: Sent → Delivered → Read → Replied. */
+  messageFunnel: { stage: string; value: number }[];
+  /** Business `outcome` rollup (promise-to-pay, callback, …). */
+  outcomes: NamedCount[];
+  /** Null when no connected calls in the period have a duration. */
+  shortCalls: ShortCallStats | null;
+  /** Null when no IVR records are in the period. */
+  ivrDropoff: IvrDropoff | null;
 }
 
 /** Precomputed analytics for a selection, keyed by fingerprint of the batch set. */
