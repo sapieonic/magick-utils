@@ -61,9 +61,10 @@ cached **aggregates** > 7 days (recomputed on next analytics request), terminal 
 the largest collection but dropping it forces a re-ingest, so it needs a separate usage-based policy.
 
 The endpoint runs without a user session, guarded by a shared Bearer secret (`CRON_SECRET`). It's driven
-by a daily GitHub Actions cron (`.github/workflows/cleanup.yml`), which needs two repo secrets: `CLEANUP_URL`
-(the deployed endpoint URL) and `CRON_SECRET` (matching the app's env). Returns 503 until both `MONGODB_URI`
-and `CRON_SECRET` are configured.
+by a daily GitHub Actions cron (`.github/workflows/cleanup.yml`) for the `production` and `dedicated`
+GitHub Environments. Each environment needs a `CLEANUP_URL` environment variable (the deployed endpoint
+URL) and a `CRON_SECRET` environment secret (matching that deployment's app env). Returns 503 until both
+`MONGODB_URI` and `CRON_SECRET` are configured.
 
 ## Client seam (`lib/api.ts`)
 `listCampaigns`, `createIngestJob`, `getJob`, `getAnalytics`, `generateInsights`, `streamChat`,
