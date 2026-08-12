@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/sapieonic/magick-utils/compare/v1.2.7...v1.3.0) (2026-08-12)
+
+
+### Features
+
+* add connect, outcome, short-call, and IVR panels to the dashboard ([#28](https://github.com/sapieonic/magick-utils/issues/28)) ([df080fb](https://github.com/sapieonic/magick-utils/commit/df080fbaee88e2da907a92843965c9f45cf4cb80))
+
 ## [1.2.7](https://github.com/sapieonic/magick-utils/compare/v1.2.6...v1.2.7) (2026-08-12)
 
 
