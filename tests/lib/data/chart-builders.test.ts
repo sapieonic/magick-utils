@@ -58,9 +58,11 @@ describe("callsOverTime", () => {
     expect(callsOverTime()).toEqual(callsOverTime());
   });
 
-  it("ends on the anchor date Jun 9", () => {
+  it("ends on the current UTC date", () => {
     const series = callsOverTime();
-    expect(series[series.length - 1].date).toBe("Jun 9");
+    expect(series[series.length - 1].date).toBe(
+      new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" }),
+    );
   });
 });
 

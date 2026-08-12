@@ -5,14 +5,18 @@ import type { NormalizedRecord } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
+import { parseBatchIds, selectionErrorResponse, validateSelection } from "@/lib/server/selection";
+import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function csvEscape(v: string): string {
   if (v == null) return "";
-  if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
-  return v;
+  const dangerous = /^[\t\r\n]/.test(v) || /^[\u0000-\u0020]*[=+\-@]/.test(v);
+  const safe = dangerous ? `'${v}` : v;
+  if (/[",\n]/.test(safe)) return `"${safe.replace(/"/g, '""')}"`;
+  return safe;
 }
 
 function colValue(r: NormalizedRecord, col: string, nameById: Map<string, string>): string {
@@ -51,15 +55,29 @@ function colValue(r: NormalizedRecord, col: string, nameById: Map<string, string
 }
 
 const DEFAULT_COLS = ["record_id", "campaign_name", "channel", "recipient_phone", "status", "outcome", "timestamp", "total_cost_inr"];
+const VALID_COLS = new Set([
+  "record_id", "call_id", "message_id", "campaign_name", "channel", "recipient_phone", "status", "outcome",
+  "timestamp", "provider", "total_cost_inr", "telephony_cost_inr", "ai_cost_inr", "duration_seconds",
+  "talk_time_seconds", "recording_url", "transcript", "conversation_summary", "sentiment", "key_topics",
+  "dtmf_input", "ivr_path", "completed_node", "delivered_at", "read_at", "reply_text", "template_name", "bounce_reason",
+]);
 
-async function handle(batchIds: string[], columns: string[], ctx: { tenantId: string; accountId: string }) {
-  if (batchIds.length === 0) return Response.json({ error: "no_batches" }, { status: 400 });
-
-  const count = await countRecords(ctx.tenantId, ctx.accountId, batchIds);
-  if (count === 0) {
-    log().warn({ batchCount: batchIds.length }, "export requested for un-ingested batches");
-    return Response.json({ error: "not_ingested", message: "Run ingestion for these batches first." }, { status: 409 });
+async function handle(rawBatchIds: unknown, rawColumns: unknown, ctx: { tenantId: string; accountId: string; idToken: string }) {
+  let batchIds: string[];
+  try {
+    batchIds = parseBatchIds(rawBatchIds);
+    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+  } catch (error) {
+    const response = selectionErrorResponse(error);
+    if (response) return response;
+    throw error;
   }
+  if (!Array.isArray(rawColumns) || rawColumns.some((column) => typeof column !== "string") || rawColumns.length > 40) {
+    return Response.json({ error: "invalid_columns" }, { status: 400 });
+  }
+  const columns = [...new Set(rawColumns as string[])];
+  if (columns.some((column) => !VALID_COLS.has(column))) return Response.json({ error: "invalid_columns" }, { status: 400 });
+  const count = await countRecords(ctx.tenantId, ctx.accountId, batchIds);
 
   const nameById = new Map<string, string>();
   for (const id of batchIds) {
@@ -105,18 +123,39 @@ async function handle(batchIds: string[], columns: string[], ctx: { tenantId: st
   });
 }
 
+async function preflight(rawBatchIds: unknown, rawColumns: unknown, ctx: { tenantId: string; accountId: string; idToken: string }) {
+  try {
+    const batchIds = parseBatchIds(rawBatchIds);
+    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    if (!Array.isArray(rawColumns) || rawColumns.some((column) => typeof column !== "string") || rawColumns.length > 40) {
+      return Response.json({ error: "invalid_columns" }, { status: 400 });
+    }
+    const columns = [...new Set(rawColumns as string[])];
+    if (columns.some((column) => !VALID_COLS.has(column))) {
+      return Response.json({ error: "invalid_columns" }, { status: 400 });
+    }
+    return Response.json({ ready: true });
+  } catch (error) {
+    const response = selectionErrorResponse(error);
+    if (response) return response;
+    throw error;
+  }
+}
+
 export const POST = withLogging("export", async (req: Request) => {
   if (!isBackendConfigured()) return Response.json({ error: "backend_not_configured" }, { status: 503 });
   const ctx = await getTenantContext();
   if (!ctx) return Response.json({ error: "not_authenticated" }, { status: 401 });
   setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
-  let body: { batchIds?: string[]; columns?: string[] };
+  let body: { batchIds?: unknown; columns?: unknown };
   try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "invalid_json" }, { status: 400 });
+    body = await parseJsonBody(req);
+  } catch (error) {
+    const response = jsonBodyErrorResponse(error);
+    if (response) return response;
+    throw error;
   }
-  return handle((body.batchIds ?? []).filter(Boolean), body.columns ?? [], ctx);
+  return handle(body?.batchIds, body?.columns ?? [], ctx);
 });
 
 export const GET = withLogging("export", async (req: Request) => {
@@ -127,5 +166,6 @@ export const GET = withLogging("export", async (req: Request) => {
   const url = new URL(req.url);
   const batchIds = (url.searchParams.get("batchIds") ?? "").split(",").filter(Boolean);
   const columns = (url.searchParams.get("columns") ?? "").split(",").filter(Boolean);
+  if (url.searchParams.get("preflight") === "1") return preflight(batchIds, columns, ctx);
   return handle(batchIds, columns, ctx);
 });

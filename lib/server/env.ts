@@ -20,6 +20,7 @@ export const env = {
     model: process.env.LLM_MODEL ?? "",
     baseUrl: process.env.LLM_BASE_URL ?? "",
     apiKey: process.env.LLM_API_KEY ?? "",
+    projectId: process.env.LLM_PROJECT_ID ?? "",
   },
 } as const;
 

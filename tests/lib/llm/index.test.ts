@@ -35,6 +35,7 @@ function setLlmEnv(vars: Record<string, string | undefined>) {
     "LLM_MODEL",
     "LLM_BASE_URL",
     "LLM_API_KEY",
+    "LLM_PROJECT_ID",
   ]) {
     delete process.env[k];
   }

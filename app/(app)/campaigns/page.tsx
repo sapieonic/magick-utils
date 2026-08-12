@@ -37,6 +37,39 @@ const PAGE_SIZE = 8;
 
 type SortState = { key: string; dir: "asc" | "desc" };
 
+function SortHead({
+  k,
+  children,
+  align,
+  sort,
+  onSort,
+}: {
+  k: string;
+  children: React.ReactNode;
+  align?: "right";
+  sort: SortState;
+  onSort: (key: string) => void;
+}) {
+  return (
+    <th className={cx("px-3 py-2.5 font-bold select-none", align === "right" && "text-right")}>
+      <button
+        onClick={() => onSort(k)}
+        className={cx(
+          "inline-flex items-center gap-1 hover:text-slate-700 transition-colors",
+          align === "right" && "flex-row-reverse",
+        )}
+      >
+        {children}
+        <Icon
+          name={sort.key === k ? (sort.dir === "desc" ? "ChevronDown" : "ChevronUp") : "ChevronsUpDown"}
+          size={13}
+          className={sort.key === k ? "text-[var(--accent)]" : "text-slate-300"}
+        />
+      </button>
+    </th>
+  );
+}
+
 export default function CampaignsScreen() {
   const { currency, setCombineTargets, setAnalyzeTargets } = useApp();
   const router = useRouter();
@@ -52,16 +85,21 @@ export default function CampaignsScreen() {
   // the backend is off; on a live backend no mock rows ever render here.
   const [campaigns, setCampaigns] = useState<Batch[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // load via the data seam — returns mock when the backend is off, live data when on
   useEffect(() => {
     let active = true;
-    setLoading(true);
     listCampaigns()
       .then((r) => {
-        if (active) setCampaigns(r.batches);
+        if (active) {
+          setCampaigns(r.batches);
+          setLoadError(null);
+        }
       })
-      .catch(() => {})
+      .catch((error: unknown) => {
+        if (active) setLoadError(error instanceof Error ? error.message : "Unable to load campaigns.");
+      })
       .finally(() => {
         if (active) setLoading(false);
       });
@@ -69,10 +107,6 @@ export default function CampaignsScreen() {
       active = false;
     };
   }, []);
-
-  useEffect(() => {
-    setPage(1);
-  }, [search, channel, statusF, providerF]);
 
   const providers = useMemo(() => ["all", ...Array.from(new Set(campaigns.map((c: Batch) => c.provider)))], [campaigns]);
 
@@ -140,30 +174,12 @@ export default function CampaignsScreen() {
 
   const setSortKey = (key: string) =>
     setSort((s: SortState) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" }));
-  const SortHead = ({ k, children, align }: { k: string; children: React.ReactNode; align?: "right" }) => (
-    <th className={cx("px-3 py-2.5 font-bold select-none", align === "right" && "text-right")}>
-      <button
-        onClick={() => setSortKey(k)}
-        className={cx(
-          "inline-flex items-center gap-1 hover:text-slate-700 transition-colors",
-          align === "right" && "flex-row-reverse"
-        )}
-      >
-        {children}
-        <Icon
-          name={sort.key === k ? (sort.dir === "desc" ? "ChevronDown" : "ChevronUp") : "ChevronsUpDown"}
-          size={13}
-          className={sort.key === k ? "text-[var(--accent)]" : "text-slate-300"}
-        />
-      </button>
-    </th>
-  );
-
   const resetFilters = () => {
     setSearch("");
     setChannel("all");
     setStatusF("all");
     setProviderF("all");
+    setPage(1);
   };
   const hasFilters = search || channel !== "all" || statusF !== "all" || providerF !== "all";
 
@@ -184,14 +200,20 @@ export default function CampaignsScreen() {
           icon="Search"
           placeholder="Search campaigns or batch ID…"
           value={search}
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+            setSearch(e.target.value);
+            setPage(1);
+          }}
           className="w-full sm:w-72"
         />
         <FilterSelect
           icon="Filter"
           label="Type"
           value={channel}
-          onChange={setChannel}
+          onChange={(value) => {
+            setChannel(value);
+            setPage(1);
+          }}
           options={[
             { value: "all", label: "All types" },
             ...Object.values(TYPES).map((t) => ({
@@ -204,7 +226,10 @@ export default function CampaignsScreen() {
           icon="Activity"
           label="Status"
           value={statusF}
-          onChange={setStatusF}
+          onChange={(value) => {
+            setStatusF(value);
+            setPage(1);
+          }}
           options={[
             { value: "all", label: "All statuses" },
             ...Object.entries(STATUS).map(([k, v]) => ({ value: k, label: v.label })),
@@ -214,7 +239,10 @@ export default function CampaignsScreen() {
           icon="Server"
           label="Provider"
           value={providerF}
-          onChange={setProviderF}
+          onChange={(value) => {
+            setProviderF(value);
+            setPage(1);
+          }}
           options={providers.map((p: string) => ({ value: p, label: p === "all" ? "All providers" : p }))}
         />
         {hasFilters && (
@@ -233,6 +261,11 @@ export default function CampaignsScreen() {
         </div>
       </div>
 
+      <div className="mb-3 flex items-center gap-2 text-[12.5px] text-slate-500">
+        <Icon name="ChartColumnBig" size={14} className="text-[var(--accent)]" />
+        Select two or more checkboxes to analyze batches together. Combined selections must use the same batch type.
+      </div>
+
       <Card className="overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm min-w-[940px]">
@@ -243,19 +276,20 @@ export default function CampaignsScreen() {
                     checked={allOnPageSelected}
                     indeterminate={someSelected && !allOnPageSelected}
                     onChange={togglePage}
+                    ariaLabel="Select all eligible campaigns on this page"
                   />
                 </th>
-                <SortHead k="name">Campaign</SortHead>
+                <SortHead k="name" sort={sort} onSort={setSortKey}>Campaign</SortHead>
                 <th className="px-3 py-2.5 font-bold">Type</th>
-                <SortHead k="date">Date</SortHead>
-                <SortHead k="records" align="right">
+                <SortHead k="date" sort={sort} onSort={setSortKey}>Date</SortHead>
+                <SortHead k="records" align="right" sort={sort} onSort={setSortKey}>
                   Records
                 </SortHead>
                 <th className="px-3 py-2.5 font-bold">Status breakdown</th>
-                <SortHead k="success" align="right">
+                <SortHead k="success" align="right" sort={sort} onSort={setSortKey}>
                   Success
                 </SortHead>
-                <SortHead k="spend" align="right">
+                <SortHead k="spend" align="right" sort={sort} onSort={setSortKey}>
                   Spend
                 </SortHead>
                 <th className="px-5 py-2.5 font-bold text-right">Actions</th>
@@ -285,9 +319,10 @@ export default function CampaignsScreen() {
                       <Checkbox
                         checked={isSel}
                         disabled={!canSel}
+                        ariaLabel={`Select ${c.name}`}
                         title={
                           !canSel && activeSelType
-                            ? `You can only combine batches of the same type (${SEL_LABEL[activeSelType as SelType]}). Clear the selection to switch types.`
+                            ? `Combined analysis and CSV export require the same batch type (${SEL_LABEL[activeSelType as SelType]}). Clear the selection to switch types.`
                             : undefined
                         }
                         onChange={() => toggle(c.id)}
@@ -335,12 +370,12 @@ export default function CampaignsScreen() {
 
         {!loading && filtered.length === 0 && (
           <EmptyState
-            icon="SearchX"
-            title="No campaigns match your filters"
-            body="Try adjusting your search or clearing filters to see more results."
+            icon={loadError ? "TriangleAlert" : "SearchX"}
+            title={loadError ? "Campaigns are unavailable" : "No campaigns match your filters"}
+            body={loadError ?? "Try adjusting your search or clearing filters to see more results."}
             action={
-              <Button variant="secondary" icon="X" onClick={resetFilters}>
-                Clear filters
+              <Button variant="secondary" icon={loadError ? "RotateCcw" : "X"} onClick={() => loadError ? window.location.reload() : resetFilters()}>
+                {loadError ? "Try again" : "Clear filters"}
               </Button>
             }
           />
@@ -360,6 +395,8 @@ export default function CampaignsScreen() {
               <IconButton
                 icon="ChevronLeft"
                 size="sm"
+                aria-label="Previous page"
+                disabled={page === 1}
                 onClick={() => setPage((p: number) => Math.max(1, p - 1))}
                 className={page === 1 ? "opacity-40 pointer-events-none" : ""}
               />
@@ -379,6 +416,8 @@ export default function CampaignsScreen() {
               <IconButton
                 icon="ChevronRight"
                 size="sm"
+                aria-label="Next page"
+                disabled={page === pages}
                 onClick={() => setPage((p: number) => Math.min(pages, p + 1))}
                 className={page === pages ? "opacity-40 pointer-events-none" : ""}
               />
@@ -409,13 +448,14 @@ export default function CampaignsScreen() {
               icon="ChartColumnBig"
               onClick={() => analyze(Array.from(selected))}
             >
-              Analyze together
+              {selected.size > 1 ? `Analyze ${selected.size} together` : "Analyze selected"}
             </Button>
             <Button size="sm" className="!text-white" icon="GitMerge" onClick={() => combine(Array.from(selected))}>
               Combine into one CSV
             </Button>
             <button
               onClick={() => setSelected(new Set())}
+              aria-label="Clear campaign selection"
               className="text-slate-400 hover:text-white hover:bg-white/10 rounded-lg p-1.5 ml-0.5"
             >
               <Icon name="X" size={16} />
@@ -425,7 +465,7 @@ export default function CampaignsScreen() {
       )}
 
       {downloadCampaign && (
-        <DownloadModal campaign={downloadCampaign} currency={currency} onClose={() => setDownloadCampaign(null)} />
+        <DownloadModal campaign={downloadCampaign} onClose={() => setDownloadCampaign(null)} />
       )}
     </div>
   );

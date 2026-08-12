@@ -25,11 +25,22 @@ export default function Page() {
   // effect below fires a live ingest job using seeded mock ids (cmp_1005…),
   // which the worker can't find ("batch … not found").
   const [batchesReady, setBatchesReady] = useState(false);
+  const [ingest, setIngest] = useState(0);
+  const [ingesting, setIngesting] = useState(true);
+  const [analytics, setAnalytics] = useState<AggregatesDoc | null>(null);
+  const [live, setLive] = useState(false); // backend is on for this run
+  const [ingestError, setIngestError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
     listCampaigns()
       .then(({ batches }) => {
         if (alive && batches.length) setBatches(batches);
+      })
+      .catch((error: unknown) => {
+        if (!alive) return;
+        setLive(true);
+        setIngestError(error instanceof Error ? error.message : "Unable to load campaign batches.");
+        setIngesting(false);
       })
       .finally(() => {
         if (alive) setBatchesReady(true);
@@ -41,12 +52,19 @@ export default function Page() {
 
   const targets = useMemo<Batch[]>(() => {
     if (!batches.length) return [];
+    if (analyzeTargets && analyzeTargets.length) {
+      return analyzeTargets
+        .map((id) => batches.find((campaign: Batch) => campaign.id === id))
+        .filter((campaign): campaign is Batch => Boolean(campaign));
+    }
     const fallback = batches.filter((c: Batch) => selType(c) === "ai")[0] || batches[0];
-    const list = (analyzeTargets && analyzeTargets.length ? analyzeTargets : [fallback.id])
-      .map((id) => batches.find((c: Batch) => c.id === id))
-      .filter((c): c is Batch => Boolean(c));
-    return list.length ? list : [batches[0]];
+    return [fallback];
   }, [analyzeTargets, batches]);
+
+  const missingTargetIds = useMemo(
+    () => (analyzeTargets ?? []).filter((id) => !batches.some((batch) => batch.id === id)),
+    [analyzeTargets, batches],
+  );
 
   const ids = useMemo(() => targets.map((t: Batch) => t.id), [targets]);
   const idsKey = ids.join(",");
@@ -61,11 +79,6 @@ export default function Page() {
   const [chatOpen, setChatOpen] = useState(false);
 
   // ingestion job
-  const [ingest, setIngest] = useState(0);
-  const [ingesting, setIngesting] = useState(true);
-  const [analytics, setAnalytics] = useState<AggregatesDoc | null>(null);
-  const [live, setLive] = useState(false); // backend is on for this run
-  const [ingestError, setIngestError] = useState<string | null>(null);
   const [runToken, setRunToken] = useState(0); // bumped by "Refresh data"
   const refreshRef = useRef(false);
   const runIngest = () => {
@@ -76,24 +89,29 @@ export default function Page() {
   // Real ingestion: create a job and poll it. When the backend is off,
   // createIngestJob returns null and we keep the simulated progress animation.
   useEffect(() => {
-    if (!ids.length || !batchesReady) return;
+    if (!ids.length || !batchesReady || missingTargetIds.length > 0) return;
     let alive = true;
     let simIv: ReturnType<typeof setInterval> | null = null;
     let pollIv: ReturnType<typeof setInterval> | null = null;
     const refresh = refreshRef.current;
     refreshRef.current = false;
 
-    setIngesting(true);
-    setIngest(0);
-    setAnalytics(null);
-    setIngestError(null);
+    const fail = (error: unknown) => {
+      if (!alive) return;
+      setIngestError(error instanceof Error ? error.message : "Unable to prepare analytics. Please try again.");
+      setIngesting(false);
+    };
 
     const finish = async () => {
-      const agg = await getAnalytics(ids, refresh);
-      if (!alive) return;
-      setAnalytics(agg);
-      setIngest(100);
-      setTimeout(() => alive && setIngesting(false), 400);
+      try {
+        const agg = await getAnalytics(ids, refresh);
+        if (!alive) return;
+        setAnalytics(agg);
+        setIngest(100);
+        setTimeout(() => alive && setIngesting(false), 400);
+      } catch (error) {
+        fail(error);
+      }
     };
 
     const simulate = () => {
@@ -110,6 +128,16 @@ export default function Page() {
       }, 200);
     };
 
+    // Defer the reset so the effect only coordinates the external ingestion
+    // process; this also lets a rapid dependency change cancel the stale run.
+    queueMicrotask(() => {
+      if (!alive) return;
+      setIngesting(true);
+      setIngest(0);
+      setAnalytics(null);
+      setIngestError(null);
+    });
+
     createIngestJob(ids, "ingest").then((job) => {
       if (!alive) return;
       if (!job) {
@@ -119,27 +147,36 @@ export default function Page() {
         return;
       }
       setLive(true);
+      if (!job.jobId) {
+        void finish();
+        return;
+      }
+      const jobId = job.jobId;
       const total = job.total || 1;
       pollIv = setInterval(async () => {
-        const j = await getJob(job.jobId);
-        if (!alive) return;
-        if (!j) return;
-        setIngest(Math.min(99, Math.round((j.done / total) * 100)));
-        if (j.status === "done") {
+        try {
+          const j = await getJob(jobId);
+          if (!alive) return;
+          if (!j) return;
+          setIngest(Math.min(99, Math.round((j.done / total) * 100)));
+          if (j.status === "done") {
+            if (pollIv) clearInterval(pollIv);
+            pollIv = null;
+            await finish();
+          } else if (j.status === "error") {
+            if (pollIv) clearInterval(pollIv);
+            pollIv = null;
+            setIngestError(j.error || "Ingestion failed");
+            setIngest(100);
+            setTimeout(() => alive && setIngesting(false), 400);
+          }
+        } catch (error) {
           if (pollIv) clearInterval(pollIv);
           pollIv = null;
-          await finish();
-        } else if (j.status === "error") {
-          // Don't fetch analytics on a failed ingest — surface the error
-          // instead of silently rendering mock data as if it were live.
-          if (pollIv) clearInterval(pollIv);
-          pollIv = null;
-          setIngestError(j.error || "Ingestion failed");
-          setIngest(100);
-          setTimeout(() => alive && setIngesting(false), 400);
+          fail(error);
         }
       }, 1000);
-    });
+    }).catch(fail);
 
     return () => {
       alive = false;
@@ -167,6 +204,53 @@ export default function Page() {
       <div className="mx-auto max-w-[1400px] px-4 sm:px-6 py-6">
         <Card className="flex items-center justify-center gap-2.5 py-20 text-sm font-semibold text-slate-500">
           <Spinner size={16} /> Loading analytics…
+        </Card>
+      </div>
+    );
+  }
+
+  if (batches.length === 0 && ingestError) {
+    return (
+      <div className="mx-auto max-w-[1400px] px-4 sm:px-6 py-6">
+        <Card>
+          <div className="p-8 text-center">
+            <Icon name="TriangleAlert" size={28} className="mx-auto mb-3 text-red-600" />
+            <h2 className="text-lg font-bold text-slate-900">Analytics are unavailable</h2>
+            <p className="mx-auto mt-2 max-w-xl text-sm text-slate-500">{ingestError}</p>
+            <Button className="mt-5" icon="ArrowLeft" onClick={() => router.push("/campaigns")}>Return to Campaigns</Button>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  if (batches.length === 0 && missingTargetIds.length === 0) {
+    return (
+      <div className="mx-auto max-w-[1400px] px-4 sm:px-6 py-6">
+        <Card>
+          <div className="p-8 text-center">
+            <Icon name="ChartColumnBig" size={28} className="mx-auto mb-3 text-slate-400" />
+            <h2 className="text-lg font-bold text-slate-900">No campaigns are available to analyze</h2>
+            <p className="mx-auto mt-2 max-w-xl text-sm text-slate-500">Create or load a campaign batch, then return here to analyze its records.</p>
+            <Button className="mt-5" icon="ArrowLeft" onClick={() => router.push("/campaigns")}>Return to Campaigns</Button>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  if (missingTargetIds.length > 0) {
+    return (
+      <div className="mx-auto max-w-[1400px] px-4 sm:px-6 py-6">
+        <Card>
+          <div className="p-8 text-center">
+            <Icon name="TriangleAlert" size={28} className="mx-auto mb-3 text-amber-600" />
+            <h2 className="text-lg font-bold text-slate-900">The saved analysis selection is incomplete</h2>
+            <p className="mx-auto mt-2 max-w-xl text-sm text-slate-500">
+              These selected batches are no longer available: {missingTargetIds.join(", ")}. Nothing has been silently omitted.
+            </p>
+            <Button className="mt-5" icon="ArrowLeft" onClick={() => router.push("/campaigns")}>Return to Campaigns</Button>
+          </div>
         </Card>
       </div>
     );
@@ -223,11 +307,15 @@ export default function Page() {
                     {fmtNum(ingested)} / {fmtNum(totalRecords)}
                   </div>
                 </div>
-              ) : (
-                <div className="flex items-center gap-2 text-[13px] font-semibold text-emerald-600">
-                  <Icon name="CircleCheck" size={16} /> Up to date<span className="text-slate-300 font-normal">· synced 2m ago</span>
+              ) : ingestError ? (
+                <div className="flex items-center gap-2 text-[13px] font-semibold text-red-600">
+                  <Icon name="TriangleAlert" size={16} /> Sync failed
                 </div>
-              )}
+              ) : analytics ? (
+                <div className="flex items-center gap-2 text-[13px] font-semibold text-emerald-600">
+                  <Icon name="CircleCheck" size={16} /> Up to date
+                </div>
+              ) : <div className="text-[13px] font-semibold text-amber-600">No analytics available</div>}
             </div>
             <Button variant="secondary" icon="RefreshCw" onClick={runIngest} disabled={ingesting}>
               Refresh data
@@ -261,7 +349,17 @@ export default function Page() {
       {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
       {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
       {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} />}
-      {tab === "insights" && <InsightsTab key={idsKey} targets={targets} currency={currency} batchIds={ids} analytics={analytics} />}
+      {tab === "insights" && (
+        <InsightsTab
+          key={`${idsKey}:${analytics?.key ?? "pending"}`}
+          targets={targets}
+          currency={currency}
+          batchIds={ids}
+          analytics={analytics}
+          dataLoading={ingesting}
+          dataError={ingestError}
+        />
+      )}
 
       {/* Floating toggle — persistent entry point when the panel is closed. */}
       {!chatOpen && (

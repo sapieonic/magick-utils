@@ -7,6 +7,7 @@ vi.mock("@/lib/server/env", () => ({
 }));
 vi.mock("@/lib/server/session", () => ({ getTenantContext: vi.fn() }));
 vi.mock("@/lib/server/repositories", () => ({
+  consumeAiQuota: vi.fn().mockResolvedValue(true),
   getAggregates: vi.fn(),
   getInsight: vi.fn(),
   getRecords: vi.fn(),
@@ -17,6 +18,11 @@ vi.mock("@/lib/server/aggregate", () => ({ computeAggregates: vi.fn() }));
 vi.mock("@/lib/server/fingerprint", () => ({
   aggregatesKey: vi.fn(() => "agg-key"),
   batchSetKey: vi.fn(() => "set-key"),
+}));
+vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
+vi.mock("@/lib/server/selection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/selection")>()),
+  validateSelection: vi.fn().mockResolvedValue([]),
 }));
 
 const structured = vi.fn();
@@ -94,7 +100,7 @@ describe("POST /api/insights", () => {
     const res = await POST(req({ batchIds: ["b1"], model: "client-model" }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ insight: { narrative: "old" }, cached: true });
-    expect(getInsight).toHaveBeenCalledWith("t1", "a1", "set-key:backend-model");
+    expect(getInsight).toHaveBeenCalledWith("t1", "a1", "set-key:dataset:backend-model");
   });
 
   it("409 not_ingested when no aggregates and no records", async () => {
@@ -128,9 +134,34 @@ describe("POST /api/insights", () => {
     expect(json.cached).toBe(false);
     expect(json.insight.narrative).toBe("all good");
     expect(json.insight.tenantId).toBe("t1");
-    expect(json.insight.key).toBe("set-key:backend-model");
+    expect(json.insight.key).toBe("set-key:dataset:backend-model");
     expect(json.insight.model).toBe("backend-model");
     expect(setInsight).toHaveBeenCalled();
+  });
+
+  it("grounds time recommendations in the deterministic reach window", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getInsight).mockResolvedValue(null as never);
+    vi.mocked(getAggregates).mockResolvedValue({
+      ...AGG,
+      reachByTimeOfDay: {
+        timezone: "UTC",
+        bandHours: 3,
+        minSamples: 20,
+        totalPlaced: 40,
+        cells: [{ weekday: 2, band: 3, total: 40, reached: 30, rate: 0.75, lowSample: false }],
+      },
+    } as never);
+    structured.mockResolvedValue({ narrative: "grounded", anomalies: [], recommendations: [] });
+    const { POST } = await import("@/app/api/insights/route");
+    expect((await POST(req({ batchIds: ["b1"] }))).status).toBe(200);
+
+    const messages = structured.mock.calls[0][0] as { role: string; content: string }[];
+    expect(messages[1].content).toContain('"window": "9 am–12 pm"');
+    expect(messages[1].content).toContain('"timezone": "UTC"');
+    expect(messages[0].content).toContain("Only make a best-time recommendation when `bestReachWindow` is non-null");
   });
 
   it("computes aggregates first when missing but records exist", async () => {

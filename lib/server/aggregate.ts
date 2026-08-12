@@ -39,6 +39,10 @@ function parseTimestamp(iso: string | null | undefined): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
+function activityTime(r: NormalizedRecord): string | null | undefined {
+  return r.activityTimestamp ?? r.timestamp;
+}
+
 function sameUtcDay(a: Date, b: Date): boolean {
   return (
     a.getUTCFullYear() === b.getUTCFullYear() &&
@@ -149,7 +153,7 @@ function computeReachByTimeOfDay(records: NormalizedRecord[]): AggregatesDoc["re
   const cells = new Map<string, { weekday: number; band: number; total: number; reached: number }>();
   let totalPlaced = 0;
   for (const r of records) {
-    const parsed = parseTimestamp(r.timestamp);
+    const parsed = parseTimestamp(activityTime(r));
     if (!parsed) continue;
     const weekday = parsed.getUTCDay();
     const band = Math.floor(parsed.getUTCHours() / REACH_BAND_HOURS);
@@ -246,12 +250,12 @@ export function computeAggregates(
   // volume + cost over time
   const volMap = new Map<string, { date: string; calls: number; messages: number }>();
   const costMap = new Map<string, { date: string; telephony: number; ai: number }>();
-  const validDates = records.map((r) => parseTimestamp(r.timestamp)).filter((d): d is Date => Boolean(d));
+  const validDates = records.map((r) => parseTimestamp(activityTime(r))).filter((d): d is Date => Boolean(d));
   const timeGranularity = chooseTimeGranularity(validDates);
   fillTimeBuckets(volMap, validDates, timeGranularity, (date) => ({ date, calls: 0, messages: 0 }));
   fillTimeBuckets(costMap, validDates, timeGranularity, (date) => ({ date, telephony: 0, ai: 0 }));
   for (const r of records) {
-    const parsed = parseTimestamp(r.timestamp);
+    const parsed = parseTimestamp(activityTime(r));
     const bucket = parsed ? bucketStart(parsed, timeGranularity) : null;
     const key = bucket ? String(bucket.getTime()) : "invalid";
     const label = bucket ? bucketLabel(bucket, timeGranularity) : "—";

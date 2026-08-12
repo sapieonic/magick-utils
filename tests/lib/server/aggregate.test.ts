@@ -114,4 +114,16 @@ describe("computeAggregates — reachByTimeOfDay (best-time-to-reach, 4b)", () =
     const cell = agg.reachByTimeOfDay!.cells[0];
     expect(cell.reached).toBe(30);
   });
+
+  it("uses placed/sent activity time instead of completion time", () => {
+    const records = Array.from({ length: 25 }, (_, index) => ({
+      ...tsRec("2026-06-23T18:00:00Z", index < 20 ? "completed" : "no_answer"),
+      activityTimestamp: "2026-06-23T10:00:00Z",
+    }));
+    const agg = computeAggregates(records, ["b1"], ctx, "k");
+    expect(agg.reachByTimeOfDay!.cells).toEqual([
+      expect.objectContaining({ weekday: 2, band: 3, total: 25 }),
+    ]);
+    expect(agg.volumeOverTime).toEqual([{ date: "10:00 AM", calls: 25, messages: 0 }]);
+  });
 });

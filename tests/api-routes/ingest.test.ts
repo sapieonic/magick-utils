@@ -6,13 +6,17 @@ vi.mock("@/lib/server/session", () => ({
   getSession: vi.fn(),
 }));
 vi.mock("@/lib/server/repositories", () => ({
+  acquireIngestionLocks: vi.fn().mockResolvedValue(undefined),
   createJob: vi.fn().mockResolvedValue(undefined),
   getBatch: vi.fn(),
+  countRecords: vi.fn(),
+  findActiveJobForBatches: vi.fn().mockResolvedValue(null),
+  releaseIngestionLocks: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext, getSession } from "@/lib/server/session";
-import { createJob, getBatch } from "@/lib/server/repositories";
+import { countRecords, createJob, findActiveJobForBatches, getBatch } from "@/lib/server/repositories";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 
@@ -56,7 +60,7 @@ describe("POST /api/ingest", () => {
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: [] }));
     expect(res.status).toBe(400);
-    await expect(res.json()).resolves.toEqual({ error: "no_batches" });
+    await expect(res.json()).resolves.toMatchObject({ error: "no_batches" });
   });
 
   it("creates an ingest job, sums batch totals, returns {jobId,total}", async () => {
@@ -85,21 +89,56 @@ describe("POST /api/ingest", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
-    vi.mocked(getBatch).mockResolvedValue(null as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
+    vi.mocked(countRecords).mockResolvedValue(0);
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
     expect(res.status).toBe(200);
     expect(vi.mocked(createJob).mock.calls[0][0].type).toBe("merge");
   });
 
-  it("tolerates getBatch rejecting (total defaults toward 0)", async () => {
+  it("does not re-ingest merge batches whose normalized records already exist", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "ready" } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  it("does not misclassify a repository outage as batch_not_found", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockRejectedValue(new Error("mongo down"));
     const { POST } = await import("@/app/api/ingest/route");
+    await expect(POST(req({ batchIds: ["b1"] }))).rejects.toThrow("mongo down");
+  });
+
+  it("reattaches callers to overlapping active ingestion jobs", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, batchIds: ["b1"] } as never);
+    const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"] }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toMatchObject({ total: 0 });
+    await expect(res.json()).resolves.toEqual({ jobId: "active", total: 10, ready: false, existing: true });
+  });
+
+  it("rejects reattachment when an overlapping job does not cover the full selection", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, batchIds: ["b1"] } as never);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1", "b2"] }));
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toMatchObject({ error: "ingestion_in_progress" });
   });
 });

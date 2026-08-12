@@ -68,24 +68,24 @@ describe("backendStatus", () => {
     expect(healthCalls).toHaveLength(1);
   });
 
-  it("returns {backend:false, llm:false} when fetch throws", async () => {
+  it("reports health as unavailable when fetch throws", async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error("network down");
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.backendStatus()).toEqual({ backend: false, llm: false });
+    await expect(api.backendStatus()).rejects.toMatchObject({ code: "health_unavailable" });
   });
 
-  it("caches the failure state too (no re-fetch after throw)", async () => {
-    const fetchMock = vi.fn(async () => {
-      throw new Error("network down");
-    });
+  it("does not cache a transient health failure", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(jsonRes(HEALTH_ON));
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    await api.backendStatus();
-    await api.backendStatus();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(api.backendStatus()).rejects.toMatchObject({ code: "health_unavailable" });
+    await expect(api.backendStatus()).resolves.toEqual(HEALTH_ON);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -120,19 +120,17 @@ describe("listCampaigns", () => {
     expect(out.batches).toEqual(liveBatches);
   });
 
-  it("backend on + non-ok → falls back to mock", async () => {
+  it("backend on + non-ok → rejects instead of showing mock campaigns as live", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/campaigns": () => jsonRes({}, { ok: false, status: 500 }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    const out = await api.listCampaigns();
-    expect(out.source).toBe("mock");
-    expect(out.batches).toEqual(CAMPAIGNS);
+    await expect(api.listCampaigns()).rejects.toMatchObject({ status: 500 });
   });
 
-  it("backend on + fetch throws → falls back to mock", async () => {
+  it("backend on + fetch throws → rejects instead of showing mock campaigns as live", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/campaigns": () => {
@@ -141,9 +139,7 @@ describe("listCampaigns", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    const out = await api.listCampaigns();
-    expect(out.source).toBe("mock");
-    expect(out.batches).toEqual(CAMPAIGNS);
+    await expect(api.listCampaigns()).rejects.toThrow("boom");
   });
 });
 
@@ -197,7 +193,7 @@ describe("createIngestJob", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    await expect(api.createIngestJob(["AI-1"])).rejects.toThrow("ingest 500");
+    await expect(api.createIngestJob(["AI-1"])).rejects.toMatchObject({ status: 500 });
   });
 });
 
@@ -219,13 +215,13 @@ describe("getJob", () => {
     expect(url).toBe("/api/jobs/job_9");
   });
 
-  it("non-ok → null", async () => {
+  it("non-ok → explicit error", async () => {
     const fetchMock = makeFetch({
       "/api/jobs/": () => jsonRes({}, { ok: false, status: 404 }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.getJob("nope")).toBeNull();
+    await expect(api.getJob("nope")).rejects.toMatchObject({ status: 404 });
   });
 });
 
@@ -272,25 +268,25 @@ describe("getAnalytics", () => {
     expect(JSON.parse(String(captured?.body)).refresh).toBe(false);
   });
 
-  it("non-ok → null", async () => {
+  it("non-ok → explicit error", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/analytics": () => jsonRes({}, { ok: false, status: 500 }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.getAnalytics(["AI-1"])).toBeNull();
+    await expect(api.getAnalytics(["AI-1"])).rejects.toMatchObject({ status: 500 });
   });
 });
 
 // --- generateInsights ----------------------------------------------------
 
 describe("generateInsights", () => {
-  it("llm off → null (even if backend on)", async () => {
+  it("llm off → explicit error (even if backend on)", async () => {
     const fetchMock = makeFetch({ "/api/health": () => jsonRes(HEALTH_BACKEND_ONLY) });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.generateInsights(["AI-1"])).toBeNull();
+    await expect(api.generateInsights(["AI-1"])).rejects.toMatchObject({ code: "llm_not_configured" });
   });
 
   it("llm on + ok → insight; body {batchIds,refresh}", async () => {
@@ -310,14 +306,14 @@ describe("generateInsights", () => {
     expect(JSON.parse(String(captured?.body))).toEqual({ batchIds: ["AI-1"], refresh: true });
   });
 
-  it("non-ok → null", async () => {
+  it("non-ok → explicit error", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/insights": () => jsonRes({}, { ok: false, status: 502 }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.generateInsights(["AI-1"])).toBeNull();
+    await expect(api.generateInsights(["AI-1"])).rejects.toMatchObject({ status: 502 });
   });
 });
 
@@ -367,39 +363,40 @@ function sseResponse(chunks: string[], { ok = true, withBody = true }: { ok?: bo
 }
 
 describe("streamChat", () => {
-  it("llm off → false", async () => {
+  it("llm off → explicit error", async () => {
     const fetchMock = makeFetch({ "/api/health": () => jsonRes(HEALTH_BACKEND_ONLY) });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     const onDelta = vi.fn();
-    expect(await api.streamChat(["AI-1"], "hello", [], onDelta)).toBe(false);
+    await expect(api.streamChat(["AI-1"], "hello", [], onDelta)).rejects.toMatchObject({ code: "llm_not_configured" });
     expect(onDelta).not.toHaveBeenCalled();
   });
 
-  it("non-ok response → false", async () => {
+  it("non-ok response → explicit error", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/chat": () => sseResponse([], { ok: false }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.streamChat(["AI-1"], "hi", [], vi.fn())).toBe(false);
+    await expect(api.streamChat(["AI-1"], "hi", [], vi.fn())).rejects.toMatchObject({ status: undefined });
   });
 
-  it("no body → false", async () => {
+  it("no body → explicit error", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/chat": () => sseResponse([], { ok: true, withBody: false }),
     });
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
-    expect(await api.streamChat(["AI-1"], "hi", [], vi.fn())).toBe(false);
+    await expect(api.streamChat(["AI-1"], "hi", [], vi.fn())).rejects.toMatchObject({ code: "empty_stream" });
   });
 
   it("parses SSE data frames, calls onDelta per delta, returns true", async () => {
     const chunks = [
       'data: {"delta":"Hello"}\n\n',
       'data: {"delta":" world"}\n\n',
+      'event: done\ndata: {}\n\n',
     ];
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
@@ -414,7 +411,7 @@ describe("streamChat", () => {
   });
 
   it("handles frames split across chunk boundaries (buffering)", async () => {
-    const chunks = ['data: {"del', 'ta":"Hi"}\n\ndata: {"delta":"!"}\n\n'];
+    const chunks = ['data: {"del', 'ta":"Hi"}\n\ndata: {"delta":"!"}\n\nevent: done\ndata: {}\n\n'];
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/chat": () => sseResponse(chunks),
@@ -432,6 +429,7 @@ describe("streamChat", () => {
       'data: {"delta":"A"}\n\n',
       "data: [DONE]\n\n", // unparsable JSON → ignored
       'data: {"foo":"bar"}\n\n', // valid JSON but no delta → no onDelta
+      'event: done\ndata: {}\n\n',
     ];
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
@@ -451,7 +449,7 @@ describe("streamChat", () => {
       "/api/health": () => jsonRes(HEALTH_ON),
       "/api/chat": (_u, init) => {
         captured = init;
-        return sseResponse(['data: {"delta":"x"}\n\n']);
+        return sseResponse(['data: {"delta":"x"}\n\nevent: done\ndata: {}\n\n']);
       },
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -464,6 +462,16 @@ describe("streamChat", () => {
       message: "hi",
       history,
     });
+  });
+
+  it("rejects a stream that closes without the terminal done event", async () => {
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/chat": () => sseResponse(['data: {"delta":"partial"}\n\n']),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    await expect(api.streamChat(["AI-1"], "hi", [], vi.fn())).rejects.toMatchObject({ code: "incomplete_stream" });
   });
 });
 
@@ -607,5 +615,19 @@ describe("downloadCsvUrl", () => {
     const api = await freshApi();
     api.downloadCsvUrl(["x"], ["y"]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("downloadCsv", () => {
+  it("surfaces export errors instead of navigating to raw JSON", async () => {
+    const fetchMock = makeFetch({
+      "/api/export": () => jsonRes({ error: "incomplete_ingestion", message: "Reingest first." }, { ok: false, status: 409 }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    await expect(api.downloadCsv(["b1"], ["status"])).rejects.toMatchObject({
+      status: 409,
+      code: "incomplete_ingestion",
+    });
   });
 });

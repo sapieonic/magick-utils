@@ -5,8 +5,10 @@ import { MongoClient, type Collection, type Db } from "mongodb";
 import { env, isMongoConfigured } from "@/lib/server/env";
 import type {
   AggregatesDoc,
+  AiUsageWindow,
   BatchDoc,
   Insight,
+  IngestionLock,
   Job,
   NormalizedRecord,
 } from "@/lib/server/types";
@@ -54,6 +56,14 @@ export async function jobs(): Promise<Collection<Job>> {
   return (await getDb()).collection<Job>("jobs");
 }
 
+export async function ingestionLocks(): Promise<Collection<IngestionLock>> {
+  return (await getDb()).collection<IngestionLock>("ingestion_locks");
+}
+
+export async function aiUsage(): Promise<Collection<AiUsageWindow>> {
+  return (await getDb()).collection<AiUsageWindow>("ai_usage_windows");
+}
+
 export async function aggregates(): Promise<Collection<AggregatesDoc>> {
   return (await getDb()).collection<AggregatesDoc>("aggregates");
 }
@@ -93,14 +103,24 @@ async function safeCreateIndexes(
  * concurrently — "index already exists" races are swallowed.
  */
 export async function ensureIndexes(): Promise<void> {
-  const [batchesCol, recordsCol, jobsCol, aggregatesCol, insightsCol] =
+  const [batchesCol, recordsCol, jobsCol, locksCol, aiUsageCol, aggregatesCol, insightsCol] =
     await Promise.all([
       batches(),
       records(),
       jobs(),
+      ingestionLocks(),
+      aiUsage(),
       aggregates(),
       insights(),
     ]);
+
+  // Versioned publication supersedes the original unique key. Keeping the old
+  // index would reject a staging revision that shares a recordId with the
+  // currently published revision. IndexNotFound is expected on fresh installs.
+  await recordsCol.dropIndex("uniq_tenant_account_batch_record").catch((error: unknown) => {
+    const code = (error as { code?: number } | null)?.code;
+    if (code !== 27 && !/index not found/i.test((error as Error | null)?.message ?? "")) throw error;
+  });
 
   await Promise.all([
     safeCreateIndexes(() =>
@@ -116,10 +136,19 @@ export async function ensureIndexes(): Promise<void> {
           name: "tenant_account_batch",
         },
         {
-          key: { tenantId: 1, accountId: 1, batchId: 1, recordId: 1 },
-          name: "uniq_tenant_account_batch_record",
+          key: { tenantId: 1, accountId: 1, batchId: 1, revision: 1, recordId: 1 },
+          name: "uniq_tenant_account_batch_revision_record",
           unique: true,
         },
+        {
+          key: { tenantId: 1, accountId: 1, activityDate: 1 },
+          name: "tenant_account_activity_time",
+        },
+        {
+          key: { tenantId: 1, accountId: 1, batchId: 1, revision: 1, activityDate: 1 },
+          name: "published_revision_activity_time",
+        },
+        { key: { retiredAt: 1 }, name: "retired_revision_cleanup" },
       ])
     ),
     safeCreateIndexes(() =>
@@ -127,6 +156,23 @@ export async function ensureIndexes(): Promise<void> {
         { key: { jobId: 1 }, name: "uniq_jobId", unique: true },
         { key: { status: 1, type: 1 }, name: "status_type" },
         { key: { status: 1, retryAt: 1, leaseUntil: 1, createdAt: 1 }, name: "status_due_lease_created" },
+      ])
+    ),
+    safeCreateIndexes(() =>
+      locksCol.createIndexes([
+        {
+          key: { tenantId: 1, accountId: 1, batchId: 1 },
+          name: "uniq_ingestion_batch_lock",
+          unique: true,
+        },
+        { key: { expiresAt: 1 }, name: "ingestion_lock_ttl", expireAfterSeconds: 0 },
+        { key: { jobId: 1 }, name: "ingestion_lock_job" },
+      ])
+    ),
+    safeCreateIndexes(() =>
+      aiUsageCol.createIndexes([
+        { key: { key: 1 }, name: "uniq_ai_usage_window", unique: true },
+        { key: { expiresAt: 1 }, name: "ai_usage_window_ttl", expireAfterSeconds: 0 },
       ])
     ),
     safeCreateIndexes(() =>

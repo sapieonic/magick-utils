@@ -16,6 +16,8 @@ export interface OpenAICompatibleConfig {
   apiKey: string;
   baseUrl: string;
   model: string;
+  /** Optional project header required by some OpenAI-compatible gateways. */
+  projectId?: string;
 }
 
 type ChatParam = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -35,6 +37,9 @@ export class OpenAICompatibleProvider implements LLMProvider {
       apiKey: config.apiKey,
       // Fall back to the SDK default (OpenAI) when no baseUrl is configured.
       baseURL: config.baseUrl || undefined,
+      defaultHeaders: config.projectId
+        ? { "OpenAI-Project": config.projectId }
+        : undefined,
     });
   }
 

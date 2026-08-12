@@ -62,11 +62,11 @@ export default function WorkspacePage() {
     const t = tenant.trim();
     const known = liveTenants.some((lt: SessionTenantInfo) => lt.id === t);
     if (!backendOn || !t || !known) {
-      setAccountsForTenant([]);
+      queueMicrotask(() => setAccountsForTenant([]));
       return;
     }
     let active = true;
-    setAcctLoading(true);
+    queueMicrotask(() => active && setAcctLoading(true));
     listAccounts(t)
       .then((accts) => {
         if (!active) return;

@@ -41,6 +41,7 @@ export function batchDocToBatch(doc: BatchDoc): Batch {
     aiInr: doc.aiInr,
     avgDuration: doc.avgDuration,
     avgTalkTime: doc.avgTalkTime,
+    ingestStatus: doc.ingestStatus,
   };
 }
 
@@ -155,11 +156,24 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     }
   }
 
-  const fp = fingerprint([sourceId, total, JSON.stringify(breakdown), job.status]);
+  const sourceFp = fingerprint([
+    sourceId,
+    total,
+    job.status,
+    job.updated_at,
+    JSON.stringify(job.status_summary ?? null),
+    JSON.stringify(job.call_status_counts ?? null),
+  ]);
   // Key by the upstream source id so the campaigns listing, ingestion worker, and
   // frontend batch ids all align. (humanBatchId is kept for a future display id.)
   const batchId = existing?.batchId ?? sourceId;
 
+  // Records ingested before source fingerprints were introduced cannot be proven
+  // current. Invalidate them once so the next read is rebuilt from the source.
+  const sourceChanged = Boolean(
+    existing?.ingestStatus === "ready"
+      && (!existing.sourceFingerprint || existing.sourceFingerprint !== sourceFp),
+  );
   return {
     tenantId: ctx.tenantId,
     accountId: ctx.accountId,
@@ -180,8 +194,14 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     aiInr: existing?.aiInr ?? 0,
     avgDuration: existing?.avgDuration ?? null,
     avgTalkTime: existing?.avgTalkTime ?? null,
-    fingerprint: fp,
-    ingestStatus: existing?.ingestStatus ?? "none",
+    // An ingested fingerprint represents the exact normalized dataset. Do not
+    // replace it with the coarser upstream job summary on every list refresh.
+    fingerprint: ingested && existing ? existing.fingerprint : sourceFp,
+    sourceFingerprint: sourceFp,
+    publishedRevision: existing?.publishedRevision,
+    ingestStatus: sourceChanged ? "none" : existing?.ingestStatus ?? "none",
+    ingestJobId: existing?.ingestJobId,
+    ingestLeaseId: existing?.ingestLeaseId,
     updatedAt: new Date().toISOString(),
   };
 }

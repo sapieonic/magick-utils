@@ -65,23 +65,27 @@ export function bestReachWindow(reach: ReachByTimeOfDay | undefined | null): Rea
   const confident = reach.cells.filter((c) => !c.lowSample && c.total > 0);
   if (confident.length === 0) return null;
 
-  const totalN = confident.reduce((a, c) => a + c.total, 0);
-  const meanRate = totalN > 0 ? confident.reduce((a, c) => a + c.rate * c.total, 0) / totalN : 0;
+  const populated = reach.cells.filter((c) => c.total > 0);
+  const totalN = populated.reduce((a, c) => a + c.total, 0);
+  const meanRate = totalN > 0 ? populated.reduce((a, c) => a + c.rate * c.total, 0) / totalN : 0;
   const peak = confident.reduce((best: ReachCell, c) => (c.rate > best.rate ? c : best), confident[0]);
 
   // Other confident days at the same band that also beat the mean — expresses a
   // window like "Tue–Wed mornings" rather than a single isolated cell.
-  const strongDays = confident.filter((c) => c.band === peak.band && c.rate >= meanRate).map((c) => c.weekday);
+  const strongCells = confident.filter((c) => c.band === peak.band && c.rate >= meanRate);
+  const recommendationTotal = strongCells.reduce((sum, cell) => sum + cell.total, 0);
+  const recommendationReached = strongCells.reduce((sum, cell) => sum + cell.rate * cell.total, 0);
+  const recommendationRate = recommendationTotal > 0 ? recommendationReached / recommendationTotal : peak.rate;
 
   return {
     weekday: peak.weekday,
     band: peak.band,
     bandLabel: formatBand(peak.band, reach.bandHours),
-    dayRange: formatDayRange(strongDays.length ? strongDays : [peak.weekday]),
-    rate: peak.rate,
-    total: peak.total,
+    dayRange: formatDayRange(strongCells.length ? strongCells.map((cell) => cell.weekday) : [peak.weekday]),
+    rate: recommendationRate,
+    total: recommendationTotal || peak.total,
     meanRate,
-    liftPp: (peak.rate - meanRate) * 100,
+    liftPp: (recommendationRate - meanRate) * 100,
   };
 }
 

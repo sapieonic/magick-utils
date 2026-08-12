@@ -2,12 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button, Icon, Spinner, cx } from "@/components/ui";
-import { SEL_LABEL, fmtMoney, fmtNum, reachHeatmapMock, selType } from "@/lib/data";
+import { SEL_LABEL, selType } from "@/lib/data";
 import { compareInsights, generateInsights, getAnalytics, listCampaigns } from "@/lib/api";
 import { diffAggregates } from "@/lib/diff";
 import type { Batch, Currency } from "@/lib/types";
 import type { AggregatesDoc, Anomaly, Insight, Recommendation } from "@/lib/server/types";
-import { Num } from "./Num";
 import { BaselinePicker } from "./BaselinePicker";
 import { DeltaGrid } from "./DeltaGrid";
 import { ReachHeatmap } from "./ReachHeatmap";
@@ -17,13 +16,18 @@ export function InsightsTab({
   currency,
   batchIds,
   analytics,
+  dataLoading = false,
+  dataError = null,
 }: {
   targets: Batch[];
   currency: Currency;
   batchIds: string[];
   analytics: AggregatesDoc | null;
+  dataLoading?: boolean;
+  dataError?: string | null;
 }) {
-  const [gen, setGen] = useState<"loading" | "ready">("loading");
+  const [gen, setGen] = useState<"loading" | "ready" | "error">("loading");
+  const [genError, setGenError] = useState<string | null>(null);
   const [insight, setInsight] = useState<Insight | null>(null);
   const [regen, setRegen] = useState(0); // bumped by "Regenerate"
   const refreshRef = useRef(false); // true for exactly one run after a Regenerate click
@@ -54,10 +58,12 @@ export function InsightsTab({
   // batches already selected (the same hard rule used for combine/analyze).
   useEffect(() => {
     let alive = true;
-    listCampaigns().then(({ batches }) => {
-      if (!alive) return;
-      setCandidates(batches.filter((b) => selType(b) === curSelType && !batchIds.includes(b.id)));
-    });
+    listCampaigns()
+      .then(({ batches }) => {
+        if (!alive) return;
+        setCandidates(batches.filter((b) => selType(b) === curSelType && !batchIds.includes(b.id)));
+      })
+      .catch(() => alive && setCandidates([]));
     return () => {
       alive = false;
     };
@@ -78,14 +84,15 @@ export function InsightsTab({
     const refresh = cmpRefreshRef.current;
     cmpRefreshRef.current = false;
     (async () => {
-      const [agg, ins] = await Promise.all([getAnalytics([baselineId]), compareInsights(batchIds, [baselineId], refresh)]);
+      const [aggregateResult, insightResult] = await Promise.allSettled([
+        getAnalytics([baselineId]),
+        compareInsights(batchIds, [baselineId], refresh),
+      ]);
       if (!alive) return;
-      setBaselineAgg(agg);
-      setCmpInsight(ins);
+      setBaselineAgg(aggregateResult.status === "fulfilled" ? aggregateResult.value : null);
+      setCmpInsight(insightResult.status === "fulfilled" ? insightResult.value : null);
       setCmp("ready");
-    })().catch(() => {
-      if (alive) setCmp("ready");
-    });
+    })();
     return () => {
       alive = false;
     };
@@ -98,14 +105,15 @@ export function InsightsTab({
   );
   const compareMode = baselineId != null;
 
-  // Reach matrix for the heatmap: live aggregates, or a mock so the section
-  // still renders with the backend off (parity with the other tabs).
-  const reach = analytics?.reachByTimeOfDay ?? reachHeatmapMock();
+  const reach = analytics?.reachByTimeOfDay;
+  const effectiveGen = analytics ? gen : dataLoading ? "loading" : "error";
+  const effectiveGenError = analytics
+    ? genError
+    : dataError ?? "No ingested campaign data is available for AI analysis.";
 
   useEffect(() => {
+    if (!analytics) return;
     let alive = true;
-    setGen("loading");
-    setInsight(null);
     // refresh is forced only by an explicit Regenerate — not by selection changes.
     const refresh = refreshRef.current;
     refreshRef.current = false;
@@ -115,17 +123,17 @@ export function InsightsTab({
         setInsight(res); // null when LLM off → fall back to hardcoded block
         setGen("ready");
       })
-      .catch(() => {
-        // Don't strand the skeleton on a network/stream error.
+      .catch((error: unknown) => {
         if (!alive) return;
         setInsight(null);
-        setGen("ready");
+        setGenError(error instanceof Error ? error.message : "AI insight generation failed.");
+        setGen("error");
       });
     return () => {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idsKey, regen]);
+  }, [idsKey, regen, analytics?.key]);
 
   const name = targets.length === 1 ? targets[0].name : `${targets.length} combined campaigns`;
   const baselineLabel = baselineBatch ? `${baselineBatch.name} (${baselineBatch.batchId})` : "baseline";
@@ -139,6 +147,9 @@ export function InsightsTab({
       setCmpRegen((n: number) => n + 1); // re-runs the compare effect with refresh
     } else {
       refreshRef.current = true;
+      setGen("loading");
+      setGenError(null);
+      setInsight(null);
       setRegen((n: number) => n + 1);
     }
   };
@@ -148,7 +159,7 @@ export function InsightsTab({
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-2 text-sm text-slate-500">
           <Icon name="Sparkles" size={16} className="text-[var(--accent)]" />
-          {compareMode ? "Comparing" : "Insights generated for"} <span className="font-semibold text-slate-700">{name}</span>
+          {compareMode ? "Comparing" : "AI insights for"} <span className="font-semibold text-slate-700">{name}</span>
         </div>
         <div className="flex items-center gap-2">
           <BaselinePicker
@@ -163,7 +174,7 @@ export function InsightsTab({
             size="sm"
             icon="RefreshCw"
             onClick={regenerate}
-            disabled={gen === "loading" || cmp === "loading"}
+            disabled={effectiveGen === "loading" || cmp === "loading"}
           >
             Regenerate
           </Button>
@@ -180,9 +191,22 @@ export function InsightsTab({
           baselineLabel={baselineLabel}
           backendOff={analytics == null}
         />
-      ) : gen === "loading" ? (
+      ) : effectiveGen === "loading" ? (
         <InsightsSkeleton />
-      ) : insight ? (
+      ) : effectiveGen === "error" || !insight ? (
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50/60 p-5 text-amber-800">
+            <Icon name="TriangleAlert" size={18} className="mt-0.5 shrink-0" />
+            <div>
+              <div className="text-sm font-bold">AI insight is unavailable</div>
+              <p className="mt-1 text-[13px] leading-relaxed text-amber-700">
+                {effectiveGenError ?? "The analysis could not be generated. No estimated or demo insight is being shown."}
+              </p>
+            </div>
+          </div>
+          {reach && <ReachHeatmap reach={reach} isMessage={isMessage} />}
+        </div>
+      ) : (
         <div className="space-y-4">
           {candidates.length > 0 && <CompareAffordance onChoose={() => chooseBaseline(candidates[0].id)} />}
           {/* narrative */}
@@ -225,76 +249,7 @@ export function InsightsTab({
             </div>
           )}
 
-          <ReachHeatmap reach={reach} isMessage={isMessage} />
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {/* narrative */}
-          <div className="relative rounded-2xl border border-slate-200 bg-white p-5 overflow-hidden shadow-[0_8px_24px_-12px_rgba(15,23,42,0.12)]">
-            <div className="absolute top-0 left-0 right-0 h-1 brand-grad" />
-            <div className="flex items-center gap-2 mb-3">
-              <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-white" style={{ background: "var(--brand-grad)" }}>
-                <Icon name="Sparkles" size={15} />
-              </span>
-              <span className="text-[15px] font-bold text-slate-900">Campaign narrative</span>
-            </div>
-            <p className="text-[14.5px] leading-relaxed text-slate-600">
-              This batch reached <Num>{fmtNum(targets.reduce((a, c) => a + c.total, 0))}</Num> recipients with an overall answer/read rate of <Num tone="good">68.4%</Num>, slightly ahead of your account&apos;s 30-day average of 64.1%. Connected conversations skewed <Num tone="good">positive (47%)</Num>, though <Num tone="bad">19% negative</Num> sentiment clustered around “dispute / wrong amount” intents. Spend was efficient at <Num>{fmtMoney(targets.reduce((a, c) => a + c.spendInr, 0), currency)}</Num>, with telephony driving ~62% of cost. The strongest performance window was <Num tone="good">11am–1pm</Num>, where pickup rate ran 14 points above the daily mean.
-            </p>
-          </div>
-
-          {/* anomalies */}
-          <div>
-            <div className="text-[13px] font-bold uppercase tracking-wider text-slate-400 mb-2.5 flex items-center gap-2">
-              <Icon name="TriangleAlert" size={14} /> Anomalies detected
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <AnomalyCard
-                tone="bad"
-                icon="PhoneOff"
-                title="No-answer spike on Day 4"
-                body={
-                  <>
-                    Pickup fell to <Num tone="bad">38%</Num> vs the <Num>61%</Num> baseline — likely a dialer throttle between 3–5pm.
-                  </>
-                }
-              />
-              <AnomalyCard
-                tone="bad"
-                icon="ThumbsDown"
-                title="Negative sentiment cluster"
-                body={
-                  <>
-                    <Num tone="bad">312 calls</Num> tagged “wrong amount”, 2.4× the usual share. Suggests a data-sync issue in the dunning file.
-                  </>
-                }
-              />
-              <AnomalyCard
-                tone="warn"
-                icon="TrendingUp"
-                title="AI cost creep"
-                body={
-                  <>
-                    Per-call AI cost rose <Num tone="bad">+18%</Num> after the prompt change on Jun 3 with no lift in resolution.
-                  </>
-                }
-              />
-            </div>
-          </div>
-
-          {/* recommendations */}
-          <div>
-            <div className="text-[13px] font-bold uppercase tracking-wider text-slate-400 mb-2.5 flex items-center gap-2">
-              <Icon name="Lightbulb" size={14} /> Recommendations
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <RecCard n={1} title="Concentrate dials at 11am–1pm" body="Shifting 30% of volume into the midday window could lift connect rate by an estimated 9–12 points." />
-              <RecCard n={2} title="Re-verify the dunning amounts" body="Quarantine the 312 disputed records and re-sync from billing before the next pass to cut negative sentiment." />
-              <RecCard n={3} title="Roll back the Jun 3 prompt" body="The newer script raised cost without improving promise-to-pay. A/B the prior prompt on 10% of volume." />
-            </div>
-          </div>
-
-          <ReachHeatmap reach={reach} isMessage={isMessage} />
+          {reach && <ReachHeatmap reach={reach} isMessage={isMessage} />}
         </div>
       )}
     </div>

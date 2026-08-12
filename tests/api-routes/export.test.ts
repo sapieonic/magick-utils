@@ -48,7 +48,11 @@ async function readAll(res: Response): Promise<string> {
 }
 
 describe("POST /api/export", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBatch).mockResolvedValue({ name: "Camp A", selType: "ai", ingestStatus: "ready", total: 1 } as never);
+    vi.mocked(countRecords).mockResolvedValue(1 as never);
+  });
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
@@ -76,7 +80,7 @@ describe("POST /api/export", () => {
     const { POST } = await import("@/app/api/export/route");
     const res = await POST(postReq({ batchIds: [] }));
     expect(res.status).toBe(400);
-    await expect(res.json()).resolves.toEqual({ error: "no_batches" });
+    await expect(res.json()).resolves.toMatchObject({ error: "no_batches" });
   });
 
   it("409 not_ingested when count is 0", async () => {
@@ -86,14 +90,14 @@ describe("POST /api/export", () => {
     const { POST } = await import("@/app/api/export/route");
     const res = await POST(postReq({ batchIds: ["b1"] }));
     expect(res.status).toBe(409);
-    await expect(res.json()).resolves.toMatchObject({ error: "not_ingested" });
+    await expect(res.json()).resolves.toMatchObject({ error: "incomplete_ingestion" });
   });
 
   it("streams CSV with default columns + header on happy path", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(countRecords).mockResolvedValue(1 as never);
-    vi.mocked(getBatch).mockResolvedValue({ name: "Camp A" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ name: "Camp A", selType: "ai", ingestStatus: "ready", total: 1 } as never);
     const { it, close } = cursor([
       {
         recordId: "r1", batchId: "b1", channel: "voice", recipientPhone: "+91",
@@ -119,7 +123,7 @@ describe("POST /api/export", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(countRecords).mockResolvedValue(1 as never);
-    vi.mocked(getBatch).mockResolvedValue(null as never);
+    vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 1 } as never);
     const { it } = cursor([{ recordId: "r1", status: "x" }]);
     vi.mocked(streamRecords).mockResolvedValue(it as never);
     const { POST } = await import("@/app/api/export/route");
@@ -128,10 +132,30 @@ describe("POST /api/export", () => {
     const body = await readAll(res);
     expect(body.trim().split("\n")[0]).toBe("record_id,status");
   });
+
+  it("neutralizes spreadsheet formulas after leading whitespace and control characters", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 7 } as never);
+    vi.mocked(countRecords).mockResolvedValue(7 as never);
+    const values = ["=cmd", "+cmd", "-cmd", "@cmd", "  =cmd", "\t=cmd", "\n=cmd"];
+    const { it } = cursor(values.map((recipientPhone, index) => ({ recordId: `r${index}`, batchId: "b1", recipientPhone })));
+    vi.mocked(streamRecords).mockResolvedValue(it as never);
+
+    const { POST } = await import("@/app/api/export/route");
+    const res = await POST(postReq({ batchIds: ["b1"], columns: ["recipient_phone"] }));
+    const body = await readAll(res);
+    for (const value of values.slice(0, 6)) expect(body).toContain(`'${value}`);
+    expect(body).toContain("'\n=cmd");
+  });
 });
 
 describe("GET /api/export", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 1 } as never);
+    vi.mocked(countRecords).mockResolvedValue(1 as never);
+  });
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
@@ -158,7 +182,7 @@ describe("GET /api/export", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(countRecords).mockResolvedValue(1 as never);
-    vi.mocked(getBatch).mockResolvedValue({ name: "C" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 1 } as never);
     const { it } = cursor([{ recordId: "r1", status: "ok" }]);
     vi.mocked(streamRecords).mockResolvedValue(it as never);
     const { GET } = await import("@/app/api/export/route");
@@ -167,5 +191,15 @@ describe("GET /api/export", () => {
     expect(res.headers.get("Content-Type")).toContain("text/csv");
     const body = await readAll(res);
     expect(body.trim().split("\n")[0]).toBe("record_id,status");
+  });
+
+  it("preflights readiness without opening a record cursor", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    const { GET } = await import("@/app/api/export/route");
+    const res = await GET(getReq("batchIds=b1&columns=record_id,status&preflight=1"));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ready: true });
+    expect(streamRecords).not.toHaveBeenCalled();
   });
 });

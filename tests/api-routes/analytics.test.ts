@@ -9,6 +9,11 @@ vi.mock("@/lib/server/repositories", () => ({
 }));
 vi.mock("@/lib/server/aggregate", () => ({ computeAggregates: vi.fn() }));
 vi.mock("@/lib/server/fingerprint", () => ({ aggregatesKey: vi.fn(() => "agg-key") }));
+vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
+vi.mock("@/lib/server/selection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/selection")>()),
+  validateSelection: vi.fn().mockResolvedValue([]),
+}));
 
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";

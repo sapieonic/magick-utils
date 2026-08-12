@@ -10,7 +10,7 @@ import {
   PROVIDERS,
   COLUMN_GROUPS,
 } from "@/lib/data";
-import type { Batch, Channel, TypeKey, StatusKey } from "@/lib/types";
+import type { Channel, TypeKey, StatusKey } from "@/lib/types";
 
 describe("typeKey", () => {
   it("voice maps to its callType (ai)", () => {

@@ -9,7 +9,7 @@ const streamMock = vi.fn();
 vi.mock("@anthropic-ai/sdk", () => ({
   default: class MockAnthropic {
     messages = { create: createMock, stream: streamMock };
-    constructor(_cfg: unknown) {}
+    constructor() {}
   },
 }));
 

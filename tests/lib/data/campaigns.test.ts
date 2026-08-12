@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { CAMPAIGNS, selType, typeKey, buildPreviewRows, COLUMN_GROUPS } from "@/lib/data";
+import { CAMPAIGNS, selType, typeKey, buildPreviewRows } from "@/lib/data";
 import type { Batch } from "@/lib/types";
 
 describe("CAMPAIGNS", () => {
@@ -94,8 +94,6 @@ describe("CAMPAIGNS", () => {
 });
 
 describe("buildPreviewRows", () => {
-  const allCommon = COLUMN_GROUPS.common.columns.map((c) => c.key);
-
   it("returns n rows (default 6)", () => {
     expect(buildPreviewRows(CAMPAIGNS, ["record_id"])).toHaveLength(6);
     expect(buildPreviewRows(CAMPAIGNS, ["record_id"], 3)).toHaveLength(3);

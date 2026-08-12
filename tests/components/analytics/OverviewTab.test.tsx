@@ -4,10 +4,12 @@ import { describe, it, expect, vi } from "vitest";
 
 vi.mock("recharts", () => {
   const Pass = ({ children }: { children?: React.ReactNode }) => <div>{children}</div>;
+  const Svg = ({ children }: { children?: React.ReactNode }) => <svg>{children}</svg>;
+  const Empty = () => null;
   return {
     ResponsiveContainer: Pass,
-    AreaChart: Pass,
-    Area: Pass,
+    AreaChart: Svg,
+    Area: Empty,
     BarChart: Pass,
     Bar: Pass,
     PieChart: Pass,
