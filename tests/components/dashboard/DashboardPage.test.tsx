@@ -12,7 +12,6 @@ vi.mock("@/lib/store", () => ({
   }),
 }));
 vi.mock("@/lib/api", () => ({
-  getDashboardVolume: vi.fn(),
   listCampaigns: vi.fn(),
 }));
 vi.mock("@/components/screens/dashboard/Legend", () => ({ Legend: () => null }));
@@ -20,34 +19,42 @@ vi.mock("@/components/screens/dashboard/VolumeChart", () => ({ VolumeChart: () =
 vi.mock("@/components/screens/dashboard/StatusDonut", () => ({ StatusDonut: () => null }));
 
 import DashboardScreen from "@/app/(app)/dashboard/page";
-import { getDashboardVolume, listCampaigns } from "@/lib/api";
+import { listCampaigns } from "@/lib/api";
 import type { Batch } from "@/lib/types";
 
 const campaign: Batch = {
   id: "b1", batchId: "AI-1", name: "Campaign one", channel: "voice", callType: "ai",
-  provider: "provider", date: new Date().toISOString(), dayAgo: 0, total: 10,
-  breakdown: [{ key: "completed", value: 10 }], successRate: 1, spendInr: 10,
+  provider: "provider", date: new Date().toISOString(), dayAgo: 0, total: 1984,
+  breakdown: [{ key: "completed", value: 250 }, { key: "busy", value: 1734 }],
+  successRate: 250 / 1984, spendInr: 10,
   telephonyInr: 5, aiInr: 5, avgDuration: 10, avgTalkTime: 8,
 };
 
-describe("DashboardScreen live-data failures", () => {
+describe("DashboardScreen campaign volume", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("shows activity metrics as unavailable instead of zero", async () => {
+  it("shows campaign-list call volume without waiting on ingested records", async () => {
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
-    vi.mocked(getDashboardVolume).mockRejectedValue(new Error("dashboard unavailable"));
     render(<DashboardScreen />);
 
     await waitFor(() => {
-      expect(screen.getByText("Daily activity is temporarily unavailable. No estimated values are shown."))
-        .toBeInTheDocument();
-    });
-
-    for (const label of ["Total calls", "Total messages", "Success / answer rate", "Total spend"]) {
-      const card = screen.getByText(label).closest("div.rounded-2xl");
+      const card = screen.getByText("Total calls").closest("div.rounded-2xl");
       expect(card).not.toBeNull();
-      expect(within(card as HTMLElement).getByText("—")).toBeInTheDocument();
-      expect(within(card as HTMLElement).getByText("Activity data temporarily unavailable.")).toBeInTheDocument();
-    }
+      expect(within(card as HTMLElement).getByText("2.0K")).toBeInTheDocument();
+      expect(within(card as HTMLElement).getByText(/1,984/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Daily activity is temporarily unavailable. No estimated values are shown."))
+      .not.toBeInTheDocument();
+  });
+
+  it("shows zero campaign volume when the campaign list fails", async () => {
+    vi.mocked(listCampaigns).mockRejectedValue(new Error("campaigns unavailable"));
+    render(<DashboardScreen />);
+
+    await waitFor(() => {
+      const card = screen.getByText("Total calls").closest("div.rounded-2xl");
+      expect(card).not.toBeNull();
+      expect(within(card as HTMLElement).getByText("0")).toBeInTheDocument();
+    });
   });
 });
