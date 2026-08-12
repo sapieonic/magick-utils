@@ -24,9 +24,10 @@ vi.mock("@/lib/server/magick-client", () => ({
   MagickApiError,
 }));
 
+const refreshBatchFromSource = vi.hoisted(() => vi.fn(async (doc) => doc));
 vi.mock("@/lib/server/repositories", () => ({
   getBatch: vi.fn(),
-  upsertBatch: vi.fn().mockResolvedValue(undefined),
+  refreshBatchFromSource,
 }));
 
 vi.mock("@/lib/server/map", () => ({
@@ -71,6 +72,7 @@ describe("GET /api/campaigns", () => {
     const json = await res.json();
     // empty id filtered out, sorted by dayAgo asc
     expect(json.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2", "3"]);
+    expect(refreshBatchFromSource).toHaveBeenCalledTimes(3);
   });
 
   it("502 when the client throws", async () => {

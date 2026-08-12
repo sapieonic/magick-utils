@@ -44,6 +44,76 @@ export async function upsertBatch(doc: BatchDoc): Promise<void> {
   );
 }
 
+/** Refresh source metadata without allowing a stale campaign-list read to
+ * overwrite a revision that the ingestion worker published concurrently. */
+export async function refreshBatchFromSource(
+  doc: BatchDoc,
+  expectedUpdatedAt: string | null,
+): Promise<BatchDoc> {
+  const col = await batches();
+  const key = {
+    tenantId: doc.tenantId,
+    accountId: doc.accountId,
+    batchId: doc.batchId,
+  };
+  if (expectedUpdatedAt == null) {
+    const current = await col.findOneAndUpdate(
+      key,
+      { $setOnInsert: doc },
+      { upsert: true, returnDocument: "after" },
+    );
+    if (current) return current;
+  } else {
+    const updated = await col.findOneAndUpdate(
+      { ...key, updatedAt: expectedUpdatedAt },
+      { $set: doc },
+      { returnDocument: "after" },
+    );
+    if (updated) return updated;
+  }
+  // A worker or another source refresh won the optimistic race. Return its
+  // document rather than writing the stale snapshot over it.
+  const current = await col.findOne(key);
+  if (current) return current;
+  // Deletion between the compare-and-swap and read is exceptionally rare; an
+  // insert-only retry safely recreates the source document.
+  return refreshBatchFromSource(doc, null);
+}
+
+/** Mark a batch as staging for this worker without letting an older lease
+ * overwrite ownership established by a reclaimed/newer worker. */
+export async function beginBatchIngestion(
+  doc: BatchDoc,
+  jobId: string,
+  leaseId: string,
+  leaseUntil: string,
+): Promise<boolean> {
+  const col = await batches();
+  const result = await col.updateOne(
+    {
+      tenantId: doc.tenantId,
+      accountId: doc.accountId,
+      batchId: doc.batchId,
+      $or: [
+        { ingestJobId: { $exists: false } },
+        { ingestJobId: jobId, ingestLeaseId: leaseId },
+        { ingestLeaseUntil: { $lt: leaseUntil } },
+      ],
+    },
+    {
+      $set: {
+        ...doc,
+        ingestStatus: doc.ingestStatus === "ready" ? "ready" : "ingesting",
+        ingestJobId: jobId,
+        ingestLeaseId: leaseId,
+        ingestLeaseUntil: leaseUntil,
+        updatedAt: nowIso(),
+      },
+    },
+  );
+  return result.matchedCount === 1;
+}
+
 /** Atomically publish a revision only while this exact worker lease still owns
  * the batch. A reclaimed worker replaces ingestLeaseId, so stale workers cannot
  * swap the published pointer. */
@@ -61,7 +131,7 @@ export async function publishBatchIfOwned(
       ingestJobId: jobId,
       ingestLeaseId: leaseId,
     },
-    { $set: doc, $unset: { ingestJobId: "", ingestLeaseId: "" } },
+    { $set: doc, $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" } },
   );
   return result.matchedCount === 1;
 }
@@ -83,7 +153,7 @@ export async function failBatchIfOwned(
         ingestStatus: current.publishedRevision ? "ready" : "error",
         updatedAt: nowIso(),
       },
-      $unset: { ingestJobId: "", ingestLeaseId: "" },
+      $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
     },
   );
 }
