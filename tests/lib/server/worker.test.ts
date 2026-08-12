@@ -153,13 +153,41 @@ describe("processJob resume", () => {
     );
   });
 
-  it("publishes only when the unique staged-record count matches the upstream total", async () => {
+  it("deduplicates repeated upstream ids and publishes the unique records", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 2 });
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "dup" }, { id: "dup" }], total: 2 });
     repositories.getRecordsForRevision.mockResolvedValue([{ recordId: "dup", status: "done" }]);
 
-    await expect(processJob(job({ batchIds: ["b1"], total: 2 }))).rejects.toThrow(
-      "stored 1 of 2",
+    await expect(processJob(job({ batchIds: ["b1"], total: 2 }))).resolves.toBeUndefined();
+    expect(repositories.replaceBatchRecords).toHaveBeenCalledWith(
+      "t1",
+      "a1",
+      "b1",
+      [expect.objectContaining({ recordId: "dup" })],
+    );
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 1 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("rejects upstream rows that have no stable record id", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "" }], total: 1 });
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(
+      "1 of 1 records at offset 0 have no record id",
+    );
+    expect(repositories.replaceBatchRecords).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+  });
+
+  it("retains partial-write detection after deduplicating source ids", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }], total: 2 });
+    repositories.getRecordsForRevision.mockResolvedValue([{ recordId: "1", status: "done" }]);
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(
+      "stored 1 of 2 unique records fetched",
     );
   });
 

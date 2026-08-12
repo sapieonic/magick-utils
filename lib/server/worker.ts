@@ -181,6 +181,13 @@ async function ingestBatch(
   }
 
   let offset = initialOffset;
+  // A resumed job may already have unique rows staged for this revision. Seed
+  // the expected-id set from those rows so duplicate detection remains correct
+  // across a rate-limit/restart boundary.
+  const stagedRecords = initialOffset > 0
+    ? await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision)
+    : [];
+  const expectedRecordIds = new Set(stagedRecords.map((record) => record.recordId));
   // Upstream totals are progress hints, not pagination boundaries. They can be
   // stale in either direction, so the returned pages determine completion.
   let reportedTotal = batch.total;
@@ -211,7 +218,19 @@ async function ingestBatch(
     if (page.length === 0) {
       break;
     }
-    await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, page);
+    const missingRecordIds = page.filter(
+      (record) => typeof record.recordId !== "string" || record.recordId.trim().length === 0,
+    ).length;
+    if (missingRecordIds > 0) {
+      throw new Error(
+        `invalid upstream records for ${batchId}: ${missingRecordIds} of ${page.length} records at offset ${offset} have no record id`,
+      );
+    }
+    // Repeated source ids represent the same session. Keep the latest payload
+    // for each id while retaining the raw page length for upstream pagination.
+    const uniquePage = [...new Map(page.map((record) => [record.recordId, record])).values()];
+    for (const record of uniquePage) expectedRecordIds.add(record.recordId);
+    await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, uniquePage);
     offset += page.length;
     const checkpoint = await checkpointJob(jobId, leaseId, {
       done: initialDone + offset,
@@ -225,10 +244,19 @@ async function ingestBatch(
   }
 
   const records = await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision);
-  // Compare Mongo's unique staged rows with the number actually fetched. This
-  // still catches duplicate ids / partial writes without trusting stale totals.
-  if (records.length !== offset) {
-    throw new Error(`incomplete ingestion for ${batchId}: stored ${records.length} of ${offset}`);
+  // Compare Mongo's unique staged rows with the unique source identities that
+  // should exist. Raw pages may legitimately repeat a session id.
+  if (records.length !== expectedRecordIds.size) {
+    throw new Error(
+      `incomplete ingestion for ${batchId}: stored ${records.length} of ${expectedRecordIds.size} unique records fetched`,
+    );
+  }
+  const duplicateRows = offset - expectedRecordIds.size;
+  if (duplicateRows > 0) {
+    log().warn(
+      { batchId, fetchedRows: offset, uniqueRecords: records.length, duplicateRows },
+      "[worker] duplicate upstream record ids deduplicated",
+    );
   }
   if (reportedTotal !== records.length) {
     log().warn(
