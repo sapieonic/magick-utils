@@ -1,3 +1,10 @@
+## [1.2.4](https://github.com/sapieonic/magick-utils/compare/v1.2.3...v1.2.4) (2026-08-12)
+
+
+### Bug Fixes
+
+* Handle duplicate ingestion record IDs ([#24](https://github.com/sapieonic/magick-utils/issues/24)) ([ab55bdd](https://github.com/sapieonic/magick-utils/commit/ab55bdd6a7909da013e849537d86e54fbd279664))
+
 ## [1.2.3](https://github.com/sapieonic/magick-utils/compare/v1.2.2...v1.2.3) (2026-08-11)
 
 
