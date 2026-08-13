@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/sapieonic/magick-utils/compare/v1.3.0...v1.3.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* resume ingest after refresh instead of re-pulling ready batches ([#29](https://github.com/sapieonic/magick-utils/issues/29)) ([d6ab816](https://github.com/sapieonic/magick-utils/commit/d6ab816a9196aa73b18c13cf6740fd466c4aec87))
+
 # [1.3.0](https://github.com/sapieonic/magick-utils/compare/v1.2.7...v1.3.0) (2026-08-12)
 
 
