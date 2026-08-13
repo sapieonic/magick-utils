@@ -105,7 +105,7 @@ describe("POST /api/ingest", () => {
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, ready: true });
+    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, done: 0, ready: true });
     expect(createJob).not.toHaveBeenCalled();
   });
 
@@ -123,11 +123,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
-    vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, batchIds: ["b1"] } as never);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, done: 4, batchIds: ["b1"] } as never);
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"] }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ jobId: "active", total: 10, ready: false, existing: true });
+    await expect(res.json()).resolves.toEqual({ jobId: "active", total: 10, done: 4, ready: false, existing: true });
   });
 
   it("rejects reattachment when an overlapping job does not cover the full selection", async () => {
@@ -140,5 +140,43 @@ describe("POST /api/ingest", () => {
     const res = await POST(req({ batchIds: ["b1", "b2"] }));
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({ error: "ingestion_in_progress" });
+  });
+
+  it("does not re-ingest analyze batches whose normalized records already exist", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "ready" } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest" }));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, done: 0, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  it("re-pulls ready analyze batches when refresh is true", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "ready" } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({ total: 10, done: 0, ready: false });
+    expect(typeof json.jobId).toBe("string");
+    expect(createJob).toHaveBeenCalledTimes(1);
+    expect(countRecords).not.toHaveBeenCalled();
+  });
+
+  it("400 invalid_refresh", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], refresh: "yes" }));
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: "invalid_refresh" });
   });
 });

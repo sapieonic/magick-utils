@@ -91,18 +91,30 @@ export async function listCampaigns(): Promise<{ batches: Batch[]; source: "live
 export interface IngestJobResult {
   jobId: string | null;
   total: number;
-  /** A merge preparation can complete immediately when every batch already has
-   * normalized records. */
+  done?: number;
+  /** True when every requested batch already has normalized records, so no job
+   *  was enqueued. Also used after a page reload so Analyze/Combine skip a
+   *  redundant pull. */
   ready?: boolean;
+  /** True when the caller was attached to an already-running job. */
+  existing?: boolean;
 }
 
-export async function createIngestJob(batchIds: string[], type: "ingest" | "merge" = "ingest"): Promise<IngestJobResult | null> {
+export async function createIngestJob(
+  batchIds: string[],
+  type: "ingest" | "merge" = "ingest",
+  options?: { refresh?: boolean },
+): Promise<IngestJobResult | null> {
   const { backend } = await backendStatus();
   if (!backend) return null;
   const res = await fetch("/api/ingest", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ batchIds, type }),
+    body: JSON.stringify({
+      batchIds,
+      type,
+      ...(options?.refresh ? { refresh: true } : {}),
+    }),
   });
   if (handleSessionExpiry(res)) return null;
   if (!res.ok) throw await responseError(res, "Unable to schedule ingestion.");
@@ -114,6 +126,17 @@ export async function getJob(jobId: string): Promise<JobDto | null> {
   if (handleSessionExpiry(res)) return null;
   if (!res.ok) throw await responseError(res, "Unable to refresh job progress.");
   return res.json();
+}
+
+export function isJobNotFound(error: unknown): boolean {
+  return error instanceof ApiRequestError && (error.status === 404 || error.code === "not_found");
+}
+
+/** Progress bar percent. In-flight jobs cap at 99 so "100" only means done. */
+export function jobProgressPercent(done: number, total: number, status?: JobStatus): number {
+  if (status === "done") return 100;
+  if (!(total > 0)) return 0;
+  return Math.min(99, Math.round((done / total) * 100));
 }
 
 export async function getAnalytics(batchIds: string[], refresh = false): Promise<AggregatesDoc | null> {

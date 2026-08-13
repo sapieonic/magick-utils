@@ -186,6 +186,21 @@ describe("createIngestJob", () => {
     expect(JSON.parse(String(captured?.body)).type).toBe("ingest");
   });
 
+  it("includes refresh:true only when requested", async () => {
+    let captured: RequestInit | undefined;
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/ingest": (_u, init) => {
+        captured = init;
+        return jsonRes({ jobId: "j", total: 1 });
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    await api.createIngestJob(["AI-1"], "ingest", { refresh: true });
+    expect(JSON.parse(String(captured?.body))).toEqual({ batchIds: ["AI-1"], type: "ingest", refresh: true });
+  });
+
   it("non-ok throws instead of silently entering mock mode", async () => {
     const fetchMock = makeFetch({
       "/api/health": () => jsonRes(HEALTH_ON),
@@ -222,6 +237,24 @@ describe("getJob", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = await freshApi();
     await expect(api.getJob("nope")).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe("job helpers", () => {
+  it("isJobNotFound matches 404 ApiRequestError", async () => {
+    const api = await freshApi();
+    expect(api.isJobNotFound(new api.ApiRequestError("missing", 404, "not_found"))).toBe(true);
+    expect(api.isJobNotFound(new api.ApiRequestError("nope", 500))).toBe(false);
+    expect(api.isJobNotFound(new Error("nope"))).toBe(false);
+  });
+
+  it("jobProgressPercent caps in-flight work at 99", async () => {
+    const api = await freshApi();
+    expect(api.jobProgressPercent(0, 10)).toBe(0);
+    expect(api.jobProgressPercent(5, 10)).toBe(50);
+    expect(api.jobProgressPercent(10, 10)).toBe(99);
+    expect(api.jobProgressPercent(10, 10, "done")).toBe(100);
+    expect(api.jobProgressPercent(1, 0)).toBe(0);
   });
 });
 

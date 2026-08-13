@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Card, Icon, Spinner, Tabs, TypeBadge, TypeDot, cx } from "@/components/ui";
 import { aggregate, fmtNum, selType, typeKey } from "@/lib/data";
-import { createIngestJob, getAnalytics, getJob, listCampaigns } from "@/lib/api";
+import { ApiRequestError, createIngestJob, getAnalytics, getJob, isJobNotFound, jobProgressPercent, listCampaigns } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, TypeKey } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
@@ -13,6 +13,28 @@ import { ConversationTab } from "@/components/screens/analytics/ConversationTab"
 import { CostTab } from "@/components/screens/analytics/CostTab";
 import { InsightsTab } from "@/components/screens/analytics/InsightsTab";
 import { OverviewTab } from "@/components/screens/analytics/OverviewTab";
+
+const ANALYTICS_JOB_KEY = "mu_analytics_job_v1";
+
+function readAnalyticsJob(idsKey: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(ANALYTICS_JOB_KEY) ?? "null") as { jobId?: string; idsKey?: string } | null;
+    if (parsed?.idsKey === idsKey && parsed.jobId) return parsed.jobId;
+  } catch {
+    // ignore malformed resume state
+  }
+  return null;
+}
+
+function writeAnalyticsJob(idsKey: string, jobId: string | null) {
+  if (typeof window === "undefined") return;
+  if (jobId) {
+    sessionStorage.setItem(ANALYTICS_JOB_KEY, JSON.stringify({ jobId, idsKey }));
+    return;
+  }
+  sessionStorage.removeItem(ANALYTICS_JOB_KEY);
+}
 
 export default function Page() {
   const router = useRouter();
@@ -86,23 +108,31 @@ export default function Page() {
     setRunToken((n: number) => n + 1);
   };
 
-  // Real ingestion: create a job and poll it. When the backend is off,
-  // createIngestJob returns null and we keep the simulated progress animation.
+  // Real ingestion: reattach to an in-flight job, skip a pull when records are
+  // already ready, and only enqueue a new ingest on first load or Refresh data.
   useEffect(() => {
     if (!ids.length || !batchesReady || missingTargetIds.length > 0) return;
     let alive = true;
+    let settled = false;
     let simIv: ReturnType<typeof setInterval> | null = null;
-    let pollIv: ReturnType<typeof setInterval> | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const refresh = refreshRef.current;
     refreshRef.current = false;
+    let pollJobId = refresh ? null : readAnalyticsJob(idsKey);
+    let polling = false;
 
     const fail = (error: unknown) => {
-      if (!alive) return;
+      if (!alive || settled) return;
+      settled = true;
+      writeAnalyticsJob(idsKey, null);
       setIngestError(error instanceof Error ? error.message : "Unable to prepare analytics. Please try again.");
       setIngesting(false);
     };
 
     const finish = async () => {
+      if (!alive || settled) return;
+      settled = true;
+      writeAnalyticsJob(idsKey, null);
       try {
         const agg = await getAnalytics(ids, refresh);
         if (!alive) return;
@@ -110,6 +140,7 @@ export default function Page() {
         setIngest(100);
         setTimeout(() => alive && setIngesting(false), 400);
       } catch (error) {
+        settled = false;
         fail(error);
       }
     };
@@ -128,60 +159,111 @@ export default function Page() {
       }, 200);
     };
 
+    const poll = async () => {
+      if (!alive || settled) return;
+      if (!pollJobId) {
+        polling = false;
+        return;
+      }
+      let delay = 1000;
+      try {
+        const job = await getJob(pollJobId);
+        if (!alive || settled) return;
+        if (job) {
+          setIngestError(null);
+          setIngest(jobProgressPercent(job.done, job.total || 1, job.status));
+          if (job.status === "done") {
+            await finish();
+            return;
+          }
+          if (job.status === "error") {
+            writeAnalyticsJob(idsKey, null);
+            setIngestError(job.error || "Ingestion failed");
+            setIngest(100);
+            setTimeout(() => alive && setIngesting(false), 400);
+            settled = true;
+            return;
+          }
+          if (job.status === "rate_limited" && job.retryAt) {
+            const untilRetry = Date.parse(job.retryAt) - Date.now();
+            delay = Number.isFinite(untilRetry) ? Math.max(1000, Math.min(30_000, untilRetry)) : 3000;
+          }
+        } else {
+          delay = 2000;
+        }
+      } catch (error) {
+        if (isJobNotFound(error)) {
+          // The loop is no longer scheduled. Clear the flag so startPolling
+          // after reattach actually restarts poll() instead of freezing.
+          polling = false;
+          pollJobId = null;
+          writeAnalyticsJob(idsKey, null);
+          attach();
+          return;
+        }
+        setIngestError(error instanceof ApiRequestError ? error.message : "Unable to refresh progress. Retrying automatically…");
+        delay = 3000;
+      }
+      if (alive && !settled && pollJobId) timer = setTimeout(() => void poll(), delay);
+    };
+
+    const startPolling = (jobId: string, done = 0, total = 1) => {
+      pollJobId = jobId;
+      writeAnalyticsJob(idsKey, jobId);
+      setIngest(jobProgressPercent(done, total || 1));
+      if (!polling) {
+        polling = true;
+        void poll();
+      }
+    };
+
+    const attach = () => {
+      createIngestJob(ids, "ingest", refresh ? { refresh: true } : undefined)
+        .then((job) => {
+          if (!alive || settled) return;
+          if (!job) {
+            setLive(false);
+            simulate();
+            return;
+          }
+          setLive(true);
+          if (job.ready || !job.jobId) {
+            void finish();
+            return;
+          }
+          startPolling(job.jobId, job.done ?? 0, job.total || 1);
+        })
+        .catch((error: unknown) => {
+          if (pollJobId && polling) {
+            setIngestError("Unable to schedule ingestion. Retrying against the in-progress job…");
+            return;
+          }
+          fail(error);
+        });
+    };
+
     // Defer the reset so the effect only coordinates the external ingestion
     // process; this also lets a rapid dependency change cancel the stale run.
     queueMicrotask(() => {
       if (!alive) return;
       setIngesting(true);
-      setIngest(0);
-      setAnalytics(null);
       setIngestError(null);
+      if (refresh) {
+        setIngest(0);
+        setAnalytics(null);
+      }
     });
 
-    createIngestJob(ids, "ingest").then((job) => {
-      if (!alive) return;
-      if (!job) {
-        // backend off → simulated UX, no analytics fetch (stays mock)
-        setLive(false);
-        simulate();
-        return;
-      }
-      setLive(true);
-      if (!job.jobId) {
-        void finish();
-        return;
-      }
-      const jobId = job.jobId;
-      const total = job.total || 1;
-      pollIv = setInterval(async () => {
-        try {
-          const j = await getJob(jobId);
-          if (!alive) return;
-          if (!j) return;
-          setIngest(Math.min(99, Math.round((j.done / total) * 100)));
-          if (j.status === "done") {
-            if (pollIv) clearInterval(pollIv);
-            pollIv = null;
-            await finish();
-          } else if (j.status === "error") {
-            if (pollIv) clearInterval(pollIv);
-            pollIv = null;
-            setIngestError(j.error || "Ingestion failed");
-            setIngest(100);
-            setTimeout(() => alive && setIngesting(false), 400);
-          }
-        } catch (error) {
-          if (pollIv) clearInterval(pollIv);
-          pollIv = null;
-          fail(error);
-        }
-      }, 1000);
-    }).catch(fail);
+    if (pollJobId) {
+      polling = true;
+      void poll();
+    }
+    attach();
 
     return () => {
       alive = false;
       if (simIv) clearInterval(simIv);
-      if (pollIv) clearInterval(pollIv);
+      if (timer) clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idsKey, runToken, batchesReady]);
