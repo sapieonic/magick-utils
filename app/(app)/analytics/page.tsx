@@ -160,7 +160,11 @@ export default function Page() {
     };
 
     const poll = async () => {
-      if (!alive || settled || !pollJobId) return;
+      if (!alive || settled) return;
+      if (!pollJobId) {
+        polling = false;
+        return;
+      }
       let delay = 1000;
       try {
         const job = await getJob(pollJobId);
@@ -189,6 +193,9 @@ export default function Page() {
         }
       } catch (error) {
         if (isJobNotFound(error)) {
+          // The loop is no longer scheduled. Clear the flag so startPolling
+          // after reattach actually restarts poll() instead of freezing.
+          polling = false;
           pollJobId = null;
           writeAnalyticsJob(idsKey, null);
           attach();

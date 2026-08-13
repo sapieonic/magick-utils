@@ -120,4 +120,25 @@ describe("Analytics page ingest resume", () => {
     await waitFor(() => expect(createIngestJob).toHaveBeenCalledWith(["b1"], "ingest", { refresh: true }));
     await waitFor(() => expect(getAnalytics).toHaveBeenCalledWith(["b1"], true));
   });
+
+  it("restarts polling after a persisted job id disappears", async () => {
+    sessionStorage.setItem("mu_analytics_job_v1", JSON.stringify({ jobId: "stale-job", idsKey: "b1" }));
+    const { ApiRequestError } = await import("@/lib/api");
+    vi.mocked(getJob)
+      .mockRejectedValueOnce(new ApiRequestError("not found", 404, "not_found"))
+      .mockResolvedValue({
+        jobId: "job-2", type: "ingest", status: "running", total: 10, done: 3,
+        retryAt: null, retryCount: 0, error: null, result: null,
+        createdAt: "2026-08-12T00:00:00Z", updatedAt: "2026-08-12T00:00:01Z",
+      });
+    vi.mocked(createIngestJob).mockResolvedValue({
+      jobId: "job-2", total: 10, done: 3, ready: false, existing: true,
+    });
+    render(<Page />);
+
+    await waitFor(() => expect(getJob).toHaveBeenCalledWith("stale-job"));
+    await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-2"));
+    expect(getAnalytics).not.toHaveBeenCalled();
+    expect(await screen.findByText(/Ingesting records/)).toBeInTheDocument();
+  });
 });
