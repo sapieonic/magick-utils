@@ -2,7 +2,7 @@
 // Combine CSV — combined export builder (chips -> column picker -> preview -> job).
 // Ported from the design's screens-combine.jsx.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import {
@@ -24,7 +24,7 @@ import {
   selType,
   typeKey,
 } from "@/lib/data";
-import { createIngestJob, downloadCsv, getJob, listCampaigns } from "@/lib/api";
+import { createIngestJob, downloadCsv, getJob, isJobNotFound, jobProgressPercent, listCampaigns } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
 
@@ -32,14 +32,39 @@ import { ColumnPicker, relevantGroups } from "./ColumnPicker";
 import { StepBadge } from "./StepBadge";
 import { SummaryRow } from "./SummaryRow";
 
+const COMBINE_JOB_KEY = "combineJobId";
+const COMBINE_PREPARED_KEY = "combinePrepared";
+const COMBINE_PHASE_KEY = "combinePhase";
+
+type CombinePhase = "build" | "working" | "done";
+type PreparedExport = { batchIds: string[]; columns: string[]; totalRows: number; batchCount: number };
+
+function readPrepared(): PreparedExport | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(COMBINE_PREPARED_KEY) ?? "null") as PreparedExport | null;
+    if (parsed?.batchIds?.length && Array.isArray(parsed.columns)) return parsed;
+  } catch {
+    // ignore malformed resume state
+  }
+  return null;
+}
+
+function readCombinePhase(): CombinePhase {
+  if (typeof window === "undefined") return "build";
+  if (sessionStorage.getItem(COMBINE_JOB_KEY)) return "working";
+  const stored = sessionStorage.getItem(COMBINE_PHASE_KEY);
+  if (stored === "working") return "working";
+  if (stored === "done" && readPrepared()) return "done";
+  return "build";
+}
+
 export function CombineScreen() {
   const router = useRouter();
   const { currency, combineTargets, setCombineTargets } = useApp();
 
   const [selectedCols, setSelectedCols] = useState<Set<string> | null>(null);
-  const [phase, setPhase] = useState<"build" | "working" | "done">(() =>
-    typeof window !== "undefined" && sessionStorage.getItem("combineJobId") ? "working" : "build",
-  );
+  const [phase, setPhase] = useState<CombinePhase>(readCombinePhase);
   const [prog, setProg] = useState(0);
   // Start empty — never seed with mock. listCampaigns() supplies mock only when
   // the backend is off; on a live backend mock data never enters this screen.
@@ -49,31 +74,30 @@ export function CombineScreen() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [jobId, setJobId] = useState<string | null>(() =>
-    typeof window === "undefined" ? null : sessionStorage.getItem("combineJobId"),
+    typeof window === "undefined" ? null : sessionStorage.getItem(COMBINE_JOB_KEY),
   );
   const [error, setError] = useState<string | null>(null);
   const [rateLimitRetryAt, setRateLimitRetryAt] = useState<string | null>(null);
-  const [prepared, setPrepared] = useState<{ batchIds: string[]; columns: string[]; totalRows: number; batchCount: number } | null>(() => {
-    if (typeof window === "undefined") return null;
-    try {
-      return JSON.parse(sessionStorage.getItem("combinePrepared") ?? "null");
-    } catch {
-      return null;
-    }
-  });
+  const [prepared, setPrepared] = useState<PreparedExport | null>(readPrepared);
+  const schedulingRef = useRef(false);
 
   useEffect(() => {
     if (jobId) {
-      sessionStorage.setItem("combineJobId", jobId);
+      sessionStorage.setItem(COMBINE_JOB_KEY, jobId);
     } else {
-      sessionStorage.removeItem("combineJobId");
+      sessionStorage.removeItem(COMBINE_JOB_KEY);
     }
   }, [jobId]);
 
   useEffect(() => {
-    if (prepared) sessionStorage.setItem("combinePrepared", JSON.stringify(prepared));
-    else sessionStorage.removeItem("combinePrepared");
+    if (prepared) sessionStorage.setItem(COMBINE_PREPARED_KEY, JSON.stringify(prepared));
+    else sessionStorage.removeItem(COMBINE_PREPARED_KEY);
   }, [prepared]);
+
+  useEffect(() => {
+    if (phase === "build") sessionStorage.removeItem(COMBINE_PHASE_KEY);
+    else sessionStorage.setItem(COMBINE_PHASE_KEY, phase);
+  }, [phase]);
 
   // load live batches (falls back to mock automatically when backend is off)
   useEffect(() => {
@@ -117,6 +141,8 @@ export function CombineScreen() {
       if (!active) return;
       setSelectedCols((prev: Set<string> | null) => {
         const valid = new Set(groups.flatMap((g: ColumnGroup) => g.columns.map((c: ColumnDef) => c.key)));
+        const fromPrepared = (prepared?.columns ?? []).filter((key) => valid.has(key));
+        if (fromPrepared.length && phase !== "build") return new Set(fromPrepared);
         if (!prev) return new Set(groups.flatMap((g: ColumnGroup) => g.columns.filter((c: ColumnDef) => c.default).map((c: ColumnDef) => c.key)));
         return new Set([...prev].filter((k: string) => valid.has(k)));
       });
@@ -124,7 +150,7 @@ export function CombineScreen() {
     return () => {
       active = false;
     };
-  }, [groups]);
+  }, [groups, prepared, phase]);
 
   const colOrder = useMemo(
     () => groups.flatMap((g: ColumnGroup) => g.columns.map((c: ColumnDef) => c.key)).filter((k: string) => selectedCols && selectedCols.has(k)),
@@ -146,7 +172,7 @@ export function CombineScreen() {
         if (stopped) return;
         if (job) {
           setError(null);
-          setProg((current) => Math.max(current, job.total > 0 ? (job.done / job.total) * 100 : 0));
+          setProg((current) => Math.max(current, jobProgressPercent(job.done, job.total, job.status)));
           setRateLimitRetryAt(job.status === "rate_limited" ? job.retryAt : null);
           if (job.status === "done") {
             setProg(100);
@@ -157,6 +183,8 @@ export function CombineScreen() {
           if (job.status === "error") {
             setError(job.error || "Merge failed");
             setJobId(null);
+            setPhase("build");
+            schedulingRef.current = false;
             return;
           }
           if (job.status === "rate_limited" && job.retryAt) {
@@ -167,8 +195,14 @@ export function CombineScreen() {
           setError("Unable to refresh progress. Retrying automatically…");
           delay = 3000;
         }
-      } catch {
-        if (!stopped) setError("Unable to refresh progress. Retrying automatically…");
+      } catch (pollError) {
+        if (stopped) return;
+        if (isJobNotFound(pollError)) {
+          setJobId(null);
+          schedulingRef.current = false;
+          return;
+        }
+        setError("Unable to refresh progress. Retrying automatically…");
         delay = 3000;
       }
       if (!stopped) timer = setTimeout(poll, delay);
@@ -179,6 +213,40 @@ export function CombineScreen() {
       if (timer) clearTimeout(timer);
     };
   }, [phase, jobId]);
+
+  // Refresh mid-schedule (phase=working, job id not saved yet) or after the
+  // stored job vanished: reattach or skip-ready instead of dropping back to build.
+  useEffect(() => {
+    if (phase !== "working" || jobId || schedulingRef.current) return;
+    const batchIds = prepared?.batchIds;
+    if (!batchIds?.length) return;
+    let cancelled = false;
+    createIngestJob(batchIds, "merge")
+      .then((res) => {
+        if (cancelled) return;
+        if (!res) {
+          schedulingRef.current = false;
+          setPhase("build");
+          setPrepared(null);
+          setError("CSV download requires the live backend; demo rows cannot be exported as customer data.");
+        } else if (res.ready || !res.jobId) {
+          setProg(100);
+          setPhase("done");
+        } else {
+          setProg(jobProgressPercent(res.done ?? 0, res.total || 1));
+          setJobId(res.jobId);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        schedulingRef.current = false;
+        setPhase("build");
+        setError("Unable to schedule merge. Please try again.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [phase, jobId, prepared]);
 
   const onGenerate = async () => {
     if (missingTargetIds.length > 0) {
@@ -194,11 +262,15 @@ export function CombineScreen() {
       totalRows,
       batchCount: campaigns.length,
     };
+    schedulingRef.current = true;
+    sessionStorage.setItem(COMBINE_PHASE_KEY, "working");
+    sessionStorage.setItem(COMBINE_PREPARED_KEY, JSON.stringify(snapshot));
     setPrepared(snapshot);
     setPhase("working");
     try {
       const res = await createIngestJob(snapshot.batchIds, "merge");
       if (!res) {
+        schedulingRef.current = false;
         setPhase("build");
         setPrepared(null);
         setError("CSV download requires the live backend; demo rows cannot be exported as customer data.");
@@ -206,9 +278,11 @@ export function CombineScreen() {
         setProg(100);
         setPhase("done");
       } else {
+        setProg(jobProgressPercent(res.done ?? 0, res.total || 1));
         setJobId(res.jobId);
       }
     } catch {
+      schedulingRef.current = false;
       setPhase("build");
       setPrepared(null);
       setError("Unable to schedule merge. Please try again.");
@@ -216,6 +290,7 @@ export function CombineScreen() {
   };
 
   const reset = () => {
+    schedulingRef.current = false;
     setPhase("build");
     setProg(0);
     setJobId(null);
@@ -487,7 +562,8 @@ export function CombineScreen() {
                         <Icon name="Clock3" size={15} className="mt-0.5 shrink-0" />
                         <span>
                           Rate limit reached. This job will retry automatically at{" "}
-                          {new Date(rateLimitRetryAt).toLocaleTimeString()}. Keep this page open; no refresh is needed.
+                          {new Date(rateLimitRetryAt).toLocaleTimeString()}. You can refresh this page;
+                          the merge will resume.
                         </span>
                       </div>
                     )}

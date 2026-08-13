@@ -27,7 +27,7 @@ export const POST = withLogging("ingest", async (req: Request) => {
   if (!ctx) return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
   setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
 
-  let body: { batchIds?: unknown; type?: JobType };
+  let body: { batchIds?: unknown; type?: JobType; refresh?: boolean };
   try {
     body = await parseJsonBody(req);
   } catch (error) {
@@ -48,19 +48,25 @@ export const POST = withLogging("ingest", async (req: Request) => {
   if (body.type != null && body.type !== "ingest" && body.type !== "merge") {
     return NextResponse.json({ error: "invalid_job_type" }, { status: 400 });
   }
+  if (body.refresh != null && typeof body.refresh !== "boolean") {
+    return NextResponse.json({ error: "invalid_refresh" }, { status: 400 });
+  }
   const type: JobType = body.type === "merge" ? "merge" : "ingest";
+  // Analyze "Refresh data" re-pulls. Merge/CSV and a normal Analyze load must
+  // not; a page reload used to enqueue a second full ingest of ready batches.
+  const forceRefresh = type === "ingest" && body.refresh === true;
 
-  // Export combines normalized Mongo records. Do not re-pull batches that are
-  // already ready; doing so made every download scale with upstream API speed
-  // and rate limits even though the export route could stream them immediately.
+  // Skip batches whose normalized records already match the known total, unless
+  // the caller explicitly asked to refresh ingest. Merge has always done this
+  // so CSV download does not scale with upstream API speed/rate limits.
   let batchIds = requestedBatchIds;
-  if (type === "merge") {
+  if (!forceRefresh) {
     const counts = await Promise.all(
       requestedBatchIds.map((id) => countRecords(ctx.tenantId, ctx.accountId, [id])),
     );
     batchIds = requestedBatchIds.filter((_, index) => batchDocs[index].ingestStatus !== "ready" || counts[index] !== batchDocs[index].total);
     if (batchIds.length === 0) {
-      return NextResponse.json({ jobId: null, total: 0, ready: true });
+      return NextResponse.json({ jobId: null, total: 0, done: 0, ready: true });
     }
   }
 
@@ -81,6 +87,7 @@ export const POST = withLogging("ingest", async (req: Request) => {
     return NextResponse.json({
       jobId: activeJob.jobId,
       total: activeJob.total,
+      done: activeJob.done ?? 0,
       ready: false,
       existing: true,
     });
@@ -123,5 +130,5 @@ export const POST = withLogging("ingest", async (req: Request) => {
     { jobId: job.jobId, type, batchCount: batchIds.length, total },
     "ingestion job enqueued",
   );
-  return NextResponse.json({ jobId: job.jobId, total, ready: false });
+  return NextResponse.json({ jobId: job.jobId, total, done: 0, ready: false });
 });
