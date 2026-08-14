@@ -38,13 +38,14 @@ vi.mock("recharts", () => {
   };
 });
 
-import { VolumeChart } from "@/components/screens/dashboard/VolumeChart";
+import { VolumeChart as DashboardVolumeChart } from "@/components/screens/dashboard/VolumeChart";
+import { VolumeChart as AnalyticsVolumeChart } from "@/components/screens/analytics/VolumeChart";
 import { VOLUME_Y_AXIS_WIDTH } from "@/lib/chart-axis";
 
 describe("dashboard VolumeChart Y-axis", () => {
   it("uses a numeric 0-based scale with monotonic compact labels", () => {
     render(
-      <VolumeChart
+      <DashboardVolumeChart
         data={[
           { date: "Jul 16", calls: 2000, messages: 0 },
           { date: "Jul 17", calls: 6500, messages: 0 },
@@ -67,7 +68,7 @@ describe("dashboard VolumeChart Y-axis", () => {
 
   it("coerces string counts so the axis stays numeric", () => {
     render(
-      <VolumeChart
+      <DashboardVolumeChart
         data={[
           { date: "Aug 1", calls: "16500" as unknown as number, messages: 0 },
           { date: "Aug 2", calls: 8000, messages: 0 },
@@ -78,5 +79,9 @@ describe("dashboard VolumeChart Y-axis", () => {
     expect(axis).toHaveAttribute("data-type", "number");
     expect(JSON.parse(axis.getAttribute("data-ticks") ?? "[]")[0]).toBe(0);
     expect(axis.textContent).toMatch(/10\.0K/);
+  });
+
+  it("is the same component the analytics overview chart uses", () => {
+    expect(AnalyticsVolumeChart).toBe(DashboardVolumeChart);
   });
 });

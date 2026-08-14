@@ -1,7 +1,15 @@
 "use client";
 
+import { useMemo } from "react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ChartCard } from "@/components/ui";
+import {
+  VOLUME_CHART_MARGIN,
+  VOLUME_Y_AXIS_WIDTH,
+  countYAxisScale,
+  formatCountTick,
+  seriesMax,
+} from "@/lib/chart-axis";
 import { fmtDuration, fmtNum, fmtPct } from "@/lib/data";
 import type { ShortCallStats } from "@/lib/server/types";
 import { ChartTip } from "./ChartTip";
@@ -17,6 +25,10 @@ function Metric({ label, value, sub }: { label: string; value: string; sub: stri
 }
 
 export function ShortCallCard({ stats }: { stats: ShortCallStats | null }) {
+  const { ticks, domain } = useMemo(
+    () => countYAxisScale(seriesMax((stats?.durationHistogram ?? []).map((row) => row.calls))),
+    [stats],
+  );
   return (
     <ChartCard
       title="Short calls & hang-ups"
@@ -47,10 +59,22 @@ export function ShortCallCard({ stats }: { stats: ShortCallStats | null }) {
           </div>
           <div style={{ height: 160 }}>
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={stats.durationHistogram} margin={{ top: 6, right: 8, left: -16, bottom: 0 }}>
+              <BarChart data={stats.durationHistogram} margin={{ ...VOLUME_CHART_MARGIN }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
                 <XAxis dataKey="bucket" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
-                <YAxis tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} tickFormatter={fmtNum} width={40} />
+                <YAxis
+                  type="number"
+                  scale="linear"
+                  domain={domain}
+                  ticks={ticks}
+                  interval={0}
+                  allowDecimals={false}
+                  tick={{ fontSize: 11, fill: "#94a3b8" }}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={formatCountTick}
+                  width={VOLUME_Y_AXIS_WIDTH}
+                />
                 <Tooltip content={<ChartTip suffix=" calls" />} cursor={{ fill: "rgba(148,163,184,0.08)" }} />
                 <Bar dataKey="calls" fill="var(--accent)" radius={[5, 5, 0, 0]} barSize={22} />
               </BarChart>

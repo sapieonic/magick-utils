@@ -5,8 +5,8 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import {
   VOLUME_CHART_MARGIN,
   VOLUME_Y_AXIS_WIDTH,
+  countYAxisScale,
   formatCountTick,
-  niceCountTicks,
   seriesMax,
   toFiniteNumber,
 } from "@/lib/chart-axis";
@@ -24,11 +24,10 @@ export function VolumeChart({ data }: { data: VolumePoint[] }) {
       })),
     [data],
   );
-  const ticks = useMemo(
-    () => niceCountTicks(seriesMax(series.flatMap((point) => [point.calls, point.messages]))),
+  const { ticks, domain } = useMemo(
+    () => countYAxisScale(seriesMax(series.flatMap((point) => [point.calls, point.messages]))),
     [series],
   );
-  const top = ticks[ticks.length - 1] ?? 1;
 
   return (
     <div style={{ height: 260 }}>
@@ -49,7 +48,7 @@ export function VolumeChart({ data }: { data: VolumePoint[] }) {
           <YAxis
             type="number"
             scale="linear"
-            domain={[0, top]}
+            domain={domain}
             ticks={ticks}
             interval={0}
             allowDecimals={false}

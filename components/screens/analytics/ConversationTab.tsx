@@ -24,7 +24,9 @@ import {
 import {
   VOLUME_CHART_MARGIN,
   VOLUME_Y_AXIS_WIDTH,
+  countYAxisScale,
   formatCountTick,
+  seriesMax,
 } from "@/lib/chart-axis";
 import type { AggregatesDoc } from "@/lib/server/types";
 import { ChartTip } from "./ChartTip";
@@ -92,6 +94,10 @@ export function ConversationTab({ hasVoice, hasMsg, analytics }: { hasVoice: boo
 }
 
 function DurationChart({ data }: { data: { bucket: string; calls: number; talk: number }[] }) {
+  const { ticks, domain } = useMemo(
+    () => countYAxisScale(seriesMax(data.flatMap((row) => [row.calls, row.talk]))),
+    [data],
+  );
   return (
     <div style={{ height: 260 }}>
       <ResponsiveContainer width="100%" height="100%">
@@ -100,7 +106,11 @@ function DurationChart({ data }: { data: { bucket: string; calls: number; talk: 
           <XAxis dataKey="bucket" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
           <YAxis
             type="number"
-            domain={[0, "auto"]}
+            scale="linear"
+            domain={domain}
+            ticks={ticks}
+            interval={0}
+            allowDecimals={false}
             tick={{ fontSize: 11, fill: "#94a3b8" }}
             tickLine={false}
             axisLine={false}
@@ -124,7 +134,15 @@ function SentimentTrend() {
         <LineChart data={data} margin={{ ...VOLUME_CHART_MARGIN, right: 12 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
           <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
-          <YAxis tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} unit="%" width={40} />
+          <YAxis
+            type="number"
+            domain={[0, 100]}
+            tick={{ fontSize: 11, fill: "#94a3b8" }}
+            tickLine={false}
+            axisLine={false}
+            unit="%"
+            width={48}
+          />
           <Tooltip content={<ChartTip suffix="%" />} />
           <Line type="monotone" dataKey="positive" stroke="#16a34a" strokeWidth={2.5} dot={false} />
         </LineChart>
