@@ -3,16 +3,20 @@
 import type { JSX } from "react";
 import type { Components, ExtraProps } from "react-markdown";
 import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { cx } from "./icon";
 
 type MdProps<T extends keyof JSX.IntrinsicElements> = JSX.IntrinsicElements[T] & ExtraProps;
 
 function stripNode<T extends ExtraProps>(props: T) {
-  const rest = { ...props };
-  delete rest.node;
+  const { node, ...rest } = props;
+  void node;
   return rest;
 }
+
+const linkClass =
+  "font-medium text-[var(--accent)] underline underline-offset-2 hover:text-[var(--accent-strong)]";
 
 const components: Components = {
   h1: ({ children, className, ...props }: MdProps<"h1">) => (
@@ -39,6 +43,27 @@ const components: Components = {
       {children}
     </h3>
   ),
+  h4: ({ children, className, ...props }: MdProps<"h4">) => (
+    <h4 {...stripNode(props)} className={cx("mt-2 mb-1 text-[13px] font-bold text-slate-800 first:mt-0", className)}>
+      {children}
+    </h4>
+  ),
+  h5: ({ children, className, ...props }: MdProps<"h5">) => (
+    <h5
+      {...stripNode(props)}
+      className={cx("mt-2 mb-1 text-[13px] font-semibold text-slate-800 first:mt-0", className)}
+    >
+      {children}
+    </h5>
+  ),
+  h6: ({ children, className, ...props }: MdProps<"h6">) => (
+    <h6
+      {...stripNode(props)}
+      className={cx("mt-2 mb-1 text-[13px] font-semibold text-slate-700 first:mt-0", className)}
+    >
+      {children}
+    </h6>
+  ),
   p: ({ children, className, ...props }: MdProps<"p">) => (
     <p {...stripNode(props)} className={cx("my-1.5 first:mt-0 last:mb-0", className)}>
       {children}
@@ -57,7 +82,10 @@ const components: Components = {
   ul: ({ children, className, ...props }: MdProps<"ul">) => (
     <ul
       {...stripNode(props)}
-      className={cx("my-1.5 list-disc space-y-1 pl-4 first:mt-0 last:mb-0", className)}
+      className={cx(
+        "my-1.5 list-disc space-y-1 pl-4 first:mt-0 last:mb-0 [&.contains-task-list]:list-none",
+        className,
+      )}
     >
       {children}
     </ul>
@@ -71,24 +99,28 @@ const components: Components = {
     </ol>
   ),
   li: ({ children, className, ...props }: MdProps<"li">) => (
-    <li {...stripNode(props)} className={cx("pl-0.5 [&>p]:my-0.5", className)}>
+    <li {...stripNode(props)} className={cx("pl-0.5 [&>p]:my-0.5 [&.task-list-item]:list-none", className)}>
       {children}
     </li>
   ),
-  a: ({ children, href, className, ...props }: MdProps<"a">) => (
-    <a
-      {...stripNode(props)}
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className={cx(
-        "font-medium text-[var(--accent)] underline underline-offset-2 hover:text-[var(--accent-strong)]",
-        className,
-      )}
-    >
-      {children}
-    </a>
-  ),
+  a: ({ children, href, className, ...props }: MdProps<"a">) => {
+    const rest = stripNode(props);
+    const safeHref = href?.trim() ?? "";
+    if (!safeHref) {
+      return <span className={className}>{children}</span>;
+    }
+    const external = /^https?:\/\//i.test(safeHref);
+    return (
+      <a
+        {...rest}
+        href={safeHref}
+        {...(external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+        className={cx(linkClass, className)}
+      >
+        {children}
+      </a>
+    );
+  },
   code: ({ children, className, ...props }: MdProps<"code">) => (
     <code
       {...stripNode(props)}
@@ -171,7 +203,11 @@ const components: Components = {
 export function Markdown({ children, className }: { children: string; className?: string }) {
   return (
     <div className={cx("min-w-0 break-words [overflow-wrap:anywhere]", className)}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        disallowedElements={["img"]}
+        components={components}
+      >
         {children}
       </ReactMarkdown>
     </div>

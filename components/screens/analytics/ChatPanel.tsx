@@ -188,9 +188,8 @@ export function ChatPanel({
                       <Icon name="Sparkles" size={14} />
                     </span>
                     <div className="max-w-[90%] min-w-0 rounded-2xl rounded-tl-md border border-slate-200 bg-white px-3.5 py-2.5 text-[13.5px] leading-relaxed text-slate-600">
-                      <div className={cx(msg.streaming && "caret")}>
-                        {msg.text ? <Markdown>{msg.text}</Markdown> : null}
-                      </div>
+                      {msg.text ? <Markdown>{msg.text}</Markdown> : null}
+                      {msg.streaming && <span className="caret" />}
                     </div>
                   </div>
                 ),
