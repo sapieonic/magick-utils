@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
-import { Button, Icon, cx } from "@/components/ui";
+import { Button, Icon, Markdown, cx } from "@/components/ui";
 import { streamChat } from "@/lib/api";
 import type { Batch } from "@/lib/types";
 
@@ -187,11 +187,9 @@ export function ChatPanel({
                     <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white" style={{ background: "var(--brand-grad)" }}>
                       <Icon name="Sparkles" size={14} />
                     </span>
-                    <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-slate-200 bg-white px-3.5 py-2.5 text-[13.5px] leading-relaxed text-slate-600">
-                      <span className="whitespace-pre-wrap">
-                        {msg.text}
-                        {msg.streaming && <span className="caret" />}
-                      </span>
+                    <div className="max-w-[90%] min-w-0 rounded-2xl rounded-tl-md border border-slate-200 bg-white px-3.5 py-2.5 text-[13.5px] leading-relaxed text-slate-600">
+                      {msg.text ? <Markdown>{msg.text}</Markdown> : null}
+                      {msg.streaming && <span className="caret" />}
                     </div>
                   </div>
                 ),

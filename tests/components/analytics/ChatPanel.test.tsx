@@ -68,6 +68,62 @@ describe("ChatPanel — empty state & suggestions", () => {
     // The streamed assistant reply lands.
     await waitFor(() => expect(screen.getByText("Because the dialer was throttled.")).toBeInTheDocument());
   });
+
+  it("renders assistant markdown (headings, bold, tables) instead of raw syntax", async () => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
+      onDelta(
+        "## What the data shows\n\nThe batch has a **low connect rate**.\n\n| Metric | Value |\n|---|---|\n| Success rate | 11.2% |\n",
+      );
+      return true;
+    });
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: /Why did this batch underperform\?/ }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "What the data shows" })).toBeInTheDocument();
+    });
+    expect(screen.getByText("low connect rate").tagName).toBe("STRONG");
+    expect(screen.getByRole("table")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Metric" })).toBeInTheDocument();
+    expect(screen.queryByText("## What the data shows")).not.toBeInTheDocument();
+  });
+
+  it("leaves user messages as literal text, not markdown", async () => {
+    mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
+      onDelta("Noted.");
+      return true;
+    });
+    renderPanel();
+
+    const input = screen.getByPlaceholderText(/Ask anything about this campaign/) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "See **bold** please" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(screen.getByText("See **bold** please")).toBeInTheDocument();
+    expect(screen.getByText("See **bold** please").querySelector("strong")).toBeNull();
+    await waitFor(() => expect(screen.getByText("Noted.")).toBeInTheDocument());
+  });
+
+  it("shows a streaming caret until the assistant turn settles", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
+      await gate;
+      onDelta("Done.");
+      return true;
+    });
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: /What is the best time to call\?/ }));
+    await waitFor(() => expect(document.querySelector(".caret")).toBeInTheDocument());
+
+    release();
+    await waitFor(() => expect(screen.getByText("Done.")).toBeInTheDocument());
+    expect(document.querySelector(".caret")).toBeNull();
+  });
 });
 
 describe("ChatPanel — composer", () => {
