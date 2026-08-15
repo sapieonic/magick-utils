@@ -17,8 +17,9 @@ import {
 import { CHANNELS, STATUS, TYPES, fmtNum } from "@/lib/data";
 import type { BreakdownSeg, Channel, StatusKey, TypeKey } from "@/lib/types";
 import { Icon, cx } from "./icon";
+import { Markdown } from "./Markdown";
 
-export { Icon, cx };
+export { Icon, cx, Markdown };
 
 // ---------- Card ----------
 export function Card({
