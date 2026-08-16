@@ -4,6 +4,13 @@ import { useMemo } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { Card, ChartCard, Icon, cx } from "@/components/ui";
 import { FX, costBreakdown, fmtCompact, fmtMoney, fmtMoneyFull } from "@/lib/data";
+import {
+  COST_Y_AXIS_WIDTH,
+  VOLUME_CHART_MARGIN,
+  countYAxisScale,
+  seriesMax,
+  toFiniteNumber,
+} from "@/lib/chart-axis";
 import type { Batch, Currency } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
 import { Legend } from "./Legend";
@@ -14,6 +21,10 @@ export function CostTab({ targets, currency, analytics }: { targets: Batch[]; cu
   const data = useMemo(
     () => (analytics?.costOverTime ? analytics.costOverTime : costBreakdown()),
     [analytics],
+  );
+  const { ticks, domain } = useMemo(
+    () => countYAxisScale(seriesMax(data.map((row) => toFiniteNumber(row.telephony) + toFiniteNumber(row.ai)))),
+    [data],
   );
   const tel = analytics ? analytics.telephonyInr : targets.reduce((a, c) => a + c.telephonyInr, 0);
   const ai = analytics ? analytics.aiInr : targets.reduce((a, c) => a + c.aiInr, 0);
@@ -28,7 +39,7 @@ export function CostTab({ targets, currency, analytics }: { targets: Batch[]; cu
       <ChartCard title="Cost over time" subtitle="Telephony vs AI processing" action={<Legend items={[{ c: "var(--accent)", l: "Telephony" }, { c: "#c4b5fd", l: "AI" }]} />}>
         <div style={{ height: 280 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data} margin={{ top: 6, right: 8, left: -8, bottom: 0 }}>
+            <AreaChart data={data} margin={{ ...VOLUME_CHART_MARGIN }}>
               <defs>
                 <linearGradient id="cTel" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
@@ -42,11 +53,17 @@ export function CostTab({ targets, currency, analytics }: { targets: Batch[]; cu
               <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
               <XAxis dataKey="date" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
               <YAxis
+                type="number"
+                scale="linear"
+                domain={domain}
+                ticks={ticks}
+                interval={0}
+                allowDecimals={false}
                 tick={{ fontSize: 11, fill: "#94a3b8" }}
                 tickLine={false}
                 axisLine={false}
                 tickFormatter={(v: number) => (currency === "usd" ? "$" + fmtCompact(v / FX) : "₹" + fmtCompact(v))}
-                width={52}
+                width={COST_Y_AXIS_WIDTH}
               />
               <Tooltip content={<CostTip currency={currency} />} />
               <Area type="monotone" dataKey="telephony" stackId="1" stroke="var(--accent)" strokeWidth={2} fill="url(#cTel)" />

@@ -16,12 +16,18 @@ import { ChartCard } from "@/components/ui";
 import {
   TOPICS,
   durationHistogram,
-  fmtCompact,
   fmtNum,
   messagingFunnel,
   sentimentData,
   sparkline,
 } from "@/lib/data";
+import {
+  VOLUME_CHART_MARGIN,
+  VOLUME_Y_AXIS_WIDTH,
+  countYAxisScale,
+  formatCountTick,
+  seriesMax,
+} from "@/lib/chart-axis";
 import type { AggregatesDoc } from "@/lib/server/types";
 import { ChartTip } from "./ChartTip";
 import { Legend } from "./Legend";
@@ -88,13 +94,29 @@ export function ConversationTab({ hasVoice, hasMsg, analytics }: { hasVoice: boo
 }
 
 function DurationChart({ data }: { data: { bucket: string; calls: number; talk: number }[] }) {
+  const { ticks, domain } = useMemo(
+    () => countYAxisScale(seriesMax(data.flatMap((row) => [row.calls, row.talk]))),
+    [data],
+  );
   return (
     <div style={{ height: 260 }}>
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{ top: 6, right: 8, left: -16, bottom: 0 }} barGap={2}>
+        <BarChart data={data} margin={{ ...VOLUME_CHART_MARGIN }} barGap={2}>
           <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
           <XAxis dataKey="bucket" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
-          <YAxis tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} tickFormatter={fmtCompact} width={48} />
+          <YAxis
+            type="number"
+            scale="linear"
+            domain={domain}
+            ticks={ticks}
+            interval={0}
+            allowDecimals={false}
+            tick={{ fontSize: 11, fill: "#94a3b8" }}
+            tickLine={false}
+            axisLine={false}
+            tickFormatter={formatCountTick}
+            width={VOLUME_Y_AXIS_WIDTH}
+          />
           <Tooltip content={<ChartTip />} cursor={{ fill: "rgba(148,163,184,0.08)" }} />
           <Bar dataKey="calls" fill="var(--accent)" radius={[5, 5, 0, 0]} barSize={20} />
           <Bar dataKey="talk" fill="#c7d2fe" radius={[5, 5, 0, 0]} barSize={20} />
@@ -109,10 +131,18 @@ function SentimentTrend() {
   return (
     <div style={{ height: 240 }}>
       <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 6, right: 12, left: -16, bottom: 0 }}>
+        <LineChart data={data} margin={{ ...VOLUME_CHART_MARGIN, right: 12 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
           <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
-          <YAxis tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} unit="%" width={40} />
+          <YAxis
+            type="number"
+            domain={[0, 100]}
+            tick={{ fontSize: 11, fill: "#94a3b8" }}
+            tickLine={false}
+            axisLine={false}
+            unit="%"
+            width={48}
+          />
           <Tooltip content={<ChartTip suffix="%" />} />
           <Line type="monotone" dataKey="positive" stroke="#16a34a" strokeWidth={2.5} dot={false} />
         </LineChart>
