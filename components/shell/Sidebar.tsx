@@ -5,6 +5,7 @@ import { Icon, cx } from "@/components/ui";
 import { Logo } from "@/components/Logo";
 import { useBrand } from "@/components/brand/BrandProvider";
 import type { Workspace } from "@/lib/types";
+import { version } from "@/package.json";
 
 export const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: "LayoutDashboard" },
@@ -97,6 +98,16 @@ export function Sidebar({
               <Icon name="ArrowLeftRight" size={18} />
             </button>
           )}
+          <div
+            aria-label={`Application version ${version}`}
+            className={cx(
+              "mt-3 flex items-center text-[10.5px] font-medium text-slate-400",
+              collapsed ? "justify-center" : "justify-between px-1",
+            )}
+          >
+            {!collapsed && <span>Version</span>}
+            <span className="font-mono tabnum">v{version}</span>
+          </div>
         </div>
       </aside>
     </>

@@ -3,9 +3,10 @@ import { timingSafeEqual } from "node:crypto";
 import { env, isBackendConfigured, isCronConfigured } from "@/lib/server/env";
 import {
   deleteAggregatesOlderThan,
+  deleteBatchDataOlderThan,
   deleteInsightsOlderThan,
+  deleteJobsOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
-  deleteTerminalJobsOlderThan,
 } from "@/lib/server/repositories";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
@@ -15,12 +16,10 @@ export const dynamic = "force-dynamic";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Retention windows. Each collection is a regenerable cache or operational
-// history, so pruning keeps the Atlas free-tier storage + indexes small.
-const AGGREGATES_RETENTION_DAYS = 7; // recomputed on the next analytics request
-const JOBS_RETENTION_DAYS = 1; // done/error jobs are just history once polled
-const INSIGHTS_RETENTION_DAYS = 30; // regen costs an LLM call, so keep longer
-const RETIRED_RECORD_REVISION_RETENTION_DAYS = 1; // grace for in-flight CSV/read cursors
+// One strict retention window for all persisted application data. Cached data
+// can be regenerated; source batches older than this are removed together with
+// every normalized record they own.
+const RETENTION_DAYS = 5;
 
 /** Constant-time Bearer-token check against CRON_SECRET. */
 function isAuthorized(req: Request): boolean {
@@ -34,9 +33,9 @@ function isAuthorized(req: Request): boolean {
 
 /**
  * Daily housekeeping endpoint, triggered by the GitHub Actions cron
- * (`.github/workflows/cleanup.yml`). Prunes stale cached/derived data so the
- * free-tier Mongo stays small. Runs without a user session, so it is guarded by
- * a shared Bearer secret (CRON_SECRET) instead of the tenant cookie.
+ * (`.github/workflows/cleanup.yml`). Enforces the global retention window so
+ * the free-tier Mongo stays small. Runs without a user session, so it is guarded
+ * by a shared Bearer secret (CRON_SECRET) instead of the tenant cookie.
  */
 export const POST = withLogging("cron/cleanup", async (req: Request) => {
   if (!isBackendConfigured())
@@ -51,13 +50,25 @@ export const POST = withLogging("cron/cleanup", async (req: Request) => {
   const now = Date.now();
   const cutoff = (days: number) => new Date(now - days * DAY_MS).toISOString();
 
-  const [aggregates, jobs, insights, recordRevisions] = await Promise.all([
-    deleteAggregatesOlderThan(cutoff(AGGREGATES_RETENTION_DAYS)),
-    deleteTerminalJobsOlderThan(cutoff(JOBS_RETENTION_DAYS)),
-    deleteInsightsOlderThan(cutoff(INSIGHTS_RETENTION_DAYS)),
-    deleteRetiredRecordRevisionsOlderThan(new Date(now - RETIRED_RECORD_REVISION_RETENTION_DAYS * DAY_MS)),
+  const retentionCutoff = cutoff(RETENTION_DAYS);
+  const [aggregates, jobs, insights, batchData] = await Promise.all([
+    deleteAggregatesOlderThan(retentionCutoff),
+    deleteJobsOlderThan(retentionCutoff),
+    deleteInsightsOlderThan(retentionCutoff),
+    deleteBatchDataOlderThan(retentionCutoff),
   ]);
+  // Run after the batch cascade so records removed with an expired batch are
+  // counted as batch data, not nondeterministically as retired revisions.
+  const recordRevisions = await deleteRetiredRecordRevisionsOlderThan(new Date(now - RETENTION_DAYS * DAY_MS));
 
-  log().info({ deleted: { aggregates, jobs, insights, recordRevisions } }, "cron cleanup pruned stale data");
-  return NextResponse.json({ ok: true, deleted: { aggregates, jobs, insights, recordRevisions } });
+  const deleted = {
+    aggregates,
+    jobs,
+    insights,
+    batches: batchData.batches,
+    records: batchData.records,
+    recordRevisions,
+  };
+  log().info({ deleted }, "cron cleanup pruned stale data");
+  return NextResponse.json({ ok: true, deleted });
 });

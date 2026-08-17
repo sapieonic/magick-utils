@@ -10,7 +10,8 @@ vi.mock("@/lib/server/env", () => ({
 }));
 vi.mock("@/lib/server/repositories", () => ({
   deleteAggregatesOlderThan: vi.fn().mockResolvedValue(2),
-  deleteTerminalJobsOlderThan: vi.fn().mockResolvedValue(3),
+  deleteBatchDataOlderThan: vi.fn().mockResolvedValue({ batches: 6, records: 500 }),
+  deleteJobsOlderThan: vi.fn().mockResolvedValue(3),
   deleteInsightsOlderThan: vi.fn().mockResolvedValue(1),
   deleteRetiredRecordRevisionsOlderThan: vi.fn().mockResolvedValue(4),
 }));
@@ -18,9 +19,10 @@ vi.mock("@/lib/server/repositories", () => ({
 import { isBackendConfigured, isCronConfigured } from "@/lib/server/env";
 import {
   deleteAggregatesOlderThan,
+  deleteBatchDataOlderThan,
   deleteInsightsOlderThan,
+  deleteJobsOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
-  deleteTerminalJobsOlderThan,
 } from "@/lib/server/repositories";
 
 function req(token?: string) {
@@ -61,19 +63,20 @@ describe("POST /api/cron/cleanup", () => {
     expect(deleteAggregatesOlderThan).not.toHaveBeenCalled();
   });
 
-  it("prunes all three collections and returns counts", async () => {
+  it("applies the five-day cutoff to all persisted application data", async () => {
     const { POST } = await import("@/app/api/cron/cleanup/route");
     const res = await POST(req(SECRET));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({
       ok: true,
-      deleted: { aggregates: 2, jobs: 3, insights: 1, recordRevisions: 4 },
+      deleted: { aggregates: 2, jobs: 3, insights: 1, batches: 6, records: 500, recordRevisions: 4 },
     });
     // each pruner is called once with an ISO cutoff in the past
     for (const fn of [
       deleteAggregatesOlderThan,
-      deleteTerminalJobsOlderThan,
+      deleteJobsOlderThan,
       deleteInsightsOlderThan,
+      deleteBatchDataOlderThan,
     ]) {
       expect(fn).toHaveBeenCalledTimes(1);
       const cutoff = vi.mocked(fn).mock.calls[0][0];
@@ -81,5 +84,13 @@ describe("POST /api/cron/cleanup", () => {
     }
     expect(deleteRetiredRecordRevisionsOlderThan).toHaveBeenCalledTimes(1);
     expect(deleteRetiredRecordRevisionsOlderThan).toHaveBeenCalledWith(expect.any(Date));
+    const cutoffs = [
+      deleteAggregatesOlderThan,
+      deleteJobsOlderThan,
+      deleteInsightsOlderThan,
+      deleteBatchDataOlderThan,
+    ].map((fn) => vi.mocked(fn).mock.calls[0][0]);
+    expect(new Set(cutoffs).size).toBe(1);
+    expect(Date.now() - new Date(cutoffs[0]).getTime()).toBeGreaterThanOrEqual(5 * 24 * 60 * 60 * 1000);
   });
 });

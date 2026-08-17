@@ -1030,21 +1030,56 @@ export async function deleteAggregatesOlderThan(
   return res.deletedCount ?? 0;
 }
 
-/**
- * Delete completed/errored jobs last updated before `cutoffIso`. Only terminal
- * jobs are removed — queued/running jobs are live work the worker still needs.
- * Returns the number removed. Jobs also carry the caller's Firebase idToken, so
- * pruning finished ones is good token hygiene on top of keeping the index small.
- */
-export async function deleteTerminalJobsOlderThan(
+/** Delete every job created before `cutoffIso`, regardless of status. A job
+ * cannot retain its caller's Firebase idToken beyond the global data window. */
+export async function deleteJobsOlderThan(
   cutoffIso: string
 ): Promise<number> {
   const col = await jobs();
   const res = await col.deleteMany({
-    status: { $in: ["done", "error"] satisfies Job["status"][] },
-    updatedAt: { $lt: cutoffIso },
+    createdAt: { $lt: cutoffIso },
   });
   return res.deletedCount ?? 0;
+}
+
+/**
+ * Delete batches whose upstream creation date is before `cutoffIso`, together
+ * with every normalized record belonging to those batches. Using the immutable
+ * source date (rather than `updatedAt`) prevents campaign-list refreshes from
+ * extending retention indefinitely. Batch metadata is removed first so new
+ * readers cannot discover data while its records are being swept.
+ */
+export async function deleteBatchDataOlderThan(
+  cutoffIso: string,
+): Promise<{ batches: number; records: number }> {
+  const batchCol = await batches();
+  const recordCol = await records();
+  const expired = await batchCol
+    .find({ date: { $lt: cutoffIso } })
+    .project<Pick<BatchDoc, "tenantId" | "accountId" | "batchId">>({
+      tenantId: 1,
+      accountId: 1,
+      batchId: 1,
+    })
+    .toArray();
+
+  if (expired.length === 0) return { batches: 0, records: 0 };
+
+  const batchResult = await batchCol.deleteMany({ date: { $lt: cutoffIso } });
+  let recordsDeleted = 0;
+  // Keep each delete query comfortably below MongoDB's command-size limit.
+  for (let offset = 0; offset < expired.length; offset += 500) {
+    const chunk = expired.slice(offset, offset + 500);
+    const recordResult = await recordCol.deleteMany({
+      $or: chunk.map(({ tenantId, accountId, batchId }) => ({ tenantId, accountId, batchId })),
+    });
+    recordsDeleted += recordResult.deletedCount ?? 0;
+  }
+
+  return {
+    batches: batchResult.deletedCount ?? 0,
+    records: recordsDeleted,
+  };
 }
 
 /** Delete only retired immutable revisions after a grace period. Current

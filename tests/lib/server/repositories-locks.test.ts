@@ -9,7 +9,7 @@ const locks = vi.hoisted(() => ({
 }));
 const usage = vi.hoisted(() => ({ findOneAndUpdate: vi.fn() }));
 const jobs = vi.hoisted(() => ({ findOne: vi.fn() }));
-const batchDb = vi.hoisted(() => ({ find: vi.fn(), findOne: vi.fn(), findOneAndUpdate: vi.fn(), updateOne: vi.fn() }));
+const batchDb = vi.hoisted(() => ({ deleteMany: vi.fn(), find: vi.fn(), findOne: vi.fn(), findOneAndUpdate: vi.fn(), updateOne: vi.fn() }));
 const recordDb = vi.hoisted(() => ({ deleteMany: vi.fn() }));
 
 vi.mock("@/lib/server/db", () => ({
@@ -26,6 +26,7 @@ import {
   acquireIngestionLocks,
   beginBatchIngestion,
   consumeAiQuota,
+  deleteBatchDataOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
   IngestionConflictError,
   refreshBatchFromSource,
@@ -206,6 +207,33 @@ describe("retired revision cleanup", () => {
     expect(recordDb.deleteMany).toHaveBeenCalledWith({
       retiredAt: { $lt: new Date("2026-08-11T00:00:00Z") },
       $nor: [{ tenantId: "t1", accountId: "a1", batchId: "b1", revision: "current" }],
+    });
+  });
+});
+
+describe("expired batch cleanup", () => {
+  it("deletes expired batch metadata and all records owned by those batches", async () => {
+    batchDb.find.mockReturnValue({
+      project: vi.fn().mockReturnValue({
+        toArray: vi.fn().mockResolvedValue([
+          { tenantId: "t1", accountId: "a1", batchId: "b1" },
+          { tenantId: "t2", accountId: "a2", batchId: "b2" },
+        ]),
+      }),
+    });
+    batchDb.deleteMany.mockResolvedValue({ deletedCount: 2 });
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 500 });
+
+    await expect(deleteBatchDataOlderThan("2026-08-12T00:00:00.000Z")).resolves.toEqual({
+      batches: 2,
+      records: 500,
+    });
+    expect(batchDb.deleteMany).toHaveBeenCalledWith({ date: { $lt: "2026-08-12T00:00:00.000Z" } });
+    expect(recordDb.deleteMany).toHaveBeenCalledWith({
+      $or: [
+        { tenantId: "t1", accountId: "a1", batchId: "b1" },
+        { tenantId: "t2", accountId: "a2", batchId: "b2" },
+      ],
     });
   });
 });
