@@ -1,6 +1,7 @@
 import type { Batch } from "./types";
 import type { DashboardVolume, NamedCount } from "./server/types";
 import { inDashboardRange, rangeStart, type DashboardRange } from "./date-range";
+import { APP_TIMEZONE, addAppDays, formatAppYmd, startOfAppDay } from "./timezone";
 
 const VOICE_STATUS_ORDER = [
   "completed",
@@ -13,7 +14,7 @@ const VOICE_STATUS_ORDER = [
   "pending",
 ] as const;
 
-/** Fill bounded dashboard ranges with explicit zero-volume UTC days. Missing
+/** Fill bounded dashboard ranges with explicit zero-volume IST days. Missing
  * points must mean zero activity, not a compressed x-axis that hides gaps. */
 export function fillDashboardDays(volume: DashboardVolume): DashboardVolume["points"] {
   if (!volume.start || volume.range === "All time") return volume.points;
@@ -22,14 +23,12 @@ export function fillDashboardDays(volume: DashboardVolume): DashboardVolume["poi
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return volume.points;
   const byDate = new Map(volume.points.map((point) => [point.date, point]));
   const result: DashboardVolume["points"] = [];
-  const cursor = new Date(start);
-  cursor.setUTCHours(0, 0, 0, 0);
-  const last = new Date(end);
-  last.setUTCHours(0, 0, 0, 0);
+  let cursor = startOfAppDay(start);
+  const last = startOfAppDay(end);
   while (cursor <= last) {
-    const date = cursor.toISOString().slice(0, 10);
+    const date = formatAppYmd(cursor);
     result.push(byDate.get(date) ?? { date, calls: 0, messages: 0 });
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    cursor = addAppDays(cursor, 1);
   }
   return result;
 }
@@ -111,7 +110,7 @@ export function dashboardVolumeFromCampaigns(
     const day = new Date(batch.date);
     if (Number.isNaN(day.getTime())) continue;
     inRange.push(batch);
-    const date = day.toISOString().slice(0, 10);
+    const date = formatAppYmd(day);
     const count = campaignVolumeCount(batch);
     const point = pointMap.get(date) ?? { date, calls: 0, messages: 0 };
     if (batch.channel === "voice") {
@@ -134,7 +133,7 @@ export function dashboardVolumeFromCampaigns(
 
   const totalRecords = totalCalls + totalMessages;
   return {
-    timezone: "UTC",
+    timezone: APP_TIMEZONE,
     range,
     start: start?.toISOString() ?? null,
     end: now.toISOString(),

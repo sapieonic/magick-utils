@@ -16,6 +16,7 @@ import {
 } from "@/lib/data";
 import type { Batch, Currency, StatusKey } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
+import { APP_TIMEZONE_LABEL } from "@/lib/timezone";
 import { ChartTip } from "./ChartTip";
 import { Legend } from "./Legend";
 import { StatusDonut } from "./StatusDonut";
@@ -95,7 +96,7 @@ export function OverviewTab({
       </div>
       <ChartCard
         title="Volume over time"
-        subtitle="Records during the campaign window"
+        subtitle={`Records during the campaign window · times in ${APP_TIMEZONE_LABEL}`}
         action={<Legend items={[{ c: "var(--accent)", l: hasVoice ? "Calls" : "Primary" }, { c: "#94a3b8", l: "Messages" }]} />}
       >
         <VolumeChart data={time} />

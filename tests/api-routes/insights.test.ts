@@ -147,11 +147,11 @@ describe("POST /api/insights", () => {
     vi.mocked(getAggregates).mockResolvedValue({
       ...AGG,
       reachByTimeOfDay: {
-        timezone: "UTC",
-        bandHours: 3,
+        timezone: "Asia/Kolkata",
+        bandHours: 1,
         minSamples: 20,
         totalPlaced: 40,
-        cells: [{ weekday: 2, band: 3, total: 40, reached: 30, rate: 0.75, lowSample: false }],
+        cells: [{ weekday: 2, band: 15, total: 40, reached: 30, rate: 0.75, lowSample: false }],
       },
     } as never);
     structured.mockResolvedValue({ narrative: "grounded", anomalies: [], recommendations: [] });
@@ -159,8 +159,8 @@ describe("POST /api/insights", () => {
     expect((await POST(req({ batchIds: ["b1"] }))).status).toBe(200);
 
     const messages = structured.mock.calls[0][0] as { role: string; content: string }[];
-    expect(messages[1].content).toContain('"window": "9 am–12 pm"');
-    expect(messages[1].content).toContain('"timezone": "UTC"');
+    expect(messages[1].content).toContain('"window": "3 pm–4 pm"');
+    expect(messages[1].content).toContain('"timezone": "Asia/Kolkata"');
     expect(messages[0].content).toContain("Only make a best-time recommendation when `bestReachWindow` is non-null");
   });
 

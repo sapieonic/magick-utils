@@ -5,22 +5,36 @@
 
 import type { ReachByTimeOfDay, ReachCell } from "@/lib/server/types";
 
-/** Indexed by `getUTCDay()` (0=Sun…6=Sat). */
+/** Indexed by IST weekday (0=Sun…6=Sat). */
 export const WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 /** Display order for the heatmap rows — Monday-first reads better for campaigns. */
 export const WEEKDAY_ROW_ORDER = [1, 2, 3, 4, 5, 6, 0];
 
-function hourLabel(h: number): string {
+export function hourLabel(h: number): string {
   const hour = ((h % 24) + 24) % 24;
   if (hour === 0) return "12 am";
   if (hour === 12) return "12 pm";
   return hour < 12 ? `${hour} am` : `${hour - 12} pm`;
 }
 
+/** Compact hour tick for the 24-column heatmap, e.g. 15 → "3p". */
+export function hourLabelCompact(h: number): string {
+  const hour = ((h % 24) + 24) % 24;
+  if (hour === 0) return "12a";
+  if (hour === 12) return "12p";
+  return hour < 12 ? `${hour}a` : `${hour - 12}p`;
+}
+
 /** Label for an hour-band, e.g. band 3 with bandHours 3 → "9 am–12 pm". */
 export function formatBand(band: number, bandHours: number): string {
   const start = band * bandHours;
   return `${hourLabel(start)}–${hourLabel(start + bandHours)}`;
+}
+
+/** Column header: a single hour ("3 pm") when bands are hourly, otherwise the range. */
+export function formatBandHeader(band: number, bandHours: number): string {
+  if (bandHours === 1) return hourLabelCompact(band);
+  return formatBand(band, bandHours);
 }
 
 /** Human day range from a set of weekday indices: contiguous runs collapse to

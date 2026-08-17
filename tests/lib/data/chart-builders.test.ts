@@ -59,10 +59,10 @@ describe("callsOverTime", () => {
     expect(callsOverTime()).toEqual(callsOverTime());
   });
 
-  it("ends on the current UTC date", () => {
+  it("ends on the current IST date", () => {
     const series = callsOverTime();
     expect(series[series.length - 1].date).toBe(
-      new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" }),
+      new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "Asia/Kolkata" }),
     );
   });
 });

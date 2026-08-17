@@ -39,7 +39,7 @@ describe("POST /api/dashboard", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getDashboardVolume).mockResolvedValue({
-      timezone: "UTC",
+      timezone: "Asia/Kolkata",
       range: "Last 7 days",
       start: "2026-08-06T00:00:00.000Z",
       end: "2026-08-12T12:00:00.000Z",
@@ -57,7 +57,7 @@ describe("POST /api/dashboard", () => {
     const { POST } = await import("@/app/api/dashboard/route");
     const res = await POST(request({ range: "Last 7 days" }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toMatchObject({ volume: { totalRecords: 3, timezone: "UTC" } });
+    await expect(res.json()).resolves.toMatchObject({ volume: { totalRecords: 3, timezone: "Asia/Kolkata" } });
     expect(getDashboardVolume).toHaveBeenCalledWith("t1", "a1", "Last 7 days", expect.any(Date), expect.any(Date));
   });
 });

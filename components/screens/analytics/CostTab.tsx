@@ -13,6 +13,7 @@ import {
 } from "@/lib/chart-axis";
 import type { Batch, Currency } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
+import { APP_TIMEZONE_LABEL } from "@/lib/timezone";
 import { Legend } from "./Legend";
 
 type CostTipPayload = { name?: string; value?: number; color?: string };
@@ -36,7 +37,7 @@ export function CostTab({ targets, currency, analytics }: { targets: Batch[]; cu
         <CostStat label="Telephony / delivery" value={fmtMoney(tel, currency)} sub={`${total ? Math.round((tel / total) * 100) : 0}% of spend`} color="var(--accent)" />
         <CostStat label="AI processing" value={fmtMoney(ai, currency)} sub={`${total ? Math.round((ai / total) * 100) : 0}% of spend`} color="#8b3fd6" />
       </div>
-      <ChartCard title="Cost over time" subtitle="Telephony vs AI processing" action={<Legend items={[{ c: "var(--accent)", l: "Telephony" }, { c: "#c4b5fd", l: "AI" }]} />}>
+      <ChartCard title="Cost over time" subtitle={`Telephony vs AI processing · times in ${APP_TIMEZONE_LABEL}`} action={<Legend items={[{ c: "var(--accent)", l: "Telephony" }, { c: "#c4b5fd", l: "AI" }]} />}>
         <div style={{ height: 280 }}>
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={data} margin={{ ...VOLUME_CHART_MARGIN }}>

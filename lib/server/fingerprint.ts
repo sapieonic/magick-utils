@@ -16,7 +16,7 @@ export function batchSetKey(batchIds: string[]): string {
 /** Version tag for the aggregates cache shape / status vocabulary. Bump this when
  *  the way aggregates are computed changes (e.g. status bucketing) so stale cached
  *  AggregatesDocs are bypassed automatically rather than served until manual refresh. */
-const AGGREGATES_VERSION = "v5"; // v5: volume/reach use placed/sent activity time
+const AGGREGATES_VERSION = "v6"; // v6: IST buckets + hourly connectivity heatmap
 
 /** Cache key for precomputed aggregates. Separate from batchSetKey so the insight
  *  cache (keyed on the bare batchSetKey) is unaffected by aggregate-shape bumps. */

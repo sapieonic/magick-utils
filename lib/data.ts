@@ -14,6 +14,15 @@ import type {
   Workspace,
   Currency,
 } from "./types";
+import {
+  APP_TIMEZONE,
+  addAppDays,
+  formatAppDate,
+  formatAppDateTime,
+  fromAppTimeParts,
+  getAppTimeParts,
+  startOfAppDay,
+} from "./timezone";
 
 // ---- seeded RNG so data is stable across reloads ----
 function mulberry32(a: number) {
@@ -97,10 +106,9 @@ export const WORKSPACES: Workspace[] = [
 
 // ---- generate campaigns ----
 function daysAgoISO(d: number) {
-  const dt = new Date();
-  dt.setUTCHours(10, 0, 0, 0);
-  dt.setUTCDate(dt.getUTCDate() - d);
-  return dt.toISOString();
+  const start = addAppDays(startOfAppDay(new Date()), -d);
+  const parts = getAppTimeParts(start);
+  return fromAppTimeParts(parts.year, parts.month, parts.date, 10).toISOString();
 }
 
 function buildBreakdown(channel: Channel, total: number) {
@@ -213,13 +221,11 @@ export function callsOverTime(days = 30) {
   const r = mulberry32(7788);
   const out: { date: string; calls: number; messages: number }[] = [];
   for (let d = Math.max(1, days) - 1; d >= 0; d--) {
-    const dt = new Date();
-    dt.setUTCHours(0, 0, 0, 0);
-    dt.setUTCDate(dt.getUTCDate() - d);
-    const weekday = dt.getUTCDay();
+    const dt = addAppDays(startOfAppDay(new Date()), -d);
+    const weekday = getAppTimeParts(dt).weekday;
     const weekendDip = weekday === 0 || weekday === 6 ? 0.5 : 1;
     out.push({
-      date: dt.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" }),
+      date: formatAppDate(dt),
       calls: Math.round((1200 + r() * 2600) * weekendDip),
       messages: Math.round((2600 + r() * 5200) * weekendDip),
     });
@@ -351,36 +357,37 @@ export function mockDashboardQuality() {
 
 // Mock best-time-to-reach matrix (feature 4b) — used when the backend is off so
 // the heatmap renders in demo mode. Mirrors the real `ReachByTimeOfDay` shape
-// from lib/server/types.ts; weekday is getUTCDay() (0=Sun…6=Sat), bands are
-// 3h-wide. Daytime bands carry real volume; nights are sparse / low-sample.
+// from lib/server/types.ts; weekday is IST (0=Sun…6=Sat), bands are hourly.
+// Daytime hours carry real volume; nights are sparse / low-sample.
 export function reachHeatmapMock() {
   const r = mulberry32(5150);
-  const bands = [2, 3, 4, 5, 6]; // 6am–9pm, the outbound window
+  const hours = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]; // 8am–8pm IST outbound window
   const cells: { weekday: number; band: number; total: number; reached: number; rate: number; lowSample: boolean }[] = [];
   let totalPlaced = 0;
   for (let weekday = 0; weekday < 7; weekday++) {
     const weekend = weekday === 0 || weekday === 6;
-    for (const band of bands) {
-      // Midday (bands 3–4) and Tue–Thu peak; weekends + early/late dip.
-      const peak = (band === 3 || band === 4 ? 1 : 0.7) * (weekday >= 2 && weekday <= 4 ? 1 : 0.85) * (weekend ? 0.45 : 1);
-      const total = Math.round((weekend ? 8 : 60 + r() * 220) * (band === 2 || band === 6 ? 0.4 : 1));
+    for (const hour of hours) {
+      // Late morning / early afternoon and Tue–Thu peak; weekends + early/late dip.
+      const midday = hour >= 10 && hour <= 16;
+      const peak = (midday ? 1 : 0.7) * (weekday >= 2 && weekday <= 4 ? 1 : 0.85) * (weekend ? 0.45 : 1);
+      const total = Math.round((weekend ? 8 : 28 + r() * 90) * (hour === 8 || hour === 19 ? 0.45 : 1));
       const rate = Math.min(0.92, Math.max(0.18, 0.4 * peak + r() * 0.22));
       const reached = Math.round(total * rate);
-      cells.push({ weekday, band, total, reached, rate: total > 0 ? reached / total : 0, lowSample: total < 20 });
+      cells.push({ weekday, band: hour, total, reached, rate: total > 0 ? reached / total : 0, lowSample: total < 20 });
       totalPlaced += total;
     }
   }
-  return { timezone: "UTC" as const, bandHours: 3, minSamples: 20, totalPlaced, cells };
+  return { timezone: APP_TIMEZONE, bandHours: 1, minSamples: 20, totalPlaced, cells };
 }
 
 export function costBreakdown() {
   const r = mulberry32(9091);
   const out: { date: string; telephony: number; ai: number }[] = [];
+  const end = fromAppTimeParts(2026, 5, 9);
   for (let d = 11; d >= 0; d--) {
-    const dt = new Date("2026-06-09");
-    dt.setDate(dt.getDate() - d * 2);
+    const dt = addAppDays(end, -d * 2);
     out.push({
-      date: dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      date: formatAppDate(dt),
       telephony: Math.round(8000 + r() * 14000),
       ai: Math.round(3000 + r() * 9000),
     });
@@ -526,7 +533,7 @@ export function fmtPct(x: number) {
   return (x * 100).toFixed(1) + "%";
 }
 export function fmtDate(iso: string) {
-  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  return formatAppDateTime(iso);
 }
 export function fmtDuration(s: number | null | undefined) {
   if (s == null) return "—";

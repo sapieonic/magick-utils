@@ -28,20 +28,20 @@ function campaign(over: Partial<Batch>): Batch {
 describe("dashboard date ranges", () => {
   const now = new Date("2026-08-12T12:00:00Z");
 
-  it("uses inclusive UTC starts for rolling ranges", () => {
-    expect(rangeStart("Last 7 days", now)?.toISOString()).toBe("2026-08-06T00:00:00.000Z");
-    expect(inDashboardRange("2026-08-06T00:00:00Z", "Last 7 days", now)).toBe(true);
-    expect(inDashboardRange("2026-08-05T23:59:59Z", "Last 7 days", now)).toBe(false);
+  it("uses inclusive IST starts for rolling ranges", () => {
+    expect(rangeStart("Last 7 days", now)?.toISOString()).toBe("2026-08-05T18:30:00.000Z");
+    expect(inDashboardRange("2026-08-05T18:30:00Z", "Last 7 days", now)).toBe(true);
+    expect(inDashboardRange("2026-08-05T18:29:59Z", "Last 7 days", now)).toBe(false);
     expect(inDashboardRange("2026-08-13T00:00:00Z", "Last 7 days", now)).toBe(false);
   });
 
-  it("starts This quarter on the UTC quarter boundary", () => {
-    expect(rangeStart("This quarter", now)?.toISOString()).toBe("2026-07-01T00:00:00.000Z");
+  it("starts This quarter on the IST quarter boundary", () => {
+    expect(rangeStart("This quarter", now)?.toISOString()).toBe("2026-06-30T18:30:00.000Z");
   });
 
   it("fills missing bounded days with explicit zeroes", () => {
     const points = fillDashboardDays({
-      timezone: "UTC",
+      timezone: "Asia/Kolkata",
       range: "Last 7 days",
       start: "2026-08-10T00:00:00.000Z",
       end: "2026-08-12T12:00:00.000Z",
@@ -144,5 +144,13 @@ describe("dashboardVolumeFromCampaigns", () => {
       { stage: "Replied", value: 0 },
     ]);
     expect(volume.voiceConnectMix).toEqual([]);
+  });
+
+  it("buckets a late-UTC campaign onto the next IST calendar day", () => {
+    const volume = dashboardVolumeFromCampaigns([
+      campaign({ date: "2026-08-02T20:00:00.000Z", total: 10, breakdown: [{ key: "completed", value: 10 }] }),
+    ], "Last 30 days", now);
+    expect(volume.points).toEqual([{ date: "2026-08-03", calls: 10, messages: 0 }]);
+    expect(volume.timezone).toBe("Asia/Kolkata");
   });
 });

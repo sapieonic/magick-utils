@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { bestReachWindow, formatBand, formatDayRange, reachLowSampleRatio } from "@/lib/reach";
+import { bestReachWindow, formatBand, formatBandHeader, formatDayRange, hourLabelCompact, reachLowSampleRatio } from "@/lib/reach";
 import type { ReachByTimeOfDay, ReachCell } from "@/lib/server/types";
 
 function cell(weekday: number, band: number, total: number, reached: number, minSamples = 20): ReachCell {
@@ -7,7 +7,7 @@ function cell(weekday: number, band: number, total: number, reached: number, min
 }
 
 function reach(cells: ReachCell[], over: Partial<ReachByTimeOfDay> = {}): ReachByTimeOfDay {
-  return { timezone: "UTC", bandHours: 3, minSamples: 20, totalPlaced: cells.reduce((a, c) => a + c.total, 0), cells, ...over };
+  return { timezone: "Asia/Kolkata", bandHours: 1, minSamples: 20, totalPlaced: cells.reduce((a, c) => a + c.total, 0), cells, ...over };
 }
 
 describe("formatBand", () => {
@@ -16,6 +16,20 @@ describe("formatBand", () => {
     expect(formatBand(0, 3)).toBe("12 am–3 am");
     expect(formatBand(4, 3)).toBe("12 pm–3 pm");
     expect(formatBand(7, 3)).toBe("9 pm–12 am");
+  });
+
+  it("labels hourly bands as a one-hour window", () => {
+    expect(formatBand(15, 1)).toBe("3 pm–4 pm");
+    expect(formatBand(0, 1)).toBe("12 am–1 am");
+    expect(formatBand(23, 1)).toBe("11 pm–12 am");
+  });
+});
+
+describe("formatBandHeader", () => {
+  it("uses a compact hour tick for hourly columns", () => {
+    expect(formatBandHeader(15, 1)).toBe("3p");
+    expect(hourLabelCompact(0)).toBe("12a");
+    expect(formatBandHeader(3, 3)).toBe("9 am–12 pm");
   });
 });
 
@@ -40,21 +54,21 @@ describe("bestReachWindow", () => {
 
   it("never recommends a high-rate low-sample cell over a confident one", () => {
     const r = reach([
-      cell(1, 3, 2, 2), // 100% but only 2 calls → lowSample
-      cell(2, 3, 100, 70), // 70% confident
-      cell(3, 3, 100, 68), // 68% confident
+      cell(1, 15, 2, 2), // 100% but only 2 calls → lowSample
+      cell(2, 15, 100, 70), // 70% confident
+      cell(3, 15, 100, 68), // 68% confident
     ]);
     const win = bestReachWindow(r)!;
     expect(win.rate).toBeCloseTo(0.7, 5);
     expect(win.weekday).toBe(2);
-    expect(win.bandLabel).toBe("9 am–12 pm");
+    expect(win.bandLabel).toBe("3 pm–4 pm");
   });
 
   it("expresses a multi-day window when neighbours at the same band are strong", () => {
     const r = reach([
-      cell(2, 3, 100, 75),
-      cell(3, 3, 100, 72),
-      cell(5, 1, 100, 40), // pulls the mean down; different band
+      cell(2, 15, 100, 75),
+      cell(3, 15, 100, 72),
+      cell(5, 9, 100, 40), // pulls the mean down; different band
     ]);
     const win = bestReachWindow(r)!;
     expect(win.dayRange).toBe("Tue–Wed");
