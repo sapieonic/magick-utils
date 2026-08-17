@@ -54,11 +54,12 @@ Typical flow: log in → pick workspace → `GET /api/campaigns` → `POST /api/
 poll `GET /api/jobs/:id` → then `analytics` / `insights` / `export` work against the ingested records.
 
 ## Scheduled cleanup
-`POST /api/cron/cleanup` prunes regenerable/derived data so the MongoDB Atlas free tier stays small:
-cached **aggregates** > 7 days (recomputed on next analytics request), terminal (done/error) **jobs** >
-1 day (live jobs are untouched; this also clears their stored idTokens), and cached **insights** > 30 days
-(regen costs an LLM call, hence the longer window). `records` and `batches` are left alone — `records` is
-the largest collection but dropping it forces a re-ingest, so it needs a separate usage-based policy.
+`POST /api/cron/cleanup` enforces a strict five-day retention window across persisted application data
+so the MongoDB Atlas free tier stays small. It removes cached **aggregates**, all **jobs**, and cached
+**insights** after five days. It also deletes every source **batch** older than five days together with
+all normalized **records** owned by that batch, and removes retired record revisions after five days.
+The batch's immutable upstream creation date is the retention clock, so listing campaigns again cannot
+extend the lifetime of old data.
 
 The endpoint runs without a user session, guarded by a shared Bearer secret (`CRON_SECRET`). It's driven
 by a daily GitHub Actions cron (`.github/workflows/cleanup.yml`) for the `production` and `dedicated`
