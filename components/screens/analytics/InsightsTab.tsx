@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button, Icon, Spinner, cx } from "@/components/ui";
-import { SEL_LABEL, selType } from "@/lib/data";
+import { SEL_LABEL, reachHeatmapMock, selType } from "@/lib/data";
 import { compareInsights, generateInsights, getAnalytics, listCampaigns } from "@/lib/api";
 import { diffAggregates } from "@/lib/diff";
 import type { Batch, Currency } from "@/lib/types";
@@ -105,7 +105,7 @@ export function InsightsTab({
   );
   const compareMode = baselineId != null;
 
-  const reach = analytics?.reachByTimeOfDay;
+  const reach = analytics?.reachByTimeOfDay ?? (analytics == null ? reachHeatmapMock() : undefined);
   const effectiveGen = analytics ? gen : dataLoading ? "loading" : "error";
   const effectiveGenError = analytics
     ? genError
