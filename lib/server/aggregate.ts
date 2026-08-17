@@ -1,6 +1,16 @@
 // Compute analytics aggregates from normalized records. Pure functions; the
 // route handler persists the result to the `aggregates` collection.
 
+import {
+  APP_TIMEZONE,
+  formatAppDate,
+  formatAppTime,
+  getAppTimeParts,
+  sameAppDay,
+  startOfAppDay,
+  startOfAppHour,
+  startOfAppMinute,
+} from "@/lib/timezone";
 import type { AggregatesDoc, NormalizedRecord, TenantContext } from "./types";
 import { normalizeStatus } from "./normalize";
 
@@ -18,7 +28,7 @@ function dayLabel(iso: string | null | undefined): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+  return formatAppDate(d);
 }
 
 type TimeGranularity = "minute" | "hour" | "day";
@@ -43,14 +53,6 @@ function activityTime(r: NormalizedRecord): string | null | undefined {
   return r.activityTimestamp ?? r.timestamp;
 }
 
-function sameUtcDay(a: Date, b: Date): boolean {
-  return (
-    a.getUTCFullYear() === b.getUTCFullYear() &&
-    a.getUTCMonth() === b.getUTCMonth() &&
-    a.getUTCDate() === b.getUTCDate()
-  );
-}
-
 function dateRange(dates: Date[]): { min: number; max: number } | null {
   if (dates.length === 0) return null;
   let min = dates[0].getTime();
@@ -69,16 +71,14 @@ function chooseTimeGranularity(dates: Date[]): TimeGranularity {
   const { min, max } = range;
   const start = new Date(min);
   const end = new Date(max);
-  if (!sameUtcDay(start, end)) return "day";
+  if (!sameAppDay(start, end)) return "day";
   return max - min <= SHORT_WINDOW_MS ? "minute" : "hour";
 }
 
 function bucketStart(d: Date, granularity: TimeGranularity): Date {
-  const start = new Date(d);
-  start.setUTCSeconds(0, 0);
-  if (granularity === "hour" || granularity === "day") start.setUTCMinutes(0, 0, 0);
-  if (granularity === "day") start.setUTCHours(0, 0, 0, 0);
-  return start;
+  if (granularity === "day") return startOfAppDay(d);
+  if (granularity === "hour") return startOfAppHour(d);
+  return startOfAppMinute(d);
 }
 
 function bucketStepMs(granularity: TimeGranularity): number {
@@ -88,8 +88,8 @@ function bucketStepMs(granularity: TimeGranularity): number {
 }
 
 function bucketLabel(d: Date, granularity: TimeGranularity): string {
-  if (granularity === "minute") return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "UTC" });
-  if (granularity === "hour") return d.toLocaleTimeString("en-US", { hour: "numeric", timeZone: "UTC" });
+  if (granularity === "minute") return formatAppTime(d, { minute: true });
+  if (granularity === "hour") return formatAppTime(d);
   return dayLabel(d.toISOString());
 }
 
@@ -134,29 +134,31 @@ function durationBucket(sec: number): string {
 /** Best-time-to-reach (feature 4b): hour-band width and the per-cell sample
  *  gate below which a cell is flagged `lowSample` and never recommended.
  *  Tunable here — revisit from the "insufficient data" rate in production. */
-export const REACH_BAND_HOURS = 3; // 8 bands/day
+export const REACH_BAND_HOURS = 1; // 24 hourly columns
 export const REACH_MIN_SAMPLES = 20;
 
-/** Whether a status bucket counts as "reached" — the identical rule the
- *  successRate definition below applies (`completed` for calls, `read` for
- *  messages), so the heatmap and the headline success rate score outcomes the
- *  same way. (The heatmap only counts records with a parseable timestamp, so
- *  its reached-total can trail successRate*total when timestamps are missing.) */
+/** Whether a status bucket counts as connected / reached — the identical rule
+ *  the successRate definition below applies (`completed` for calls, `read` for
+ *  messages), so the heatmap's connectivity % and the headline success rate
+ *  score outcomes the same way. (The heatmap only counts records with a
+ *  parseable timestamp, so its reached-total can trail successRate*total when
+ *  timestamps are missing.) */
 function isReached(bucket: string): boolean {
   return bucket === "completed" || bucket === "read";
 }
 
-/** Build the weekday × hour-band answer/read-rate matrix from records that
- *  carry a usable timestamp. UTC in v1 (reuses `parseTimestamp`); sparse —
- *  only weekday×band combinations with at least one record are emitted. */
+/** Build the weekday × hour connectivity/read-rate matrix from records that
+ *  carry a usable timestamp. Buckets are IST (reuses `parseTimestamp`); sparse
+ *  — only weekday×band combinations with at least one record are emitted. */
 function computeReachByTimeOfDay(records: NormalizedRecord[]): AggregatesDoc["reachByTimeOfDay"] {
   const cells = new Map<string, { weekday: number; band: number; total: number; reached: number }>();
   let totalPlaced = 0;
   for (const r of records) {
     const parsed = parseTimestamp(activityTime(r));
     if (!parsed) continue;
-    const weekday = parsed.getUTCDay();
-    const band = Math.floor(parsed.getUTCHours() / REACH_BAND_HOURS);
+    const parts = getAppTimeParts(parsed);
+    const weekday = parts.weekday;
+    const band = Math.floor(parts.hours / REACH_BAND_HOURS);
     const key = `${weekday}:${band}`;
     const cell = cells.get(key) ?? { weekday, band, total: 0, reached: 0 };
     cell.total += 1;
@@ -165,7 +167,7 @@ function computeReachByTimeOfDay(records: NormalizedRecord[]): AggregatesDoc["re
     totalPlaced += 1;
   }
   return {
-    timezone: "UTC",
+    timezone: APP_TIMEZONE,
     bandHours: REACH_BAND_HOURS,
     minSamples: REACH_MIN_SAMPLES,
     totalPlaced,

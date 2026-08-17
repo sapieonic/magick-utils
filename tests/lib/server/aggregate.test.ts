@@ -70,15 +70,17 @@ describe("computeAggregates — reachByTimeOfDay (best-time-to-reach, 4b)", () =
       status: rawStatus, timestamp: iso, raw: { status: rawStatus },
     } as NormalizedRecord;
   }
-  // 2026-06-23 is a Tuesday (getUTCDay() === 2); 10:00 UTC → band 3 (9–12).
+  // 2026-06-23 is a Tuesday; 10:00 UTC → 15:30 IST → hourly band 15 (3–4 pm).
   const tuesday10 = (n: number, completed: number) => [
     ...Array.from({ length: completed }, () => tsRec("2026-06-23T10:00:00Z", "completed")),
     ...Array.from({ length: n - completed }, () => tsRec("2026-06-23T10:00:00Z", "no_answer")),
   ];
 
-  it("buckets records into the correct weekday × hour-band cell", () => {
+  it("buckets records into the correct weekday × hour cell in IST", () => {
     const agg = computeAggregates(tuesday10(40, 30), ["b1"], ctx, "k");
-    const cell = agg.reachByTimeOfDay!.cells.find((c) => c.weekday === 2 && c.band === 3)!;
+    expect(agg.reachByTimeOfDay!.timezone).toBe("Asia/Kolkata");
+    expect(agg.reachByTimeOfDay!.bandHours).toBe(1);
+    const cell = agg.reachByTimeOfDay!.cells.find((c) => c.weekday === 2 && c.band === 15)!;
     expect(cell.total).toBe(40);
     expect(cell.reached).toBe(30);
     expect(cell.rate).toBeCloseTo(0.75, 5);
@@ -122,8 +124,8 @@ describe("computeAggregates — reachByTimeOfDay (best-time-to-reach, 4b)", () =
     }));
     const agg = computeAggregates(records, ["b1"], ctx, "k");
     expect(agg.reachByTimeOfDay!.cells).toEqual([
-      expect.objectContaining({ weekday: 2, band: 3, total: 25 }),
+      expect.objectContaining({ weekday: 2, band: 15, total: 25 }),
     ]);
-    expect(agg.volumeOverTime).toEqual([{ date: "10:00 AM", calls: 25, messages: 0 }]);
+    expect(agg.volumeOverTime).toEqual([{ date: "3:30 PM", calls: 25, messages: 0 }]);
   });
 });

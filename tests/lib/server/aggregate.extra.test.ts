@@ -208,18 +208,20 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     const a = agg(records);
 
     expect(a.volumeOverTime).toEqual([
-      { date: "10 AM", calls: 2, messages: 0 },
-      { date: "11 AM", calls: 0, messages: 0 },
-      { date: "12 PM", calls: 0, messages: 0 },
-      { date: "1 PM", calls: 0, messages: 0 },
-      { date: "2 PM", calls: 0, messages: 1 },
+      { date: "3 PM", calls: 2, messages: 0 },
+      { date: "4 PM", calls: 0, messages: 0 },
+      { date: "5 PM", calls: 0, messages: 0 },
+      { date: "6 PM", calls: 0, messages: 0 },
+      { date: "7 PM", calls: 0, messages: 0 },
+      { date: "8 PM", calls: 0, messages: 1 },
     ]);
     expect(a.costOverTime).toEqual([
-      { date: "10 AM", telephony: 6, ai: 3 },
-      { date: "11 AM", telephony: 0, ai: 0 },
-      { date: "12 PM", telephony: 0, ai: 0 },
-      { date: "1 PM", telephony: 0, ai: 0 },
-      { date: "2 PM", telephony: 0, ai: 3 },
+      { date: "3 PM", telephony: 6, ai: 3 },
+      { date: "4 PM", telephony: 0, ai: 0 },
+      { date: "5 PM", telephony: 0, ai: 0 },
+      { date: "6 PM", telephony: 0, ai: 0 },
+      { date: "7 PM", telephony: 0, ai: 0 },
+      { date: "8 PM", telephony: 0, ai: 3 },
     ]);
   });
 
@@ -231,26 +233,27 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     const a = agg(records);
 
     expect(a.volumeOverTime).toEqual([
-      { date: "10:00 AM", calls: 1, messages: 0 },
-      { date: "10:01 AM", calls: 0, messages: 0 },
-      { date: "10:02 AM", calls: 1, messages: 0 },
+      { date: "3:30 PM", calls: 1, messages: 0 },
+      { date: "3:31 PM", calls: 0, messages: 0 },
+      { date: "3:32 PM", calls: 1, messages: 0 },
     ]);
   });
 
-  it("uses UTC buckets regardless of the server process timezone", () => {
+  it("uses IST buckets regardless of the server process timezone", () => {
     const previousTz = process.env.TZ;
-    process.env.TZ = "Asia/Kolkata";
+    process.env.TZ = "UTC";
     try {
       const a = agg([
         makeRecord({ timestamp: utcIso(20, 0), raw: { status: "completed" } }),
         makeRecord({ timestamp: utcIso(23, 0), raw: { status: "failed" } }),
       ]);
 
+      // 20:00 and 23:00 UTC on Jan 1 are 1:30 AM and 4:30 AM IST on Jan 2.
       expect(a.volumeOverTime).toEqual([
-        { date: "8 PM", calls: 1, messages: 0 },
-        { date: "9 PM", calls: 0, messages: 0 },
-        { date: "10 PM", calls: 0, messages: 0 },
-        { date: "11 PM", calls: 1, messages: 0 },
+        { date: "1 AM", calls: 1, messages: 0 },
+        { date: "2 AM", calls: 0, messages: 0 },
+        { date: "3 AM", calls: 0, messages: 0 },
+        { date: "4 AM", calls: 1, messages: 0 },
       ]);
     } finally {
       if (previousTz == null) delete process.env.TZ;
@@ -258,9 +261,9 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     }
   });
 
-  it("treats offset-less ISO date-times as UTC", () => {
+  it("treats offset-less ISO date-times as UTC instants, then labels them in IST", () => {
     const previousTz = process.env.TZ;
-    process.env.TZ = "Asia/Kolkata";
+    process.env.TZ = "UTC";
     try {
       const a = agg([
         makeRecord({ timestamp: "2026-01-01T20:00:00", raw: { status: "completed" } }),
@@ -268,10 +271,10 @@ describe("computeAggregates — volume & cost over time grouping", () => {
       ]);
 
       expect(a.volumeOverTime).toEqual([
-        { date: "8 PM", calls: 1, messages: 0 },
-        { date: "9 PM", calls: 0, messages: 0 },
-        { date: "10 PM", calls: 0, messages: 0 },
-        { date: "11 PM", calls: 1, messages: 0 },
+        { date: "1 AM", calls: 1, messages: 0 },
+        { date: "2 AM", calls: 0, messages: 0 },
+        { date: "3 AM", calls: 0, messages: 0 },
+        { date: "4 AM", calls: 1, messages: 0 },
       ]);
     } finally {
       if (previousTz == null) delete process.env.TZ;
@@ -279,9 +282,9 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     }
   });
 
-  it("treats offset-less SQL-style date-times as UTC", () => {
+  it("treats offset-less SQL-style date-times as UTC instants, then labels them in IST", () => {
     const previousTz = process.env.TZ;
-    process.env.TZ = "Asia/Kolkata";
+    process.env.TZ = "UTC";
     try {
       const a = agg([
         makeRecord({ timestamp: "2026-01-01 20:00:00", raw: { status: "completed" } }),
@@ -289,10 +292,10 @@ describe("computeAggregates — volume & cost over time grouping", () => {
       ]);
 
       expect(a.volumeOverTime).toEqual([
-        { date: "8 PM", calls: 1, messages: 0 },
-        { date: "9 PM", calls: 0, messages: 0 },
-        { date: "10 PM", calls: 0, messages: 0 },
-        { date: "11 PM", calls: 1, messages: 0 },
+        { date: "1 AM", calls: 1, messages: 0 },
+        { date: "2 AM", calls: 0, messages: 0 },
+        { date: "3 AM", calls: 0, messages: 0 },
+        { date: "4 AM", calls: 1, messages: 0 },
       ]);
     } finally {
       if (previousTz == null) delete process.env.TZ;
@@ -307,8 +310,8 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     ]);
 
     expect(a.volumeOverTime).toHaveLength(121);
-    expect(a.volumeOverTime![0]).toEqual({ date: "10:00 AM", calls: 1, messages: 0 });
-    expect(a.volumeOverTime![120]).toEqual({ date: "12:00 PM", calls: 1, messages: 0 });
+    expect(a.volumeOverTime![0]).toEqual({ date: "3:30 PM", calls: 1, messages: 0 });
+    expect(a.volumeOverTime![120]).toEqual({ date: "5:30 PM", calls: 1, messages: 0 });
   });
 
   it("switches from minute to hourly buckets above the short-window threshold", () => {
@@ -318,9 +321,9 @@ describe("computeAggregates — volume & cost over time grouping", () => {
     ]);
 
     expect(a.volumeOverTime).toEqual([
-      { date: "10 AM", calls: 1, messages: 0 },
-      { date: "11 AM", calls: 0, messages: 0 },
-      { date: "12 PM", calls: 1, messages: 0 },
+      { date: "3 PM", calls: 1, messages: 0 },
+      { date: "4 PM", calls: 0, messages: 0 },
+      { date: "5 PM", calls: 1, messages: 0 },
     ]);
   });
 

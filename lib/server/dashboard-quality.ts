@@ -8,6 +8,7 @@
 // signal.
 
 import { normalizeStatus } from "@/lib/server/normalize";
+import { APP_TIMEZONE } from "@/lib/timezone";
 import type {
   DashboardVolume,
   IvrDropoff,
@@ -143,7 +144,7 @@ export function emptyDashboardVolume(
   end: Date,
 ): DashboardVolume {
   return {
-    timezone: "UTC",
+    timezone: APP_TIMEZONE,
     range,
     start: start?.toISOString() ?? null,
     end: end.toISOString(),

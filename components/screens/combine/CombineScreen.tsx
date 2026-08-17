@@ -26,6 +26,7 @@ import {
 } from "@/lib/data";
 import { createIngestJob, downloadCsv, getJob, isJobNotFound, jobProgressPercent, listCampaigns } from "@/lib/api";
 import { useApp } from "@/lib/store";
+import { formatAppClock } from "@/lib/timezone";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
 
 import { ColumnPicker, relevantGroups } from "./ColumnPicker";
@@ -562,7 +563,7 @@ export function CombineScreen() {
                         <Icon name="Clock3" size={15} className="mt-0.5 shrink-0" />
                         <span>
                           Rate limit reached. This job will retry automatically at{" "}
-                          {new Date(rateLimitRetryAt).toLocaleTimeString()}. You can refresh this page;
+                          {formatAppClock(rateLimitRetryAt)} IST. You can refresh this page;
                           the merge will resume.
                         </span>
                       </div>

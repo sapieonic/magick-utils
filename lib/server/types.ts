@@ -2,6 +2,7 @@
 // worker, and route handlers all agree on these shapes.
 
 import type { BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
+import type { AppTimezone } from "@/lib/timezone";
 
 /** The authenticated tenant/account context derived from the session cookie. */
 export interface TenantContext {
@@ -153,25 +154,26 @@ export interface AiUsageWindow {
   expiresAt: Date;
 }
 
-/** One weekday×hour-band cell of the best-time-to-reach matrix (feature 4b).
- *  `weekday` is UTC `getUTCDay()` (0=Sun…6=Sat); `band` indexes fixed-width
- *  hour bands (`band * bandHours`–`(band+1) * bandHours`, UTC). A cell with
- *  `total < minSamples` is flagged `lowSample` and excluded from "best window"
- *  selection so we never recommend off a handful of records. */
+/** One weekday×hour cell of the best-time-to-reach matrix (feature 4b).
+ *  `weekday` is IST `getUTCDay()` on the +05:30-shifted instant (0=Sun…6=Sat);
+ *  `band` indexes fixed-width hour bands (`band * bandHours`–`(band+1) *
+ *  bandHours`, IST). A cell with `total < minSamples` is flagged `lowSample`
+ *  and excluded from "best window" selection so we never recommend off a
+ *  handful of records. */
 export interface ReachCell {
-  weekday: number; // 0–6 (UTC)
+  weekday: number; // 0–6 (IST)
   band: number; // 0…(24/bandHours - 1)
   total: number; // records placed in this window
-  reached: number; // records that were a success (completed / read)
-  rate: number; // reached / total (0 when total is 0)
+  reached: number; // connected / read records (completed for voice, read for messages)
+  rate: number; // reached / total (0 when total is 0) — connectivity % for voice
   lowSample: boolean; // total < minSamples
 }
 
-/** Answer/read rate bucketed by weekday × hour-band — the basis for the
- *  best-time-to-reach heatmap and the AI scheduling recommendation. */
+/** Connectivity (voice) / read rate bucketed by weekday × hour — the basis
+ *  for the best-time-to-reach heatmap and the AI scheduling recommendation. */
 export interface ReachByTimeOfDay {
-  timezone: "UTC"; // v1 buckets in UTC; local-tz conversion is a fast-follow
-  bandHours: number; // hour-band width (default 3 → 8 bands)
+  timezone: AppTimezone;
+  bandHours: number; // hour-band width (1 → 24 hourly columns)
   minSamples: number; // sample gate below which a cell is lowSample
   totalPlaced: number; // records with a usable timestamp
   cells: ReachCell[]; // sparse — only weekday×band combos with records
@@ -214,7 +216,7 @@ export interface IvrDropoff {
 }
 
 export interface DashboardVolume {
-  timezone: "UTC";
+  timezone: AppTimezone;
   range: string;
   start: string | null;
   end: string;

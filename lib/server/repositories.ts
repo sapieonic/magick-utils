@@ -28,6 +28,7 @@ import type {
   Job,
   NormalizedRecord,
 } from "@/lib/server/types";
+import { APP_TIMEZONE } from "@/lib/timezone";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -363,7 +364,7 @@ export async function countRecords(
   return col.countDocuments(await publishedRecordsFilter(tenantId, accountId, batchIds));
 }
 
-/** Aggregate true placed/sent activity by UTC day. The fallback to `timestamp`
+/** Aggregate true placed/sent activity by IST day. The fallback to `timestamp`
  * keeps records ingested before activityTimestamp was introduced visible until
  * their next refresh. Work stays in Mongo so an all-time dashboard never loads
  * every normalized record into application memory. */
@@ -567,7 +568,7 @@ export async function getDashboardVolume(
           {
             $group: {
               _id: {
-                date: { $dateToString: { date: "$_eventDate", format: "%Y-%m-%d", timezone: "UTC" } },
+                date: { $dateToString: { date: "$_eventDate", format: "%Y-%m-%d", timezone: APP_TIMEZONE } },
                 status: "$_status",
               },
               calls: { $sum: { $cond: [{ $eq: ["$selType", "message"] }, 0, 1] } },
@@ -757,7 +758,7 @@ export async function getDashboardVolume(
   const quality = assembleDashboardQuality(grouped);
 
   return {
-    timezone: "UTC",
+    timezone: APP_TIMEZONE,
     range,
     start: start?.toISOString() ?? null,
     end: end.toISOString(),

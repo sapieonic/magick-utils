@@ -23,6 +23,7 @@ import { getDashboardVolume, listCampaigns } from "@/lib/api";
 import { inDashboardRange, isDashboardRange, rangeStart, type DashboardRange } from "@/lib/date-range";
 import type { DashboardVolume } from "@/lib/server/types";
 import { dashboardVolumeFromCampaigns, fillDashboardDays } from "@/lib/dashboard";
+import { APP_TIMEZONE_LABEL, formatAppDate, getAppTimeParts, parseAppYmd } from "@/lib/timezone";
 import { FunnelBars } from "@/components/screens/dashboard/FunnelBars";
 import { IvrDropoffCard } from "@/components/screens/dashboard/IvrDropoffCard";
 import { Legend } from "@/components/screens/dashboard/Legend";
@@ -97,11 +98,8 @@ export default function DashboardScreen() {
     }
     return fillDashboardDays(campaignVolume).map((point) => ({
       ...point,
-      date: new Date(`${point.date}T00:00:00Z`).toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-        year: selectedRange === "All time" ? "numeric" : undefined,
-        timeZone: "UTC",
+      date: formatAppDate(parseAppYmd(point.date), {
+        year: selectedRange === "All time",
       }),
     }));
   }, [campaignVolume, selectedRange, source]);
@@ -136,7 +134,7 @@ export default function DashboardScreen() {
   // Greet the signed-in user by first name, time-of-day aware. Falls back to a
   // nameless greeting on the mock/no-backend path where no session user exists.
   const greeting = useMemo(() => {
-    const h = new Date().getHours();
+    const h = getAppTimeParts(new Date()).hours;
     const part = h < 12 ? "morning" : h < 18 ? "afternoon" : "evening";
     const first = user?.name?.trim().split(/\s+/)[0] || user?.email?.split("@")[0];
     return first ? `Good ${part}, ${first} 👋` : `Good ${part} 👋`;
@@ -182,7 +180,7 @@ export default function DashboardScreen() {
         <ChartCard
           className="lg:col-span-2"
           title="Calls & messages over time"
-          subtitle={`Daily volume by campaign start date · ${dateRange.toLowerCase()} · UTC`}
+          subtitle={`Daily volume by campaign start date · ${dateRange.toLowerCase()} · ${APP_TIMEZONE_LABEL}`}
           action={<Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#94a3b8", l: "Messages" }]} />}
         >
           {loading ? (

@@ -171,10 +171,11 @@ describe("fmtPct", () => {
 });
 
 describe("fmtDate", () => {
-  it("formats ISO date as 'Mon D, YYYY'", () => {
+  it("formats ISO date as 'Mon D, YYYY' in IST", () => {
     expect(fmtDate("2026-06-09T10:00:00Z")).toBe("Jun 9, 2026");
     expect(fmtDate("2026-01-01T00:00:00Z")).toBe("Jan 1, 2026");
     expect(fmtDate("2025-12-31T12:00:00Z")).toBe("Dec 31, 2025");
+    expect(fmtDate("2025-12-31T20:00:00Z")).toBe("Jan 1, 2026");
   });
 });
 
