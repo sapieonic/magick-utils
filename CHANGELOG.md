@@ -1,3 +1,10 @@
+## [1.3.2](https://github.com/sapieonic/magick-utils/compare/v1.3.1...v1.3.2) (2026-08-17)
+
+
+### Bug Fixes
+
+* show app version and enforce five-day retention ([#32](https://github.com/sapieonic/magick-utils/issues/32)) ([9ee46ec](https://github.com/sapieonic/magick-utils/commit/9ee46ec6a79823312849e0afd0cf3c7def6a6cf2))
+
 ## [1.3.1](https://github.com/sapieonic/magick-utils/compare/v1.3.0...v1.3.1) (2026-08-13)
 
 
