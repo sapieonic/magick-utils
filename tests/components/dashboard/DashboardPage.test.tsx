@@ -3,10 +3,11 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+const app = vi.hoisted(() => ({ dateRange: "Last 30 days" as string }));
 vi.mock("@/lib/store", () => ({
   useApp: () => ({
     currency: "inr",
-    dateRange: "Last 30 days",
+    dateRange: app.dateRange,
     setAnalyzeTargets: vi.fn(),
     user: { name: "Test User", email: "test@example.com" },
   }),
@@ -36,7 +37,19 @@ const campaign: Batch = {
 };
 
 describe("DashboardScreen campaign volume", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app.dateRange = "Last 30 days";
+  });
+
+  // The campaigns listing caps how many upstream jobs it scans, so filtering
+  // client-side from an unfiltered pull silently truncated long ranges.
+  it("asks for the selected range rather than filtering a capped pull", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(getDashboardVolume).mockResolvedValue(null);
+    render(<DashboardScreen />);
+    await waitFor(() => expect(listCampaigns).toHaveBeenCalledWith("Last 30 days"));
+  });
 
   it("shows campaign-list call volume without waiting on ingested records", async () => {
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
@@ -65,5 +78,41 @@ describe("DashboardScreen campaign volume", () => {
       expect(card).not.toBeNull();
       expect(within(card as HTMLElement).getByText("0")).toBeInTheDocument();
     });
+  });
+});
+
+describe("DashboardScreen range fallback and truncation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app.dateRange = "Last 30 days";
+  });
+
+  // A range this build does not recognise — a sessionStorage value left by an
+  // older one — must widen, not narrow. Falling back to a 30-day window hid
+  // months of campaigns, which is the report this screen exists to have fixed.
+  it("widens an unrecognised range to All time rather than 30 days", async () => {
+    app.dateRange = "Last 90 days (removed)";
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(getDashboardVolume).mockResolvedValue(null);
+    render(<DashboardScreen />);
+    await waitFor(() => expect(listCampaigns).toHaveBeenCalledWith("All time"));
+    await waitFor(() => expect(getDashboardVolume).toHaveBeenCalledWith("All time"));
+  });
+
+  it("labels the stats when the listing stopped at its scan cap", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live", truncated: true });
+    vi.mocked(getDashboardVolume).mockResolvedValue(null);
+    render(<DashboardScreen />);
+    await waitFor(() =>
+      expect(screen.getByText(/more campaigns than one listing can scan/)).toBeInTheDocument(),
+    );
+  });
+
+  it("says nothing about scanning when the whole listing was read", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live", truncated: false });
+    vi.mocked(getDashboardVolume).mockResolvedValue(null);
+    render(<DashboardScreen />);
+    await waitFor(() => expect(listCampaigns).toHaveBeenCalled());
+    expect(screen.queryByText(/more campaigns than one listing can scan/)).not.toBeInTheDocument();
   });
 });

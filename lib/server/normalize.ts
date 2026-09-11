@@ -81,6 +81,20 @@ export function dispatchTypeToType(dispatchType: string | null | undefined): Dis
 // Record normalization
 // ---------------------------------------------------------------------------
 
+/** Fields dropped from the stored `raw` payload because a mapped column
+ *  already carries the same content. `conversation_log` is the expensive one:
+ *  it is the whole transcript, and `transcript` above is built from it, so
+ *  keeping both doubled the storage cost of every voice record. Nothing reads
+ *  arbitrary `raw` keys — only `raw.status`, for status re-derivation. */
+const REDUNDANT_RAW_FIELDS = ["conversation_log"] as const;
+
+/** The upstream payload minus fields a mapped column already duplicates. */
+function compactRaw(raw: Record<string, unknown>): Record<string, unknown> {
+  const compact = { ...raw };
+  for (const field of REDUNDANT_RAW_FIELDS) delete compact[field];
+  return compact;
+}
+
 function transcriptFromLog(
   log: RawCall["conversation_log"],
 ): string | null {
@@ -156,7 +170,7 @@ export function normalizeCall(
     dtmfInput: (raw.dtmf_input as string | null | undefined) ?? null,
     ivrPath: (raw.ivr_path as string | null | undefined) ?? null,
     completedNode: (raw.completed_node as string | null | undefined) ?? null,
-    raw: raw as Record<string, unknown>,
+    raw: compactRaw(raw as Record<string, unknown>),
   };
 }
 
@@ -206,7 +220,7 @@ export function normalizeMessage(
     replyText: raw.reply_text ?? null,
     templateName: raw.template_name ?? null,
     bounceReason,
-    raw: raw as Record<string, unknown>,
+    raw: compactRaw(raw as Record<string, unknown>),
   };
 }
 
@@ -260,6 +274,8 @@ export interface BuildBatchDocOpts {
   date: string; // ISO
   fingerprint: string;
   sourceFingerprint?: string;
+  ingestedSourceFingerprint?: string;
+  ingestedSourceUpdatedAt?: string | null;
   publishedRevision?: string;
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
@@ -315,6 +331,8 @@ export function buildBatchDoc(
     avgTalkTime: isMessage ? null : avg(talkTimes),
     fingerprint: opts.fingerprint,
     sourceFingerprint: opts.sourceFingerprint,
+    ingestedSourceFingerprint: opts.ingestedSourceFingerprint,
+    ingestedSourceUpdatedAt: opts.ingestedSourceUpdatedAt,
     publishedRevision: opts.publishedRevision,
     ingestStatus: opts.ingestStatus ?? "ready",
     updatedAt: new Date().toISOString(),

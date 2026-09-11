@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { bulkJobToBatchDoc } from "@/lib/server/map";
+import { bulkJobIsUnchangedSince, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
 import type { RawBulkJob } from "@/lib/server/magick-client";
 import type { BatchDoc, TenantContext } from "@/lib/server/types";
 
@@ -163,7 +163,7 @@ describe("bulkJobToBatchDoc", () => {
     const committed: BatchDoc = {
       ...source,
       total: 359,
-      ingestStatus: "ready",
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
       publishedRevision: "revision-1",
       fingerprint: "dataset-fp",
     };
@@ -185,9 +185,76 @@ describe("bulkJobToBatchDoc", () => {
       id: "job-stale", dispatch_type: "ai_voice_call", status: "completed",
       total_contacts: 12, updated_at: "2026-08-12T11:00:00Z",
     }, ctx, committed);
-    expect(refreshed.ingestStatus).toBe("none");
+    // "stale", never "none": the published revision is still what every reader
+    // sees, so analytics must keep serving it instead of 409-ing and re-pulling.
+    expect(refreshed.ingestStatus).toBe("stale");
     expect(refreshed.fingerprint).toBe("dataset-fp");
     expect(refreshed.sourceFingerprint).not.toBe(committed.sourceFingerprint);
+    // The ingested record count must not flip back to the raw contact count —
+    // that is what made the header total jump between page loads.
+    expect(refreshed.total).toBe(committed.total);
+  });
+
+  it("ignores updated_at churn, which upstream bumps without changing records", () => {
+    const base: RawBulkJob = {
+      id: "job-churn", dispatch_type: "ai_voice_call", status: "processing",
+      total_contacts: 10, status_summary: { completed: 4 }, updated_at: "2026-08-12T10:00:00Z",
+    };
+    const first = bulkJobToBatchDoc(base, ctx);
+    const committed: BatchDoc = {
+      ...first, ingestStatus: "ready", total: 9, fingerprint: "dataset-fp",
+      ingestedSourceFingerprint: first.sourceFingerprint,
+    };
+    const refreshed = bulkJobToBatchDoc({ ...base, updated_at: "2026-08-12T11:30:00Z" }, ctx, committed);
+    expect(refreshed.sourceFingerprint).toBe(committed.sourceFingerprint);
+    expect(refreshed.ingestStatus).toBe("ready");
+    expect(refreshed.total).toBe(9);
+  });
+
+  // A batch ingested before markers existed cannot be proven in step with its
+  // source, so it reads as stale until the next ingestion stamps one.
+  it("treats an ingested batch with no marker as stale", () => {
+    const job: RawBulkJob = {
+      id: "job-legacy", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 10,
+    };
+    const legacy: BatchDoc = { ...bulkJobToBatchDoc(job, ctx), ingestStatus: "ready", total: 9 };
+    expect(bulkJobToBatchDoc(job, ctx, legacy).ingestStatus).toBe("stale");
+  });
+
+  // Comparing each listing against the previous one let a transient upstream
+  // blip latch a batch to "stale" with no way back, since only a publish clears
+  // it. The comparison must be against what the published revision was built
+  // from, so a recovered source resolves the batch to "ready" again.
+  it("returns to ready when a transient upstream blip reverses", () => {
+    const job: RawBulkJob = {
+      id: "job-blip", dispatch_type: "ai_voice_call", status: "completed",
+      total_contacts: 10, status_summary: { completed: 10 },
+    };
+    const ingested = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...ingested, ingestStatus: "ready", total: 10,
+      ingestedSourceFingerprint: ingested.sourceFingerprint,
+    };
+    // Core briefly unreachable: status_summary comes back null.
+    const blipped = bulkJobToBatchDoc({ ...job, status_summary: null }, ctx, committed);
+    expect(blipped.ingestStatus).toBe("stale");
+    // Core recovers and reports exactly what it did before.
+    expect(bulkJobToBatchDoc(job, ctx, blipped).ingestStatus).toBe("ready");
+  });
+
+  it("keeps a stale batch's ingested figures across further listings", () => {
+    const first = bulkJobToBatchDoc({
+      id: "job-stale-2", dispatch_type: "ai_voice_call", status: "processing", total_contacts: 10,
+    }, ctx);
+    const stale: BatchDoc = {
+      ...first, ingestStatus: "stale", total: 9, spendInr: 42, fingerprint: "dataset-fp",
+    };
+    const refreshed = bulkJobToBatchDoc({
+      id: "job-stale-2", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 11,
+    }, ctx, stale);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.total).toBe(9);
+    expect(refreshed.spendInr).toBe(42);
   });
 
   it("does not copy worker ownership fields from an existing batch", () => {
@@ -207,5 +274,102 @@ describe("bulkJobToBatchDoc", () => {
     expect(doc.ingestJobId).toBeUndefined();
     expect(doc.ingestLeaseId).toBeUndefined();
     expect(doc.ingestLeaseUntil).toBeUndefined();
+  });
+
+});
+
+describe("bulkJobIsUnchangedSince", () => {
+  const done = (over: Partial<RawBulkJob> = {}): RawBulkJob => ({
+    id: "job-1", dispatch_type: "ai_voice_call", status: "completed",
+    total_contacts: 10, updated_at: "2026-09-01T10:00:00Z", ...over,
+  });
+
+  it("is true only when a finished job has not been touched since ingestion", () => {
+    expect(bulkJobIsUnchangedSince(done(), "2026-09-01T10:00:00Z")).toBe(true);
+  });
+
+  it("is false once upstream writes to the job again", () => {
+    expect(bulkJobIsUnchangedSince(done({ updated_at: "2026-09-01T11:00:00Z" }), "2026-09-01T10:00:00Z")).toBe(false);
+  });
+
+  // status_summary and call_status_counts are call-dispatch-only, so for a
+  // messaging campaign the summary fingerprint is frozen from dispatch onward.
+  // Delivery receipts, read receipts and replies move only updated_at — without
+  // that check "Refresh data" would be a permanent no-op for messaging.
+  it("catches messaging receipts, which move no summary field", () => {
+    const base = { id: "job-wa", dispatch_type: "whatsapp", status: "completed", total_contacts: 5000 };
+    const atIngest: RawBulkJob = { ...base, updated_at: "2026-09-01T10:00:00Z" };
+    const later: RawBulkJob = { ...base, updated_at: "2026-09-01T12:30:00Z" };
+    expect(bulkJobSourceFingerprint(atIngest)).toBe(bulkJobSourceFingerprint(later));
+    expect(bulkJobIsUnchangedSince(later, atIngest.updated_at)).toBe(false);
+  });
+
+  it("never skips a job that is still running", () => {
+    for (const status of ["processing", "queued", "in_progress", "", undefined]) {
+      expect(bulkJobIsUnchangedSince(done({ status }), "2026-09-01T10:00:00Z")).toBe(false);
+    }
+  });
+
+  it("never skips without a stamp — a legacy or never-ingested batch", () => {
+    expect(bulkJobIsUnchangedSince(done(), null)).toBe(false);
+    expect(bulkJobIsUnchangedSince(done(), undefined)).toBe(false);
+  });
+
+  it("never skips when upstream sends no updated_at at all", () => {
+    expect(bulkJobIsUnchangedSince(done({ updated_at: null }), null)).toBe(false);
+  });
+});
+
+describe("bulkJobSourceFingerprint", () => {
+  // Upstream may serialize these maps in any order (a Go map, a re-ordered
+  // group-by). Order alone reading as "the data moved" is the churn this whole
+  // fingerprint exists to avoid, arriving by another route.
+  it("ignores key order in the upstream summaries", () => {
+    const a: RawBulkJob = {
+      id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 5,
+      status_summary: { completed: 4, failed: 1 },
+      call_status_counts: [{ batch_id: 1, completed: 4, failed: 1 } as never],
+    };
+    const b: RawBulkJob = {
+      id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 5,
+      status_summary: { failed: 1, completed: 4 },
+      call_status_counts: [{ failed: 1, completed: 4, batch_id: 1 } as never],
+    };
+    expect(bulkJobSourceFingerprint(a)).toBe(bulkJobSourceFingerprint(b));
+  });
+
+  // call_status_counts is a SET of per-batch rows assembled from webhook
+  // arrivals, so upstream can serve the same rows in a different order. Reading
+  // a reshuffle as a change cost a full duplicate re-ingest.
+  it("ignores row order in call_status_counts", () => {
+    const base = { id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 9 };
+    const a: RawBulkJob = {
+      ...base,
+      call_status_counts: [
+        { batch_id: 1, completed: 4, failed: 1 } as never,
+        { batch_id: 2, completed: 3, failed: 1 } as never,
+      ],
+    };
+    const b: RawBulkJob = {
+      ...base,
+      call_status_counts: [
+        { batch_id: 2, failed: 1, completed: 3 } as never,
+        { failed: 1, batch_id: 1, completed: 4 } as never,
+      ],
+    };
+    expect(bulkJobSourceFingerprint(a)).toBe(bulkJobSourceFingerprint(b));
+  });
+
+  it("still changes when a row's counts change, whatever the order", () => {
+    const base = { id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 9 };
+    const a: RawBulkJob = { ...base, call_status_counts: [{ batch_id: 1, completed: 4 } as never] };
+    const b: RawBulkJob = { ...base, call_status_counts: [{ batch_id: 1, completed: 5 } as never] };
+    expect(bulkJobSourceFingerprint(a)).not.toBe(bulkJobSourceFingerprint(b));
+  });
+
+  it("still changes when a count actually changes", () => {
+    const base: RawBulkJob = { id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 5 };
+    expect(bulkJobSourceFingerprint({ ...base, status_summary: { completed: 4 } }))
+      .not.toBe(bulkJobSourceFingerprint({ ...base, status_summary: { completed: 5 } }));
   });
 });

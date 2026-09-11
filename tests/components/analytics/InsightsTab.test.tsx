@@ -56,6 +56,22 @@ describe("InsightsTab — trustworthy failure behavior", () => {
     expect(screen.queryByText(/11am.?1pm/i)).not.toBeInTheDocument();
   });
 
+  // The seeded heatmap is demo-only: with no aggregate on a live backend there
+  // is nothing real behind "Best time to reach", so the card must stay away.
+  it("never shows the seeded reach heatmap to a live user without an aggregate", async () => {
+    render(<InsightsTab targets={[target]} currency="inr" batchIds={["b1"]} analytics={null} />);
+
+    expect(await screen.findByText("AI insight is unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("Best time to reach")).not.toBeInTheDocument();
+    expect(generateInsights).not.toHaveBeenCalled();
+  });
+
+  it("still shows the seeded reach heatmap when the backend is off", async () => {
+    render(<InsightsTab targets={[target]} currency="inr" batchIds={["b1"]} analytics={null} demo />);
+
+    expect(await screen.findByText("Best time to reach")).toBeInTheDocument();
+  });
+
   it("keeps deterministic comparison deltas when the AI narrative fails", async () => {
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [target, baseline], source: "live" });
     vi.mocked(generateInsights).mockResolvedValue({

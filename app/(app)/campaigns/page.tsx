@@ -28,6 +28,7 @@ import {
   typeKey,
 } from "@/lib/data";
 import { useApp } from "@/lib/store";
+import { DASHBOARD_RANGES, isDashboardRange, type DashboardRange } from "@/lib/date-range";
 import type { Batch, BreakdownSeg, SelType } from "@/lib/types";
 import { listCampaigns } from "@/lib/api";
 import { FilterSelect } from "@/components/screens/campaigns/FilterSelect";
@@ -35,7 +36,19 @@ import { DownloadModal } from "@/components/screens/campaigns/DownloadModal";
 
 const PAGE_SIZE = 8;
 
+/** The sentinel the date FilterSelect uses for "not filtering", so it renders
+ *  neutral like the other "All …" options instead of permanently highlighted. */
+const RANGE_ANY = "all";
+
 type SortState = { key: string; dir: "asc" | "desc" };
+
+/** Drop selected ids that are not in `batches`, keeping the original Set when
+ *  nothing was dropped so an unchanged selection doesn't re-render the table. */
+function retain(selected: Set<string>, batches: Batch[]): Set<string> {
+  const ids = new Set(batches.map((b) => b.id));
+  const kept = Array.from(selected).filter((id) => ids.has(id));
+  return kept.length === selected.size ? selected : new Set(kept);
+}
 
 function SortHead({
   k,
@@ -71,8 +84,12 @@ function SortHead({
 }
 
 export default function CampaignsScreen() {
-  const { currency, setCombineTargets, setAnalyzeTargets } = useApp();
+  const { currency, dateRange, setDateRange, setCombineTargets, setAnalyzeTargets } = useApp();
   const router = useRouter();
+  // dateRange is hydrated from sessionStorage, so it can be any string. Coerce it
+  // the way the dashboard does — a value we don't recognise must mean "no date
+  // filter", never an error screen.
+  const range: DashboardRange = isDashboardRange(dateRange) ? dateRange : "All time";
   const [search, setSearch] = useState("");
   const [channel, setChannel] = useState("all");
   const [statusF, setStatusF] = useState("all");
@@ -84,29 +101,54 @@ export default function CampaignsScreen() {
   // Start empty — never seed with mock. listCampaigns() returns mock only when
   // the backend is off; on a live backend no mock rows ever render here.
   const [campaigns, setCampaigns] = useState<Batch[]>([]);
-  const [loading, setLoading] = useState(true);
+  // The range the rows on screen belong to. Anything else — including the
+  // initial null — means the list is still catching up, so a range switch shows
+  // the skeleton instead of stale rows (same idiom as the dashboard).
+  const [loadedRange, setLoadedRange] = useState<DashboardRange | null>(null);
+  const loading = loadedRange !== range;
   const [loadError, setLoadError] = useState<string | null>(null);
+  // The backend stopped scanning upstream jobs at its cap, so this listing may be
+  // missing campaigns it never looked at. Surfaced below — a listing that is
+  // short for that reason must not read as "you have no campaigns".
+  const [truncated, setTruncated] = useState(false);
 
-  // load via the data seam — returns mock when the backend is off, live data when on
+  // load via the data seam — returns mock when the backend is off, live data when
+  // on. The Topbar's date range is server-side filtering, so this refetches
+  // whenever it changes; `active` drops a response that a faster switch has
+  // already superseded.
   useEffect(() => {
     let active = true;
-    listCampaigns()
+    listCampaigns(range)
       .then((r) => {
         if (active) {
           setCampaigns(r.batches);
+          setTruncated(Boolean(r.truncated));
           setLoadError(null);
+          // A new range is a new result set — paging back to the top keeps the
+          // pager inside the filtered count, and rows that fell out of scope must
+          // not stay selected: the bulk bar would otherwise count batches nobody
+          // can see and lose the same-type label along with them.
+          setPage(1);
+          setSelected((s: Set<string>) => retain(s, r.batches));
         }
       })
       .catch((error: unknown) => {
-        if (active) setLoadError(error instanceof Error ? error.message : "Unable to load campaigns.");
+        if (!active) return;
+        // Never leave the previous range's rows on screen under a failed load —
+        // nor a selection or a page number that belonged to them.
+        setCampaigns([]);
+        setTruncated(false);
+        setPage(1);
+        setSelected((s: Set<string>) => (s.size === 0 ? s : new Set()));
+        setLoadError(error instanceof Error ? error.message : "Unable to load campaigns.");
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active) setLoadedRange(range);
       });
     return () => {
       active = false;
     };
-  }, []);
+  }, [range]);
 
   const providers = useMemo(() => ["all", ...Array.from(new Set(campaigns.map((c: Batch) => c.provider)))], [campaigns]);
 
@@ -174,14 +216,20 @@ export default function CampaignsScreen() {
 
   const setSortKey = (key: string) =>
     setSort((s: SortState) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" }));
+  // The date range is a filter like any other here: it narrows what the screen
+  // lists, so it has to count towards "you have filters on" and be cleared with
+  // them. Leaving it out made "Clear filters" a no-op against the one filter that
+  // had actually emptied the list.
   const resetFilters = () => {
     setSearch("");
     setChannel("all");
     setStatusF("all");
     setProviderF("all");
+    setDateRange("All time");
     setPage(1);
   };
-  const hasFilters = search || channel !== "all" || statusF !== "all" || providerF !== "all";
+  const hasFilters =
+    Boolean(search) || channel !== "all" || statusF !== "all" || providerF !== "all" || range !== "All time";
 
   const analyze = (ids: string[]) => {
     setAnalyzeTargets(ids);
@@ -245,6 +293,17 @@ export default function CampaignsScreen() {
           }}
           options={providers.map((p: string) => ({ value: p, label: p === "all" ? "All providers" : p }))}
         />
+        <FilterSelect
+          icon="Calendar"
+          label="Date range"
+          value={range === "All time" ? RANGE_ANY : range}
+          onChange={(value) => {
+            // Shared with the Topbar control: one range, one place to undo it.
+            setDateRange(value === RANGE_ANY ? "All time" : value);
+            setPage(1);
+          }}
+          options={DASHBOARD_RANGES.map((r) => ({ value: r === "All time" ? RANGE_ANY : r, label: r }))}
+        />
         {hasFilters && (
           <Button variant="ghost" size="sm" icon="X" onClick={resetFilters}>
             Clear
@@ -260,6 +319,16 @@ export default function CampaignsScreen() {
           )}
         </div>
       </div>
+
+      {!loading && truncated && (
+        <div className="mb-3 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-[13px] text-amber-700">
+          <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
+          <span>
+            This account has more campaigns than one listing can scan, so some of them — including older
+            ones — may be missing from this list. Counts and filters below apply only to what was scanned.
+          </span>
+        </div>
+      )}
 
       <div className="mb-3 flex items-center gap-2 text-[12.5px] text-slate-500">
         <Icon name="ChartColumnBig" size={14} className="text-[var(--accent)]" />
@@ -368,17 +437,49 @@ export default function CampaignsScreen() {
           </table>
         </div>
 
+        {/* Three genuinely different empty lists: a failed load, a list the
+            filters (the date range included) emptied, and an account with
+            nothing to show. Blaming filters that aren't set — or offering a
+            "Clear filters" button that leaves the range in place — sent people
+            looking for data that was never hidden by what they could see. */}
         {!loading && filtered.length === 0 && (
-          <EmptyState
-            icon={loadError ? "TriangleAlert" : "SearchX"}
-            title={loadError ? "Campaigns are unavailable" : "No campaigns match your filters"}
-            body={loadError ?? "Try adjusting your search or clearing filters to see more results."}
-            action={
-              <Button variant="secondary" icon={loadError ? "RotateCcw" : "X"} onClick={() => loadError ? window.location.reload() : resetFilters()}>
-                {loadError ? "Try again" : "Clear filters"}
-              </Button>
-            }
-          />
+          loadError ? (
+            <EmptyState
+              icon="TriangleAlert"
+              title="Campaigns are unavailable"
+              body={loadError}
+              action={
+                <Button variant="secondary" icon="RotateCcw" onClick={() => window.location.reload()}>
+                  Try again
+                </Button>
+              }
+            />
+          ) : hasFilters ? (
+            <EmptyState
+              icon="SearchX"
+              title="No campaigns match your filters"
+              body={
+                range === "All time"
+                  ? "Try adjusting your search or clearing filters to see more results."
+                  : `Only campaigns from ${range.toLowerCase()} are listed. Clear filters to go back to every campaign.`
+              }
+              action={
+                <Button variant="secondary" icon="X" onClick={resetFilters}>
+                  Clear filters
+                </Button>
+              }
+            />
+          ) : (
+            <EmptyState
+              icon="Inbox"
+              title="No campaigns yet"
+              body={
+                truncated
+                  ? "Nothing turned up in the part of your history this listing was able to scan."
+                  : "Campaigns appear here once a bulk job has run in this account."
+              }
+            />
+          )
         )}
 
         {/* pagination */}
@@ -437,8 +538,9 @@ export default function CampaignsScreen() {
               {selected.size}
             </span>
             <span className="text-sm font-medium text-slate-200 whitespace-nowrap">
-              {activeSelType ? SEL_LABEL[activeSelType as SelType] : ""}
-              {selected.size > 1 ? " batches" : " batch"}
+              {[activeSelType ? SEL_LABEL[activeSelType as SelType] : null, selected.size > 1 ? "batches" : "batch"]
+                .filter(Boolean)
+                .join(" ")}
             </span>
             <div className="flex-1" />
             <Button

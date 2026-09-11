@@ -3,7 +3,7 @@
 // never leak across tenants. Server-only.
 
 import { randomUUID } from "node:crypto";
-import type { AnyBulkWriteOperation, FindCursor, WithId } from "mongodb";
+import type { AnyBulkWriteOperation, Filter, FindCursor, WithId } from "mongodb";
 import {
   aggregates,
   aiUsage,
@@ -20,6 +20,7 @@ import {
   IVR_HANGUP_NODE_KEYS,
   SHORT_CALL_SECONDS,
 } from "@/lib/server/dashboard-quality";
+import { isBatchReadable } from "@/lib/server/types";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -129,7 +130,9 @@ export async function beginBatchIngestion(
     {
       $set: {
         ...withoutIngestionOwnership(doc),
-        ingestStatus: doc.ingestStatus === "ready" ? "ready" : "ingesting",
+        // A published revision stays readable while the refresh runs; only a
+        // batch with nothing to serve yet shows as "ingesting".
+        ingestStatus: isBatchReadable(doc) ? doc.ingestStatus : "ingesting",
         ingestJobId: jobId,
         ingestLeaseId: leaseId,
         ingestLeaseUntil: leaseUntil,
@@ -172,11 +175,19 @@ export async function failBatchIfOwned(
   const col = await batches();
   const current = await col.findOne({ tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId });
   if (!current) return;
+  // A failed refresh leaves the previous revision published and readable, but
+  // it did not bring the batch up to date — resolve back to "stale" whenever
+  // the source has moved past what the published revision was built from, so
+  // the next refresh still knows there is something to pull.
+  const readableStatus =
+    current.ingestedSourceFingerprint && current.ingestedSourceFingerprint === current.sourceFingerprint
+      ? "ready"
+      : "stale";
   await col.updateOne(
     { tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId },
     {
       $set: {
-        ingestStatus: current.publishedRevision ? "ready" : "error",
+        ingestStatus: current.publishedRevision ? readableStatus : "error",
         updatedAt: nowIso(),
       },
       $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
@@ -257,6 +268,82 @@ export async function retireBatchRevision(
   );
 }
 
+/** Grace period before a superseded revision's rows are physically removed.
+ *
+ *  A reader resolves a batch's `publishedRevision` and then reads rows for it.
+ *  For most callers that gap is one round-trip, but a CSV export holds its
+ *  cursor open for the whole download, advancing only as fast as the client
+ *  consumes it — so the window has to outlast a large, slowly-drained export,
+ *  not just a query. Sized above MongoDB's own 10-minute idle cursor timeout,
+ *  which caps how long such a stream can survive anyway. */
+export const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
+
+/**
+ * Physically delete this batch's retired revisions once they are past the grace
+ * period, keeping only `keepRevision`.
+ *
+ * Every ingestion writes a complete new copy of a batch's records under a fresh
+ * revision. Leaving the superseded copies to a daily cron with a multi-day
+ * window meant each "Refresh data" click added a full duplicate dataset that
+ * lingered for days — enough repeated clicks exhausted the cluster's storage
+ * and blocked writes for every tenant. Reclaiming them here bounds a batch to
+ * its published revision plus whatever was retired inside the grace window.
+ *
+ * Only rows explicitly marked `retiredAt` are eligible, so a concurrent job's
+ * staging revision (which never carries the marker) can never be swept.
+ */
+export async function deleteSupersededRecordRevisions(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  keepRevision: string,
+  graceMs = SUPERSEDED_REVISION_GRACE_MS,
+): Promise<number> {
+  const col = await records();
+  const res = await col.deleteMany({
+    tenantId,
+    accountId,
+    batchId,
+    revision: { $exists: true, $ne: keepRevision },
+    retiredAt: { $lt: new Date(Date.now() - graceMs) },
+  });
+  return res.deletedCount ?? 0;
+}
+
+/**
+ * Reclaim revisions of one batch that no longer belong to anything: a copy
+ * orphaned when the process died between publishing a revision and retiring the
+ * previous one, or a staging revision abandoned by a SIGKILL mid-ingestion.
+ * Neither ever receives the `retiredAt` marker, so neither is reachable by
+ * `deleteSupersededRecordRevisions` — they used to survive until the whole
+ * batch aged out of the retention window.
+ *
+ * Callers MUST pass every revision that is still live for this batch: the
+ * currently published one and, when called from a worker, the revision it is
+ * about to stage. A resumable job keeps its revision across a rate-limit pause
+ * that can outlast the grace period, so omitting it would delete a running
+ * ingestion's work. Batch-scoped and age-bounded on `revisionCreatedAt`, so the
+ * query stays cheap and cannot touch anything recent.
+ */
+export async function deleteOrphanedRecordRevisions(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  keepRevisions: (string | undefined)[],
+  graceMs = SUPERSEDED_REVISION_GRACE_MS,
+): Promise<number> {
+  const keep = keepRevisions.filter((revision): revision is string => Boolean(revision));
+  const col = await records();
+  const res = await col.deleteMany({
+    tenantId,
+    accountId,
+    batchId,
+    revision: { $exists: true, $nin: keep },
+    revisionCreatedAt: { $lt: new Date(Date.now() - graceMs) },
+  });
+  return res.deletedCount ?? 0;
+}
+
 export async function replaceBatchRecords(
   tenantId: string,
   accountId: string,
@@ -293,11 +380,30 @@ export async function replaceBatchRecords(
   await col.bulkWrite(ops, { ordered: false });
 }
 
+/**
+ * An immutable snapshot of which revision each batch publishes, resolved once.
+ *
+ * Reads that make two trips to the records collection for one logical result —
+ * a count and the stream it describes — MUST resolve this once and pass the
+ * same value to both. Resolving twice lets an ingestion publish in between, so
+ * the two trips read different revisions of the same batch and their row counts
+ * legitimately disagree.
+ */
+export type PublishedRecordsFilter = Filter<NormalizedRecord>;
+
+export async function resolvePublishedRecordsFilter(
+  tenantId: string,
+  accountId: string,
+  batchIds: string[]
+): Promise<PublishedRecordsFilter> {
+  return publishedRecordsFilter(tenantId, accountId, batchIds);
+}
+
 async function publishedRecordsFilter(
   tenantId: string,
   accountId: string,
   batchIds: string[]
-) {
+): Promise<PublishedRecordsFilter> {
   const col = await batches();
   const docs = await col
     .find({ tenantId, accountId, batchId: { $in: batchIds } })
@@ -347,8 +453,14 @@ export async function streamRecords(
   batchIds: string[]
 ): Promise<FindCursor<WithId<NormalizedRecord>>> {
   if (batchIds.length === 0) throw new Error("Cannot stream an empty batch selection.");
+  return streamRecordsForFilter(await publishedRecordsFilter(tenantId, accountId, batchIds));
+}
+
+/** As `streamRecords`, against a revision snapshot the caller already resolved. */
+export async function streamRecordsForFilter(
+  filter: PublishedRecordsFilter,
+): Promise<FindCursor<WithId<NormalizedRecord>>> {
   const col = await records();
-  const filter = await publishedRecordsFilter(tenantId, accountId, batchIds);
   return col
     .find(filter)
     .sort({ batchId: 1, recordId: 1 });
@@ -360,8 +472,13 @@ export async function countRecords(
   batchIds: string[]
 ): Promise<number> {
   if (batchIds.length === 0) return 0;
+  return countRecordsForFilter(await publishedRecordsFilter(tenantId, accountId, batchIds));
+}
+
+/** As `countRecords`, against a revision snapshot the caller already resolved. */
+export async function countRecordsForFilter(filter: PublishedRecordsFilter): Promise<number> {
   const col = await records();
-  return col.countDocuments(await publishedRecordsFilter(tenantId, accountId, batchIds));
+  return col.countDocuments(filter);
 }
 
 /** Aggregate true placed/sent activity by IST day. The fallback to `timestamp`
@@ -376,8 +493,10 @@ export async function getDashboardVolume(
   end: Date,
 ): Promise<DashboardVolume> {
   const col = await records();
-  const readyBatches = (await listBatches(tenantId, accountId))
-    .filter((batch) => batch.ingestStatus === "ready");
+  // "stale" counts: its published revision is complete and is what every other
+  // reader sees, so excluding it would drop real campaigns off the dashboard
+  // the moment their upstream summary moved.
+  const readyBatches = (await listBatches(tenantId, accountId)).filter(isBatchReadable);
   if (readyBatches.length === 0) {
     return emptyDashboardVolume(range, start, end);
   }
@@ -1083,30 +1202,112 @@ export async function deleteBatchDataOlderThan(
   };
 }
 
-/** Delete only retired immutable revisions after a grace period. Current
- * published revisions and legacy unversioned records are always retained. */
+/**
+ * Delete retired immutable revisions once they are past the grace period.
+ *
+ * `retiredAt` alone is a sufficient and safe filter, because only
+ * `retireBatchRevision` ever sets it and that function refuses to mark a
+ * batch's current `publishedRevision` — and a revision id is a job id, freshly
+ * generated per job, so a retired revision can never become published again.
+ * Rows carrying the marker are therefore unreachable by construction.
+ *
+ * This previously also excluded every published revision explicitly, by
+ * loading every batch document in the database and building one `$nor` clause
+ * per batch. That list was unbounded and account-agnostic: past roughly a
+ * hundred thousand batches the query document itself exceeds MongoDB's 16 MB
+ * command limit and the whole cleanup fails, reclaiming nothing. The guard was
+ * also ineffective in the direction that mattered — it could not reach rows
+ * whose batch document had already been deleted, which is exactly the orphan a
+ * crash mid-publish leaves behind. Trusting the marker fixes both.
+ */
 export async function deleteRetiredRecordRevisionsOlderThan(cutoff: Date): Promise<number> {
+  const recordCol = await records();
+  const res = await recordCol.deleteMany({ retiredAt: { $lt: cutoff } });
+  return res.deletedCount ?? 0;
+}
+
+/** How many batches one orphan-sweep delete query covers. The whole reason the
+ *  previous all-tenant sweep failed was a query document that grew with the
+ *  database until it blew MongoDB's 16 MB command limit; chunking keeps every
+ *  query a fixed size no matter how many batches exist. */
+const ORPHAN_SWEEP_CHUNK = 500;
+
+/**
+ * Reclaim orphaned revisions across every batch, for the daily cron.
+ *
+ * `deleteRetiredRecordRevisionsOlderThan` can only see rows carrying
+ * `retiredAt`, and two kinds of duplicate never get that marker: a copy
+ * orphaned when the process died between publishing a new revision and retiring
+ * the previous one, and a staging revision abandoned by a SIGKILL mid-ingestion.
+ * The worker reclaims both, but only for a batch that gets ingested again — a
+ * batch nobody refreshes keeps its orphan until the whole batch ages out of the
+ * retention window, which on a full cluster is exactly the space that cannot be
+ * waited for.
+ *
+ * Scoped per batch rather than globally: each batch contributes its own
+ * `$nin` of live revisions, so a batch is only ever compared against its own
+ * revisions. That is what makes this safe to run without the unbounded
+ * exclusion list the old implementation built.
+ *
+ * Three guards keep a live ingestion's work out of range:
+ *  - `publishedRevision` — what every reader is currently reading;
+ *  - `ingestJobId` — the in-flight staging revision (a revision id IS the job
+ *    id), which a resumable job keeps across a rate-limit pause that can outlast
+ *    the grace window;
+ *  - `revisionCreatedAt` older than the grace window, so nothing recent is
+ *    touched even if a batch document is momentarily out of date.
+ *
+ * Rows written before revisions existed carry no `revision` at all and are
+ * matched by neither this nor `publishedRecordsFilter`'s `$exists: false`
+ * branch — they are left alone.
+ */
+export async function deleteOrphanedRecordRevisionsEverywhere(
+  graceMs = SUPERSEDED_REVISION_GRACE_MS,
+): Promise<number> {
   const batchCol = await batches();
   const recordCol = await records();
-  // Only explicitly retired revisions are eligible. Active/rate-limited
-  // staging revisions never carry retiredAt and cannot be swept mid-ingestion.
-  const published = await batchCol
-    .find({ publishedRevision: { $exists: true } })
-    .project<Pick<BatchDoc, "tenantId" | "accountId" | "batchId" | "publishedRevision">>({
-      tenantId: 1, accountId: 1, batchId: 1, publishedRevision: 1,
-    })
-    .toArray();
-  const filter: Record<string, unknown> = { retiredAt: { $lt: cutoff } };
-  if (published.length > 0) {
-    filter.$nor = published.map((batch) => ({
-      tenantId: batch.tenantId,
-      accountId: batch.accountId,
-      batchId: batch.batchId,
-      revision: batch.publishedRevision,
-    }));
+  const cutoff = new Date(Date.now() - graceMs);
+  const cursor = batchCol
+    .find({})
+    .project<Pick<BatchDoc, "tenantId" | "accountId" | "batchId" | "publishedRevision" | "ingestJobId">>({
+      tenantId: 1,
+      accountId: 1,
+      batchId: 1,
+      publishedRevision: 1,
+      ingestJobId: 1,
+    });
+
+  let deleted = 0;
+  let chunk: Array<Record<string, unknown>> = [];
+  const flush = async () => {
+    if (chunk.length === 0) return;
+    const res = await recordCol.deleteMany({
+      revision: { $exists: true },
+      revisionCreatedAt: { $lt: cutoff },
+      $or: chunk,
+    });
+    deleted += res.deletedCount ?? 0;
+    chunk = [];
+  };
+
+  try {
+    for await (const doc of cursor) {
+      const keep = [doc.publishedRevision, doc.ingestJobId].filter(
+        (revision): revision is string => Boolean(revision),
+      );
+      chunk.push({
+        tenantId: doc.tenantId,
+        accountId: doc.accountId,
+        batchId: doc.batchId,
+        revision: { $nin: keep },
+      });
+      if (chunk.length >= ORPHAN_SWEEP_CHUNK) await flush();
+    }
+    await flush();
+  } finally {
+    await cursor.close().catch(() => {});
   }
-  const res = await recordCol.deleteMany(filter);
-  return res.deletedCount ?? 0;
+  return deleted;
 }
 
 // ---------------------------------------------------------------------------

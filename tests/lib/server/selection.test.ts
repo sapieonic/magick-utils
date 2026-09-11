@@ -39,4 +39,24 @@ describe("selection validation", () => {
     await expect(validateSelection(ctx, ["b1", "b2"], { requireReady: true, verifyCounts: true }))
       .rejects.toMatchObject({ code: "incomplete_ingestion" });
   });
+
+  // A stale batch's published revision is complete and is what every reader
+  // sees. 409-ing it made the Analytics screen fail and re-ingest in a loop.
+  it("serves a stale batch rather than rejecting it as un-ingested", async () => {
+    repositories.getBatch.mockImplementation((_tenant, _account, id) =>
+      Promise.resolve(ready(id, { ingestStatus: "stale" })),
+    );
+    await expect(
+      validateSelection(ctx, ["b1"], { requireReady: true, verifyCounts: true }),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("still rejects a batch with no complete revision to read", async () => {
+    repositories.getBatch.mockImplementation((_tenant, _account, id) =>
+      Promise.resolve(ready(id, { ingestStatus: "none" })),
+    );
+    await expect(validateSelection(ctx, ["b1"], { requireReady: true })).rejects.toMatchObject({
+      code: "not_ingested",
+    });
+  });
 });

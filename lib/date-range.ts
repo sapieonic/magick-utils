@@ -17,9 +17,30 @@ export function rangeStart(range: DashboardRange, now = new Date()): Date | null
   return addAppDays(startOfAppDay(now), -(days - 1));
 }
 
+/** The Dashboard's "campaigns started in this period" predicate: bounded at both
+ *  ends, so a future-dated campaign is not counted into a period that has not
+ *  happened yet. */
 export function inDashboardRange(iso: string, range: DashboardRange, now = new Date()): boolean {
   const value = new Date(iso).getTime();
   if (!Number.isFinite(value)) return false;
   const start = rangeStart(range, now);
   return value <= now.getTime() && (start == null || value >= start.getTime());
+}
+
+/** How far ahead of our own clock an upstream timestamp may sit and still count
+ *  as "now". `created_at` is stamped by magick-master, not by this host, so a
+ *  campaign created seconds ago can legitimately arrive dated slightly in our
+ *  future — dropping it would hide the customer's newest work. */
+export const LISTING_CLOCK_SKEW_MS = 10 * 60 * 1000;
+
+/** The inventory predicate used by the Campaigns listing. Unlike the dashboard's
+ *  period framing, a listing exists to show what the account *has*: "All time"
+ *  is unbounded in both directions, and bounded ranges tolerate clock skew at
+ *  the top end rather than silently dropping just-created campaigns. */
+export function inListingRange(iso: string, range: DashboardRange, now = new Date()): boolean {
+  const value = new Date(iso).getTime();
+  if (!Number.isFinite(value)) return false;
+  const start = rangeStart(range, now);
+  if (start == null) return true;
+  return value >= start.getTime() && value <= now.getTime() + LISTING_CLOCK_SKEW_MS;
 }

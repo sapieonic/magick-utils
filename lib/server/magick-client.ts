@@ -264,6 +264,20 @@ export interface StatsParams {
 
 const PAGE_SIZE = 100;
 
+/** Every `iterate*` generator below stops on ONE condition: a short page. That
+ *  is the only signal the upstream gives that is always true when exhausted and
+ *  never true before.
+ *
+ *  They used to also stop once `offset` reached the page's reported `total`.
+ *  That break could only ever end paging earlier than the short-page stop, so
+ *  it won nothing when `total` was right and silently truncated the result when
+ *  it was low — and magick-master's totals are counted separately from the rows
+ *  it serves, so a stale-low `total` is routine. A `total: 100` on an account
+ *  with thousands of bulk jobs reproduced exactly the "only 100 campaigns"
+ *  report this listing is meant to have fixed, with the caller's scan cap never
+ *  reached. The cost of trusting the short page instead is one extra request per
+ *  iteration when the last page happens to be exactly full. */
+
 export function parseRetryAfter(value: string | null, now = Date.now()): number | null {
   if (!value) return null;
   const seconds = Number(value);
@@ -440,8 +454,6 @@ export class MagickClient {
       for (const call of calls) yield call;
       if (calls.length < limit) break;
       offset += limit;
-      const total = page.total ?? 0;
-      if (total > 0 && offset >= total) break;
     }
   }
 
@@ -471,8 +483,6 @@ export class MagickClient {
       for (const msg of messages) yield msg;
       if (messages.length < limit) break;
       offset += limit;
-      const total = page.total ?? 0;
-      if (total > 0 && offset >= total) break;
     }
   }
 
@@ -486,6 +496,26 @@ export class MagickClient {
       dispatch_type: params.dispatchType,
     });
     return getJson<BulkJobsListResponse>(url, this.headers());
+  }
+
+  /** Page through all bulk-dispatch jobs (page size 100) until exhausted. The
+   *  upstream endpoint has no date filter, so date-scoped callers page through
+   *  here and filter on `created_at` themselves — and must bound how far they
+   *  are willing to page (see app/api/campaigns/route.ts). */
+  async *iterateBulkJobs(
+    params: ListBulkJobsParams = {},
+  ): AsyncGenerator<RawBulkJob, void, unknown> {
+    let offset = params.offset ?? 0;
+    // A non-positive limit would never advance the offset nor hit the short-page
+    // stop, i.e. an infinite loop against the upstream — floor it at one row.
+    const limit = Math.max(1, params.limit ?? PAGE_SIZE);
+    for (;;) {
+      const page = await this.listBulkJobs({ ...params, limit, offset });
+      const jobs = page.jobs ?? [];
+      for (const job of jobs) yield job;
+      if (jobs.length < limit) break;
+      offset += limit;
+    }
   }
 
   async getBulkJob(id: string): Promise<RawBulkJob> {

@@ -6,7 +6,9 @@ import {
   deleteBatchDataOlderThan,
   deleteInsightsOlderThan,
   deleteJobsOlderThan,
+  deleteOrphanedRecordRevisionsEverywhere,
   deleteRetiredRecordRevisionsOlderThan,
+  SUPERSEDED_REVISION_GRACE_MS,
 } from "@/lib/server/repositories";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
@@ -16,10 +18,11 @@ export const dynamic = "force-dynamic";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// One strict retention window for all persisted application data. Cached data
-// can be regenerated; source batches older than this are removed together with
-// every normalized record they own.
-const RETENTION_DAYS = 5;
+// One retention window for all persisted application data. Cached data can be
+// regenerated; source batches older than this are removed together with every
+// normalized record they own — which also makes this the limit on how far back
+// the Dashboard and Analytics can see. Configured via DATA_RETENTION_DAYS.
+const RETENTION_DAYS = env.dataRetentionDays;
 
 /** Constant-time Bearer-token check against CRON_SECRET. */
 function isAuthorized(req: Request): boolean {
@@ -59,7 +62,24 @@ export const POST = withLogging("cron/cleanup", async (req: Request) => {
   ]);
   // Run after the batch cascade so records removed with an expired batch are
   // counted as batch data, not nondeterministically as retired revisions.
-  const recordRevisions = await deleteRetiredRecordRevisionsOlderThan(new Date(now - RETENTION_DAYS * DAY_MS));
+  //
+  // Retired revisions are superseded duplicates no reader can reach, so they go
+  // on the short grace window rather than the retention window — they are dead
+  // weight the moment a newer revision is published, and keeping them for days
+  // is what let repeated refreshes exhaust the cluster's storage. The worker
+  // already reclaims them inline after each ingestion; this catches whatever a
+  // crash mid-publish left behind.
+  const recordRevisions = await deleteRetiredRecordRevisionsOlderThan(
+    new Date(now - SUPERSEDED_REVISION_GRACE_MS),
+  );
+  // `retiredAt` is only ever set by a clean publish. A process killed between
+  // publishing a revision and retiring the previous one, or mid-staging, leaves
+  // a full duplicate copy carrying no marker at all — invisible to the sweep
+  // above. The worker clears those, but only for a batch that is ingested
+  // again; on a cluster that is already full, a batch nobody refreshes would
+  // hold its orphan until the entire batch aged out. This is the pass that
+  // reaches them, scoped per batch so the query stays bounded.
+  const orphanedRevisions = await deleteOrphanedRecordRevisionsEverywhere();
 
   const deleted = {
     aggregates,
@@ -68,6 +88,7 @@ export const POST = withLogging("cron/cleanup", async (req: Request) => {
     batches: batchData.batches,
     records: batchData.records,
     recordRevisions,
+    orphanedRevisions,
   };
   log().info({ deleted }, "cron cleanup pruned stale data");
   return NextResponse.json({ ok: true, deleted });

@@ -3,6 +3,7 @@
 // seeded mock data in lib/data.ts so the UI keeps working without credentials.
 
 import { CAMPAIGNS } from "@/lib/data";
+import { inListingRange, isDashboardRange } from "@/lib/date-range";
 import type { Batch } from "@/lib/types";
 import type { AggregatesDoc, DashboardVolume, Insight, JobStatus, JobType } from "@/lib/server/types";
 
@@ -77,15 +78,62 @@ export async function backendStatus(): Promise<{ backend: boolean; llm: boolean 
   }
 }
 
-/** List campaigns/batches. Falls back to mock data when the backend is off. */
-export async function listCampaigns(): Promise<{ batches: Batch[]; source: "live" | "mock" }> {
+export interface CampaignListResult {
+  batches: Batch[];
+  source: "live" | "mock";
+  /** True when the backend stopped scanning upstream jobs at its cap, so the
+   *  listing may be missing campaigns it never looked at. Always false in mock
+   *  mode, where the whole set is in hand. Optional so callers (and their test
+   *  doubles) that predate it keep type-checking; read it as `Boolean(...)`. */
+  truncated?: boolean;
+}
+
+/** List campaigns/batches. Falls back to mock data when the backend is off.
+ *  `range` is one of the Topbar's date ranges (see lib/date-range); omit it —
+ *  as Dashboard and Analytics do — to get every campaign, unfiltered. An
+ *  unrecognised range is dropped rather than sent, which matches how the route
+ *  treats one: never narrow a listing on a value nobody understands. */
+export async function listCampaigns(range?: string): Promise<CampaignListResult> {
   const { backend } = await backendStatus();
-  if (!backend) return { batches: CAMPAIGNS, source: "mock" };
-  const res = await fetch("/api/campaigns", { cache: "no-store" });
+  const effective = range && isDashboardRange(range) ? range : undefined;
+  if (!backend) {
+    // Mock mode filters locally so the date control still behaves like the real
+    // one when there are no credentials.
+    const batches = effective ? CAMPAIGNS.filter((c) => inListingRange(c.date, effective)) : CAMPAIGNS;
+    return { batches, source: "mock", truncated: false };
+  }
+  const query = effective ? `?range=${encodeURIComponent(effective)}` : "";
+  const res = await fetch(`/api/campaigns${query}`, { cache: "no-store" });
   if (handleSessionExpiry(res)) throw new Error("session_expired");
   if (!res.ok) throw await responseError(res, "Unable to load campaigns.");
   const j = await res.json();
-  return { batches: j.batches as Batch[], source: "live" };
+  return { batches: j.batches as Batch[], source: "live", truncated: Boolean(j.truncated) };
+}
+
+/** Resolve a known set of campaign ids without listing the account.
+ *
+ *  Analytics and Combine already hold the ids the customer selected; all they
+ *  need back is each batch's name and totals. Going through `listCampaigns()`
+ *  for that paged the whole inventory, and when that scan hit its cap the
+ *  selected ids dropped out of the result and the screen reported perfectly
+ *  live campaigns as "no longer available". A direct lookup cannot truncate:
+ *  an id missing from the response really is missing.
+ *
+ *  Ids absent upstream are simply not returned, so compare what comes back
+ *  against what you asked for rather than assuming a full result. */
+export async function listCampaignsByIds(ids: string[]): Promise<CampaignListResult> {
+  const wanted = [...new Set(ids.filter(Boolean))];
+  const { backend } = await backendStatus();
+  if (!backend) {
+    return { batches: CAMPAIGNS.filter((c) => wanted.includes(c.id)), source: "mock", truncated: false };
+  }
+  if (wanted.length === 0) return { batches: [], source: "live", truncated: false };
+  const query = `?ids=${encodeURIComponent(wanted.join(","))}`;
+  const res = await fetch(`/api/campaigns${query}`, { cache: "no-store" });
+  if (handleSessionExpiry(res)) throw new Error("session_expired");
+  if (!res.ok) throw await responseError(res, "Unable to load the selected campaigns.");
+  const j = await res.json();
+  return { batches: j.batches as Batch[], source: "live", truncated: false };
 }
 
 export interface IngestJobResult {
@@ -98,6 +146,10 @@ export interface IngestJobResult {
   ready?: boolean;
   /** True when the caller was attached to an already-running job. */
   existing?: boolean;
+  /** True when a refresh checked upstream and found nothing new to pull. Lets
+   *  the screen say so, instead of replaying a progress bar over numbers that
+   *  did not move and leaving the user to wonder whether it worked. */
+  upToDate?: boolean;
 }
 
 export async function createIngestJob(

@@ -249,11 +249,16 @@ export function durationHistogram() {
   }));
 }
 
+/** Demo sentiment split, in RECORD COUNTS — the same unit the real aggregate
+ *  emits (see lib/server/aggregate.ts). It used to return percentage shares,
+ *  which the donut then totalled into a meaningless "100 records" centre on
+ *  every campaign. Keep this in counts so the seed can never mean something
+ *  different from the live data it stands in for. */
 export function sentimentData() {
   return [
-    { name: "Positive", value: 47, color: "#16a34a" },
-    { name: "Neutral", value: 34, color: "#94a3b8" },
-    { name: "Negative", value: 19, color: "#dc2626" },
+    { name: "Positive", value: 4700, color: "#16a34a" },
+    { name: "Neutral", value: 3400, color: "#94a3b8" },
+    { name: "Negative", value: 1900, color: "#dc2626" },
   ];
 }
 

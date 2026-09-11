@@ -4,7 +4,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Card, Icon, Spinner, Tabs, TypeBadge, TypeDot, cx } from "@/components/ui";
 import { aggregate, fmtNum, selType, typeKey } from "@/lib/data";
-import { ApiRequestError, createIngestJob, getAnalytics, getJob, isJobNotFound, jobProgressPercent, listCampaigns } from "@/lib/api";
+import {
+  ApiRequestError,
+  createIngestJob,
+  getAnalytics,
+  getJob,
+  isJobNotFound,
+  jobProgressPercent,
+  listCampaigns,
+  listCampaignsByIds,
+} from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, TypeKey } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
@@ -40,7 +49,7 @@ export default function Page() {
   const router = useRouter();
   const { currency, analyzeTargets } = useApp();
 
-  // live batches — start empty; listCampaigns() supplies mock only when the
+  // live batches — start empty; the data seam supplies mock only when the
   // backend is off. On a live backend mock data never enters this screen.
   const [batches, setBatches] = useState<Batch[]>([]);
   // Gate ingestion until the real campaign list has resolved. Otherwise the
@@ -50,16 +59,43 @@ export default function Page() {
   const [ingest, setIngest] = useState(0);
   const [ingesting, setIngesting] = useState(true);
   const [analytics, setAnalytics] = useState<AggregatesDoc | null>(null);
-  const [live, setLive] = useState(false); // backend is on for this run
+  // null until we know which mode this run is in. `listCampaigns` reports it
+  // (its `source` comes from backendStatus), so the flag is set before the
+  // first tab renders instead of after the ingest job resolves. Only a
+  // positively-known "mock" source unlocks the seeded demo charts: an unknown
+  // mode must never show a customer fabricated numbers.
+  const [live, setLive] = useState<boolean | null>(null);
+  const liveRef = useRef<boolean | null>(null);
+  const demo = live === false;
   const [ingestError, setIngestError] = useState<string | null>(null);
+  // Set when a refresh checked upstream and found nothing new. Distinguishes
+  // "your data is current" from a refresh that quietly did nothing — the
+  // ambiguity the customer read as the numbers being unreliable.
+  const [upToDate, setUpToDate] = useState(false);
+  // `analyzeTargets` is set by whichever screen sent the customer here, so the
+  // ids are known before this runs and only their names and totals are missing.
+  // Resolve exactly those: listing the whole account to find a handful of them
+  // paged thousands of unrelated jobs, and a scan that hit its cap dropped the
+  // selected ids from the result — which this screen then reported as "no
+  // longer available" for campaigns that were never gone. Only an arrival with
+  // no selection at all still needs a listing, to pick a sensible default.
+  const selectedIds = analyzeTargets ?? [];
+  const selectedKey = selectedIds.join(",");
   useEffect(() => {
     let alive = true;
-    listCampaigns()
-      .then(({ batches }) => {
-        if (alive && batches.length) setBatches(batches);
+    const ids = selectedKey ? selectedKey.split(",") : [];
+    (ids.length ? listCampaignsByIds(ids) : listCampaigns())
+      .then(({ batches, source }) => {
+        if (!alive) return;
+        liveRef.current = source === "live";
+        setLive(liveRef.current);
+        // Applied even when empty: an id that resolved to nothing really is
+        // gone, and `missingTargetIds` below is what tells the customer so.
+        setBatches(batches);
       })
       .catch((error: unknown) => {
         if (!alive) return;
+        liveRef.current = true;
         setLive(true);
         setIngestError(error instanceof Error ? error.message : "Unable to load campaign batches.");
         setIngesting(false);
@@ -70,7 +106,7 @@ export default function Page() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [selectedKey]);
 
   const targets = useMemo<Batch[]>(() => {
     if (!batches.length) return [];
@@ -104,7 +140,12 @@ export default function Page() {
   const [runToken, setRunToken] = useState(0); // bumped by "Refresh data"
   const refreshRef = useRef(false);
   const runIngest = () => {
+    // The button is disabled while `ingesting`, but the effect only raised that
+    // flag inside a queueMicrotask — long enough for a double-click to enqueue
+    // two ingest jobs. Flip it here, synchronously, before the run is queued.
+    if (ingesting) return;
     refreshRef.current = true;
+    setIngesting(true);
     setRunToken((n: number) => n + 1);
   };
 
@@ -222,12 +263,21 @@ export default function Page() {
         .then((job) => {
           if (!alive || settled) return;
           if (!job) {
-            setLive(false);
-            simulate();
+            // No job only means "backend off" in demo mode. On a live backend
+            // it is a lapsed session (the client is already redirecting) — the
+            // simulated progress bar would be theatre over no data at all.
+            if (liveRef.current === false) {
+              setLive(false);
+              simulate();
+              return;
+            }
+            fail(new Error("Ingestion could not be started — your session may have expired."));
             return;
           }
+          liveRef.current = true;
           setLive(true);
           if (job.ready || !job.jobId) {
+            if (job.upToDate) setUpToDate(true);
             void finish();
             return;
           }
@@ -248,10 +298,12 @@ export default function Page() {
       if (!alive) return;
       setIngesting(true);
       setIngestError(null);
-      if (refresh) {
-        setIngest(0);
-        setAnalytics(null);
-      }
+      setUpToDate(false);
+      // Drop the previous aggregate on every re-run, not only on a refresh: a
+      // selection change must never leave the old campaign's charts rendered
+      // under the new campaign's header.
+      setAnalytics(null);
+      if (refresh) setIngest(0);
     });
 
     if (pollJobId) {
@@ -368,7 +420,10 @@ export default function Page() {
             <div className="text-[13px] text-slate-400 mt-1.5 flex items-center gap-2 flex-wrap">
               <span className="font-mono">{targets.map((t: Batch) => t.batchId).join(", ").slice(0, 60)}</span>
               <span>·</span>
-              <span>{fmtNum(totalRecords)} records</span>
+              {/* The bulk job's dispatched contact count. Deliberately NOT the
+                  same number as Overview's "Records ingested" — these two
+                  legitimately differ, so each says which one it is. */}
+              <span title="Contacts dispatched by the bulk job, as reported upstream">{fmtNum(totalRecords)} records dispatched</span>
             </div>
           </div>
 
@@ -385,8 +440,8 @@ export default function Page() {
                   <div className="h-1.5 w-full rounded-full bg-slate-200 overflow-hidden">
                     <div className="h-full rounded-full transition-all" style={{ width: ingest + "%", background: "var(--accent)" }} />
                   </div>
-                  <div className="text-[11px] tabnum text-slate-400 mt-1">
-                    {fmtNum(ingested)} / {fmtNum(totalRecords)}
+                  <div className="text-[11px] tabnum text-slate-400 mt-1" title="Estimated progress against the dispatched contact count">
+                    {fmtNum(ingested)} / {fmtNum(totalRecords)} dispatched
                   </div>
                 </div>
               ) : ingestError ? (
@@ -395,7 +450,8 @@ export default function Page() {
                 </div>
               ) : analytics ? (
                 <div className="flex items-center gap-2 text-[13px] font-semibold text-emerald-600">
-                  <Icon name="CircleCheck" size={16} /> Up to date
+                  <Icon name="CircleCheck" size={16} />
+                  {upToDate ? "No new data upstream" : "Up to date"}
                 </div>
               ) : <div className="text-[13px] font-semibold text-amber-600">No analytics available</div>}
             </div>
@@ -415,22 +471,25 @@ export default function Page() {
 
       {/* live-data notices: surface ingest failure / no-data instead of silently
           rendering demo data on a live backend */}
-      {!ingesting && live && ingestError && (
+      {!ingesting && !demo && ingestError && (
         <div className="mb-5 flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50/70 px-4 py-3 text-[13px] text-red-700">
           <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
           <span>Ingestion failed: {ingestError}. Try “Refresh data” to retry.</span>
         </div>
       )}
-      {!ingesting && live && !ingestError && !analytics && (
+      {!ingesting && !demo && !ingestError && !analytics && (
         <div className="mb-5 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-[13px] text-amber-700">
           <Icon name="Info" size={15} className="mt-0.5 shrink-0" />
-          <span>No analytics available for this selection yet — the batches may have no ingested records. Charts below are illustrative.</span>
+          <span>No analytics available for this selection yet — the batches may have no ingested records. The charts below stay empty rather than showing sample data.</span>
         </div>
       )}
 
-      {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
-      {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
-      {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} />}
+      {/* `demo` unlocks the seeded charts in lib/data.ts and is true only when
+          the backend is off; `loading` keeps "still pulling" distinct from
+          "loaded and genuinely empty". */}
+      {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} analytics={analytics} demo={demo} loading={ingesting} />}
+      {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} demo={demo} loading={ingesting} />}
+      {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} demo={demo} loading={ingesting} />}
       {tab === "insights" && (
         <InsightsTab
           key={`${idsKey}:${analytics?.key ?? "pending"}`}
@@ -440,6 +499,7 @@ export default function Page() {
           analytics={analytics}
           dataLoading={ingesting}
           dataError={ingestError}
+          demo={demo}
         />
       )}
 

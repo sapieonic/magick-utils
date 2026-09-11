@@ -8,6 +8,18 @@ export function fingerprint(parts: (string | number | null | undefined)[]): stri
   return h.digest("hex").slice(0, 16);
 }
 
+/** JSON with object keys sorted at every level, so a value whose serialization
+ *  order varies upstream (a Go map, a re-ordered DB group-by) still hashes to
+ *  one fingerprint. Key order changing alone used to read as "the data moved". */
+export function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value ?? null);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+}
+
 /** Fingerprint for a set of batch ids (order-independent). */
 export function batchSetKey(batchIds: string[]): string {
   return fingerprint([...batchIds].sort());

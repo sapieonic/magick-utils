@@ -43,7 +43,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // memory only — re-derived via fetchMe() on load, not persisted.
   const [user, setUserState] = useState<SessionUserInfo | null>(null);
   const [currency, setCurrencyState] = useState<Currency>("inr");
-  const [dateRange, setDateRangeState] = useState<string>("Last 30 days");
+  // "All time" is the only honest default for a shared range control: Campaigns
+  // is an inventory screen, and any narrower default hides history the customer
+  // never asked to hide. Narrowing stays one click away in the Topbar (and in the
+  // Campaigns filter bar), and survives the session via sessionStorage.
+  const [dateRange, setDateRangeState] = useState<string>("All time");
   const [combineTargets, setCombineTargetsState] = useState<string[]>([]);
   const [analyzeTargets, setAnalyzeTargetsState] = useState<string[]>([]);
   const [hydrated, setHydrated] = useState(false);

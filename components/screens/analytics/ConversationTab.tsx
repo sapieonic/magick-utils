@@ -12,7 +12,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { ChartCard } from "@/components/ui";
+import { ChartCard, cx } from "@/components/ui";
 import {
   TOPICS,
   durationHistogram,
@@ -29,6 +29,7 @@ import {
   seriesMax,
 } from "@/lib/chart-axis";
 import type { AggregatesDoc } from "@/lib/server/types";
+import { ChartPlaceholder } from "./ChartPlaceholder";
 import { ChartTip } from "./ChartTip";
 import { Legend } from "./Legend";
 import { StatusDonut } from "./StatusDonut";
@@ -36,25 +37,61 @@ import { StatusDonut } from "./StatusDonut";
 const SENTIMENT_COLORS: Record<string, string> = { Positive: "#16a34a", Neutral: "#94a3b8", Negative: "#dc2626" };
 const FUNNEL_COLORS = ["#94a3b8", "#3b82f6", "#16a34a", "#6366f1"];
 
-export function ConversationTab({ hasVoice, hasMsg, analytics }: { hasVoice: boolean; hasMsg: boolean; analytics?: AggregatesDoc | null }) {
+/** Shown wherever the upstream records carry no per-call AI analysis. It is the
+ *  real state for plenty of selections, so say it plainly rather than filling
+ *  the card with seeded intents. */
+const NO_AI_ANALYSIS = "These records don't include per-call AI analysis, so nothing can be charted here.";
+
+/** `demo` is true only when the backend is off (`lib/data.ts` seeds the whole
+ *  screen). On a live backend a missing series renders an honest empty state —
+ *  mock numbers must never sit beside real ones. */
+export function ConversationTab({
+  hasVoice,
+  hasMsg,
+  analytics,
+  demo = false,
+  loading = false,
+}: {
+  hasVoice: boolean;
+  hasMsg: boolean;
+  analytics?: AggregatesDoc | null;
+  demo?: boolean;
+  loading?: boolean;
+}) {
+  // Unlike every other series here, the duration histogram is always six rows:
+  // `aggregate()` emits one per bucket whether or not anything landed in it. A
+  // selection of unanswered calls — or one with no ingested records at all —
+  // therefore arrives as six zeroes, and a length check alone would draw an
+  // empty chart instead of saying so.
   const dur = useMemo(
-    () => (analytics?.durationHistogram ? analytics.durationHistogram : durationHistogram()),
-    [analytics],
+    () => withSignal(
+      analytics?.durationHistogram ?? (demo ? durationHistogram() : null),
+      (row) => row.calls > 0 || row.talk > 0,
+    ),
+    [analytics, demo],
   );
   const sent = useMemo(
     () =>
-      analytics?.sentiment
-        ? analytics.sentiment.map((s) => ({ name: s.name, value: s.value, color: SENTIMENT_COLORS[s.name] ?? "#94a3b8" }))
-        : sentimentData(),
-    [analytics],
+      nonEmpty(
+        analytics?.sentiment
+          ? analytics.sentiment.map((s) => ({ name: s.name, value: s.value, color: SENTIMENT_COLORS[s.name] ?? "#94a3b8" }))
+          : demo
+            ? sentimentData()
+            : null,
+      ),
+    [analytics, demo],
   );
-  const topics = analytics?.topics ?? TOPICS;
+  const topics = useMemo(() => nonEmpty(analytics?.topics ?? (demo ? TOPICS : null)), [analytics, demo]);
   const funnel = useMemo(
     () =>
-      analytics?.funnel
-        ? analytics.funnel.map((f, i) => ({ stage: f.stage, value: f.value, color: FUNNEL_COLORS[i % FUNNEL_COLORS.length] }))
-        : messagingFunnel(),
-    [analytics],
+      nonEmpty(
+        analytics?.funnel
+          ? analytics.funnel.map((f, i) => ({ stage: f.stage, value: f.value, color: FUNNEL_COLORS[i % FUNNEL_COLORS.length] }))
+          : demo
+            ? messagingFunnel()
+            : null,
+      ),
+    [analytics, demo],
   );
   return (
     <div className="space-y-4 fade-in">
@@ -64,33 +101,84 @@ export function ConversationTab({ hasVoice, hasMsg, analytics }: { hasVoice: boo
             className="lg:col-span-2"
             title="Call duration & talk-time"
             subtitle="Distribution across length buckets"
-            action={<Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#c7d2fe", l: "Talk-time" }]} />}
+            action={dur && <Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#c7d2fe", l: "Talk-time" }]} />}
           >
-            <DurationChart data={dur} />
+            {dur ? (
+              <DurationChart data={dur} />
+            ) : (
+              <ChartPlaceholder
+                loading={loading}
+                icon="Clock"
+                title="No call durations yet"
+                body="No connected calls with a recorded duration were ingested for this selection."
+                height={260}
+              />
+            )}
           </ChartCard>
           <ChartCard title="Sentiment" subtitle="From per-call AI analysis">
             <div className="flex flex-col items-center">
-              <StatusDonut data={sent} />
+              {sent ? (
+                // Both the real aggregate and the demo seed are per-sentiment
+                // record counts, so the donut's centre total is meaningful here.
+                <StatusDonut data={sent} />
+              ) : (
+                <ChartPlaceholder loading={loading} icon="Smile" title="No sentiment yet" body={NO_AI_ANALYSIS} height={220} />
+              )}
             </div>
           </ChartCard>
         </div>
       )}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <ChartCard title="Key topics" subtitle="Most frequent intents detected by the model">
-          <TopicList topics={topics} />
+        <ChartCard
+          className={cx(!hasMsg && !demo && "lg:col-span-2")}
+          title="Key topics"
+          subtitle="Most frequent intents detected by the model"
+        >
+          {topics ? (
+            <TopicList topics={topics} />
+          ) : (
+            <ChartPlaceholder loading={loading} icon="MessagesSquare" title="No key topics yet" body={NO_AI_ANALYSIS} variant="rows" />
+          )}
         </ChartCard>
         {hasMsg ? (
           <ChartCard title="Delivery funnel" subtitle="Sent → delivered → read → replied">
-            <FunnelView data={funnel} />
+            {funnel ? (
+              <FunnelView data={funnel} />
+            ) : (
+              <ChartPlaceholder
+                loading={loading}
+                icon="Send"
+                title="No delivery funnel yet"
+                body="No delivery, read or reply events have been ingested for these messages."
+                variant="rows"
+              />
+            )}
           </ChartCard>
         ) : (
-          <ChartCard title="Sentiment trend" subtitle="Positive share is climbing late-campaign">
-            <SentimentTrend />
-          </ChartCard>
+          // Sentiment-over-time isn't part of `AggregatesDoc`, so outside demo
+          // mode this card could only ever apologise. Drop it entirely and let
+          // "Key topics" span the row instead of leaving an empty cell.
+          demo && (
+            <ChartCard title="Sentiment trend" subtitle="Positive share by week">
+              <SentimentTrend />
+            </ChartCard>
+          )
         )}
       </div>
     </div>
   );
+}
+
+/** `[]` is truthy, so an aggregate that legitimately contains an empty series
+ *  would otherwise render an axis with no bars. Collapse both holes to null. */
+function nonEmpty<T>(rows: T[] | null | undefined): T[] | null {
+  return rows && rows.length ? rows : null;
+}
+
+/** As `nonEmpty`, for a series whose rows exist regardless of whether anything
+ *  was measured: present only when at least one row carries a real value. */
+function withSignal<T>(rows: T[] | null | undefined, hasValue: (row: T) => boolean): T[] | null {
+  return rows && rows.some(hasValue) ? rows : null;
 }
 
 function DurationChart({ data }: { data: { bucket: string; calls: number; talk: number }[] }) {
@@ -126,8 +214,14 @@ function DurationChart({ data }: { data: { bucket: string; calls: number; talk: 
   );
 }
 
+/** Demo-only: the seeded rising line reads no real data, and nothing in
+ *  `AggregatesDoc` can replace it — so this is rendered only when the backend
+ *  is off. */
 function SentimentTrend() {
-  const data = sparkline(99, 12, 40, 10).map((d, i) => ({ name: `Wk ${i + 1}`, positive: Math.min(70, 35 + i * 2.5 + (d.v % 8)) }));
+  const data = useMemo(
+    () => sparkline(99, 12, 40, 10).map((d, i) => ({ name: `Wk ${i + 1}`, positive: Math.min(70, 35 + i * 2.5 + (d.v % 8)) })),
+    [],
+  );
   return (
     <div style={{ height: 240 }}>
       <ResponsiveContainer width="100%" height="100%">
@@ -165,7 +259,7 @@ function TopicList({ topics }: { topics: { topic: string; count: number; sentime
               <span className="text-[12px] tabnum text-slate-400 ml-2">{fmtNum(t.count)}</span>
             </div>
             <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
-              <div className="h-full rounded-full" style={{ width: `${(t.count / max) * 100}%`, background: tone[t.sentiment] }} />
+              <div className="h-full rounded-full" style={{ width: `${(t.count / (max || 1)) * 100}%`, background: tone[t.sentiment] ?? "#94a3b8" }} />
             </div>
           </div>
         </div>
@@ -180,8 +274,8 @@ function FunnelView({ data }: { data: { stage: string; value: number; color: str
   return (
     <div className="space-y-2.5 py-2">
       {data.map((d, i) => {
-        const pct = (d.value / max) * 100;
-        const dropFromPrev = i > 0 ? ((data[i - 1].value - d.value) / data[i - 1].value) * 100 : 0;
+        const pct = max ? (d.value / max) * 100 : 0;
+        const dropFromPrev = i > 0 && data[i - 1].value ? ((data[i - 1].value - d.value) / data[i - 1].value) * 100 : 0;
         return (
           <div key={i}>
             <div className="flex items-center justify-between text-[13px] mb-1">

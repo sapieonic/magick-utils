@@ -6,6 +6,10 @@ import { ChartTip } from "./ChartTip";
 
 type DonutSeg = { key?: string; name: string; value: number; color: string };
 
+/** Every caller feeds this donut per-record counts, so the centre total and
+ *  the "records" wording are always true of the data. A share/percentage
+ *  series would need the centre suppressed — add that back with the caller
+ *  that needs it rather than carrying an option nothing exercises. */
 export function StatusDonut({ data }: { data: DonutSeg[] }) {
   const total = data.reduce((a, b) => a + b.value, 0);
   return (
@@ -31,7 +35,9 @@ export function StatusDonut({ data }: { data: DonutSeg[] }) {
           <span key={i} className="inline-flex items-center gap-1.5 text-xs text-slate-500">
             <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ background: d.color }} />
             <span className="truncate">{d.name}</span>
-            <span className="ml-auto tabnum font-semibold text-slate-700">{Math.round((d.value / total) * 100)}%</span>
+            <span className="ml-auto tabnum font-semibold text-slate-700">
+              {total > 0 ? `${Math.round((d.value / total) * 100)}%` : "—"}
+            </span>
           </span>
         ))}
       </div>

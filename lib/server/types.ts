@@ -4,6 +4,16 @@
 import type { BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
 import type { AppTimezone } from "@/lib/timezone";
 
+/** Whether a batch has a complete published revision that readers can be served.
+ *  "stale" qualifies: its records are complete and are what every reader sees,
+ *  it just has upstream changes waiting to be pulled. Defined here, next to the
+ *  field, so analytics, exports, the dashboard and the ingest route cannot drift
+ *  apart on what counts as readable — they did, and the disagreement surfaced as
+ *  intermittent 409s. */
+export function isBatchReadable(batch: Pick<BatchDoc, "ingestStatus">): boolean {
+  return batch.ingestStatus === "ready" || batch.ingestStatus === "stale";
+}
+
 /** The authenticated tenant/account context derived from the session cookie. */
 export interface TenantContext {
   tenantId: string;
@@ -36,10 +46,22 @@ export interface BatchDoc {
   /** Revision of the upstream bulk-job summary, distinct from the committed
    * normalized dataset fingerprint above. */
   sourceFingerprint?: string;
+  /** The `sourceFingerprint` the currently published revision was ingested
+   * from. Equal to the current `sourceFingerprint` means the batch is in step
+   * with its source; differing marks it stale. */
+  ingestedSourceFingerprint?: string;
+  /** The upstream job's `updated_at` when the published revision was ingested.
+   * Deliberately NOT part of `sourceFingerprint` (it churns on writes that
+   * change no record), but a skip decision needs it: it is the only signal that
+   * catches message receipts, replies and post-call AI enrichment, none of
+   * which move a field the fingerprint covers. */
+  ingestedSourceUpdatedAt?: string | null;
   /** Immutable record revision currently visible to readers. Older documents
    * without this field use the legacy unversioned record set. */
   publishedRevision?: string;
-  ingestStatus: "none" | "ingesting" | "ready" | "error";
+  /** "stale" = a published revision is still readable, but upstream has moved
+   * on since it was ingested. Readable like "ready"; a refresh will re-pull. */
+  ingestStatus: "none" | "ingesting" | "ready" | "stale" | "error";
   /** Current worker ownership, used for conditional revision publication. */
   ingestJobId?: string;
   ingestLeaseId?: string;

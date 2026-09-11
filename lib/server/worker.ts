@@ -9,6 +9,8 @@ import {
   claimNextJob,
   countRecords,
   deleteBatchRevisionRecords,
+  deleteOrphanedRecordRevisions,
+  deleteSupersededRecordRevisions,
   deleteUnpublishedBatchRevision,
   failBatchIfOwned,
   getBatch,
@@ -18,6 +20,7 @@ import {
   renewIngestionLocks,
   retireBatchRevision,
   replaceBatchRecords,
+  SUPERSEDED_REVISION_GRACE_MS,
   updateClaimedJob,
 } from "./repositories";
 import { MagickApiError, MagickClient } from "./magick-client";
@@ -31,6 +34,9 @@ const PAGE_SIZE = 100;
 const IDLE_DELAY_MS = 2500;
 const DEFAULT_RETRY_AFTER_MS = 30_000;
 const LEASE_MS = 60_000;
+/** Small margin so a deferred sweep fires strictly after the grace cutoff it
+ *  is waiting on, rather than racing it by a millisecond. */
+export const SWEEP_DELAY_MARGIN_MS = 5_000;
 
 let started = false;
 
@@ -164,6 +170,35 @@ export async function processJob(job: Job) {
   if (!completed) throw new Error("job lease lost before completion");
 }
 
+/** Reclaim the revision a publish just superseded, after the reader grace
+ *  window it sits inside has elapsed.
+ *
+ *  Deferred rather than awaited: the worker must not block a job for minutes,
+ *  and the rows are unreachable the moment the published pointer moves. The
+ *  timer is unref'd so it can never hold the process open, and the cron sweep
+ *  remains the backstop if the host restarts before it fires. At fire time the
+ *  batch's CURRENT published revision is what must be spared — another refresh
+ *  may have published a newer one in the meantime. */
+function scheduleSupersededRevisionSweep(ctx: TenantContext, batchId: string, publishedRevision: string) {
+  const timer = setTimeout(() => {
+    void (async () => {
+      const current = await getBatch(ctx.tenantId, ctx.accountId, batchId).catch(() => null);
+      const keep = current?.publishedRevision ?? publishedRevision;
+      const reclaimed = await deleteSupersededRecordRevisions(ctx.tenantId, ctx.accountId, batchId, keep);
+      if (reclaimed > 0) {
+        // Outside the job's async context, so correlation fields are passed explicitly.
+        logger.info(
+          { batchId, reclaimed, tenantId: ctx.tenantId, accountId: ctx.accountId },
+          "[worker] superseded revision rows reclaimed after grace",
+        );
+      }
+    })().catch((error) => {
+      logger.warn({ error, batchId }, "[worker] deferred revision sweep failed; cron will retry");
+    });
+  }, SUPERSEDED_REVISION_GRACE_MS + SWEEP_DELAY_MARGIN_MS);
+  timer.unref?.();
+}
+
 async function ingestBatch(
   client: MagickClient,
   ctx: TenantContext,
@@ -201,10 +236,42 @@ async function ingestBatch(
     );
     throw new Error("newer worker owns batch ingestion");
   }
+  // The job's last-modified stamp, read before this batch's first page so that
+  // anything upstream writes while we page leaves it behind and the next
+  // refresh re-pulls. Only a pull that starts at offset 0 gets one: a resumed
+  // job would be reading the stamp after its pause, and would then claim to
+  // include changes made during that pause. A null stamp simply means the batch
+  // never qualifies for a skip, which is the safe direction.
+  const sourceUpdatedAt = initialOffset === 0 && batch.sourceId
+    ? await client
+        .getBulkJob(batch.sourceId)
+        .then((job) => job.updated_at ?? null)
+        .catch((error) => {
+          log().warn({ error, batchId }, "[worker] source stamp unavailable; refreshes will re-pull this batch");
+          return null;
+        })
+    : null;
+
   const revision = jobId;
   const revisionCreatedAt = new Date();
   if (initialOffset === 0) {
     await deleteBatchRevisionRecords(ctx.tenantId, ctx.accountId, batchId, revision);
+  }
+  // Before staging, drop anything a previous crash orphaned for this batch —
+  // rows that never got a retiredAt marker and so are invisible to the normal
+  // sweep. The published revision and this job's own (possibly resumed) staging
+  // revision are explicitly spared.
+  const orphaned = await deleteOrphanedRecordRevisions(
+    ctx.tenantId,
+    ctx.accountId,
+    batchId,
+    [batch.publishedRevision, revision],
+  ).catch((error) => {
+    log().warn({ error, batchId }, "[worker] orphaned revision sweep skipped");
+    return 0;
+  });
+  if (orphaned > 0) {
+    log().info({ batchId, orphaned }, "[worker] orphaned revision rows reclaimed");
   }
 
   let offset = initialOffset;
@@ -326,6 +393,27 @@ async function ingestBatch(
     date: batch.date,
     fingerprint: freshFp,
     sourceFingerprint: batch.sourceFingerprint,
+    // Stamp what this revision was built from. The fingerprint is what later
+    // listings compare against to flag the batch stale; the timestamp is what a
+    // refresh checks before deciding it has nothing to pull.
+    //
+    // The fingerprint comes from the batch document — i.e. from the LIST payload
+    // the campaigns route last saw — and not from the detail payload fetched
+    // just above for `sourceUpdatedAt`, even though that one is fresher. A
+    // fingerprint is only meaningful against another fingerprint of the same
+    // shape: `/bulk-dispatch-jobs` and `/bulk-dispatch-jobs/{id}` are separate
+    // endpoints whose summary fields (`status_summary`, `call_status_counts`)
+    // need not agree, so stamping a detail-derived value would make the very
+    // next listing compute a different fingerprint and mark this batch stale
+    // forever, on every batch, immediately after a successful ingestion.
+    //
+    // Being a listing behind instead is the safe direction: a source change that
+    // landed mid-ingestion shows up as "stale" on the next listing, and the
+    // refresh that follows is no longer skippable (see refreshableBatchIds,
+    // which never skips a stale batch), so the two signals converge on the next
+    // pull rather than deadlocking.
+    ingestedSourceFingerprint: batch.sourceFingerprint,
+    ingestedSourceUpdatedAt: sourceUpdatedAt,
     publishedRevision: revision,
     ingestStatus: "ready",
     total: records.length,
@@ -348,6 +436,25 @@ async function ingestBatch(
   await retireBatchRevision(ctx.tenantId, ctx.accountId, batchId, previousRevision).catch((error) => {
     log().warn({ error, batchId, revision: previousRevision }, "[worker] retired revision marking deferred");
   });
+  // Reclaim copies superseded by earlier ingestions of this batch, which are
+  // already past the reader grace window. Repeated refreshes therefore cannot
+  // stack duplicate datasets — that stacking is what filled the cluster.
+  const reclaimed = await deleteSupersededRecordRevisions(
+    ctx.tenantId,
+    ctx.accountId,
+    batchId,
+    revision,
+  ).catch((error) => {
+    log().warn({ error, batchId }, "[worker] superseded revision sweep deferred to cron");
+    return 0;
+  });
+  if (reclaimed > 0) {
+    log().info({ batchId, reclaimed }, "[worker] superseded revision rows reclaimed");
+  }
+  // The copy THIS job just superseded is still inside the grace window, so the
+  // sweep above deliberately spared it. Come back for it once the window has
+  // passed instead of leaving a full duplicate dataset for the daily cron.
+  scheduleSupersededRevisionSweep(ctx, batchId, revision);
   const done = completedDone + records.length;
   const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
   if (!transitioned) throw new Error("job lease lost during batch transition");

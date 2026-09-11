@@ -14,10 +14,13 @@ const repositories = vi.hoisted(() => ({
   releaseIngestionLocks: vi.fn(),
   renewIngestionLocks: vi.fn(),
   retireBatchRevision: vi.fn(),
+  deleteSupersededRecordRevisions: vi.fn(),
+  deleteOrphanedRecordRevisions: vi.fn(),
+  SUPERSEDED_REVISION_GRACE_MS: 30 * 60 * 1000,
   replaceBatchRecords: vi.fn(),
   updateClaimedJob: vi.fn(),
 }));
-const client = vi.hoisted(() => ({ listCalls: vi.fn(), listMessages: vi.fn() }));
+const client = vi.hoisted(() => ({ listCalls: vi.fn(), listMessages: vi.fn(), getBulkJob: vi.fn() }));
 const logFns = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 
 vi.mock("@/lib/server/repositories", () => repositories);
@@ -31,13 +34,17 @@ vi.mock("@/lib/server/normalize", () => ({
   buildBatchDoc: (_records: unknown[], _ctx: unknown, batch: unknown) => batch,
 }));
 vi.mock("@/lib/server/logger", () => ({
-  logger: { info: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
   log: () => logFns,
 }));
 vi.mock("@/lib/server/observability/request-context", () => ({ runWithRequestContext: vi.fn() }));
 
+import { logger } from "@/lib/server/logger";
 import { MagickApiError } from "@/lib/server/magick-client";
-import { processJob, runClaimedJob } from "@/lib/server/worker";
+import { processJob, runClaimedJob, SWEEP_DELAY_MARGIN_MS } from "@/lib/server/worker";
+
+// Mirrors the repositories mock above; the real constant is covered by its own test.
+const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
 import type { Job } from "@/lib/server/types";
 
 const job = (patch: Partial<Job> = {}): Job => ({
@@ -82,6 +89,9 @@ beforeEach(() => {
   repositories.releaseIngestionLocks.mockResolvedValue(undefined);
   repositories.renewIngestionLocks.mockResolvedValue(undefined);
   repositories.retireBatchRevision.mockResolvedValue(undefined);
+  repositories.deleteSupersededRecordRevisions.mockResolvedValue(0);
+  repositories.deleteOrphanedRecordRevisions.mockResolvedValue(0);
+  client.getBulkJob.mockResolvedValue({ id: "source-b1", updated_at: "2026-09-01T09:00:00Z" });
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
 });
 
@@ -194,6 +204,157 @@ describe("processJob resume", () => {
     await expect(processJob(job({ batchIds: ["b1"], total: 100 }))).resolves.toBeUndefined();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ total: 0 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // Every ingestion stages a full new copy of a batch's records. Leaving the
+  // superseded copies for a daily cron meant each "Refresh data" click added a
+  // duplicate dataset that lingered for days, until storage ran out.
+  it("reclaims revisions superseded by earlier runs once the new one is published", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(repositories.retireBatchRevision).toHaveBeenCalledBefore(
+      repositories.deleteSupersededRecordRevisions,
+    );
+    expect(repositories.deleteSupersededRecordRevisions).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+  });
+
+  it("clears crash orphans before staging, sparing the published and staging revisions", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), publishedRevision: "rev-live" });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(repositories.deleteOrphanedRecordRevisions).toHaveBeenCalledWith(
+      "t1", "a1", "b1", ["rev-live", "j1"],
+    );
+    // Must run before any row of the new revision is written, so a resumed job
+    // never has its own staged work swept.
+    expect(repositories.deleteOrphanedRecordRevisions).toHaveBeenCalledBefore(
+      repositories.replaceBatchRecords,
+    );
+  });
+
+  // The sweep above spares anything inside the reader grace window, so it can
+  // never reclaim the revision this very job just retired. Without a second,
+  // deferred pass that duplicate survives until the daily cron — which is the
+  // storage growth the whole change exists to stop.
+  it("comes back for the revision it just superseded, once the grace has passed", async () => {
+    vi.useFakeTimers();
+    try {
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+      await processJob(job({ batchIds: ["b1"], total: 1 }));
+      expect(repositories.deleteSupersededRecordRevisions).toHaveBeenCalledTimes(1);
+
+      // At fire time the batch's CURRENT published revision is what must be
+      // spared — another refresh may have published a newer one since.
+      repositories.getBatch.mockResolvedValue({ ...batch("b1"), publishedRevision: "j2" });
+      await vi.advanceTimersByTimeAsync(SUPERSEDED_REVISION_GRACE_MS + SWEEP_DELAY_MARGIN_MS);
+
+      expect(repositories.deleteSupersededRecordRevisions).toHaveBeenCalledTimes(2);
+      expect(repositories.deleteSupersededRecordRevisions).toHaveBeenLastCalledWith("t1", "a1", "b1", "j2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not fail the job when the deferred sweep throws", async () => {
+    vi.useFakeTimers();
+    try {
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+      await processJob(job({ batchIds: ["b1"], total: 1 }));
+      repositories.deleteSupersededRecordRevisions.mockRejectedValue(new Error("mongo down"));
+      await vi.advanceTimersByTimeAsync(SUPERSEDED_REVISION_GRACE_MS + SWEEP_DELAY_MARGIN_MS);
+      // Swallowed and logged, never an unhandled rejection that takes the
+      // long-running worker process down hours after the job finished.
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ batchId: "b1" }),
+        expect.stringContaining("deferred revision sweep failed"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The stamp a refresh compares against must predate the pull: anything
+  // upstream writes while we page has to leave it behind, so the next refresh
+  // re-pulls rather than concluding nothing changed.
+  it("stamps the source timestamp read before paging began", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), sourceFingerprint: "src-fp" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", updated_at: "2026-09-01T10:00:00Z" });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.getBulkJob).toHaveBeenCalledWith("source-b1");
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ingestedSourceFingerprint: "src-fp",
+        ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("does not stamp a resumed pull, whose stamp would postdate its own pause", async () => {
+    repositories.getRecordsForRevision
+      .mockResolvedValueOnce([{ recordId: "1", status: "done" }])
+      .mockResolvedValue([{ recordId: "1", status: "done" }, { recordId: "2", status: "done" }]);
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "2" }], total: 2 });
+
+    await processJob(job({ batchIds: ["b1"], total: 2, done: 1, cursor: 1, batchIndex: 0 }));
+
+    // A rate-limited job can pause for longer than the changes it would be
+    // claiming to have captured.
+    expect(client.getBulkJob).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ ingestedSourceUpdatedAt: null }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("publishes without a stamp when the source job cannot be read", async () => {
+    client.getBulkJob.mockRejectedValue(new Error("upstream down"));
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    // No stamp means no skip: the next refresh re-pulls rather than guessing.
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ ingestedSourceUpdatedAt: null }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("still completes when the superseded-revision sweep fails", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+    repositories.deleteSupersededRecordRevisions.mockRejectedValue(new Error("mongo down"));
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 1 }))).resolves.toBeUndefined();
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ status: "done" }),
+    );
+  });
+
+  it("stamps the source fingerprint the published revision was built from", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), sourceFingerprint: "src-fp" });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    // Without this stamp a refresh cannot tell an unchanged source from a moved
+    // one, and re-pulls an identical dataset on every click.
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ ingestedSourceFingerprint: "src-fp" }),
       "j1",
       "lease-1",
     );

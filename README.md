@@ -73,6 +73,9 @@ Copy `.env.example` → `.env.local` and fill in:
 - `LLM_API_KEY`, `LLM_MODEL`, (optional) `LLM_BASE_URL`, `LLM_PROJECT_ID` — insights / chat
 - `NEXT_PUBLIC_FIREBASE_*` — web login config
 - `CRON_SECRET` — shared secret guarding the scheduled cleanup endpoint (see below)
+- `DATA_RETENTION_DAYS` — how long campaign data is kept (default `5`). **This is the limit on how far
+  back the Dashboard and Analytics can look**, so raise it if customers need previous months — see
+  [Scheduled cleanup](#scheduled-cleanup) for the storage trade-off.
 
 On boot, `instrumentation.ts` ensures Mongo indexes and starts the worker when the backend is configured.
 See [`BACKEND.md`](./BACKEND.md) for a full local-testing walkthrough against the live (read-only) services.
@@ -81,8 +84,9 @@ See [`BACKEND.md`](./BACKEND.md) for a full local-testing walkthrough against th
 
 To keep MongoDB small enough for the Atlas free tier, a daily GitHub Actions cron
 ([`.github/workflows/cleanup.yml`](./.github/workflows/cleanup.yml)) calls `POST /api/cron/cleanup`, which
-enforces a strict five-day retention window for batches and their normalized records, jobs, cached
-aggregates, cached insights, and retired record revisions. The endpoint is guarded by a Bearer
+enforces a retention window — `DATA_RETENTION_DAYS`, default five — for batches and their normalized
+records, jobs, cached aggregates and cached insights, and reclaims any superseded record revisions the
+ingestion worker did not (those are unreachable duplicates, so they are not on the retention clock). The endpoint is guarded by a Bearer
 `CRON_SECRET` and no-ops (503) until both `MONGODB_URI` and `CRON_SECRET` are set. The workflow runs for the `production` and `dedicated` GitHub
 Environments. Configure the following under each environment's secrets and variables:
 
@@ -90,7 +94,9 @@ Environments. Configure the following under each environment's secrets and varia
   `https://<your-host>/api/cron/cleanup`
 - `CRON_SECRET` — an environment secret with the same value as that deployment's app env var
 
-See [`BACKEND.md`](./BACKEND.md#scheduled-cleanup) for the retention rationale.
+See [`BACKEND.md`](./BACKEND.md#scheduled-cleanup) for the retention rationale, and
+[`docs/runbooks/storage-recovery.md`](./docs/runbooks/storage-recovery.md) for what to do when a
+cluster has already filled up.
 
 ## Status
 

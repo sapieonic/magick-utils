@@ -14,17 +14,33 @@ import {
 import type { Batch, Currency } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
 import { APP_TIMEZONE_LABEL } from "@/lib/timezone";
+import { ChartPlaceholder } from "./ChartPlaceholder";
 import { Legend } from "./Legend";
 
 type CostTipPayload = { name?: string; value?: number; color?: string };
 
-export function CostTab({ targets, currency, analytics }: { targets: Batch[]; currency: Currency; analytics?: AggregatesDoc | null }) {
-  const data = useMemo(
-    () => (analytics?.costOverTime ? analytics.costOverTime : costBreakdown()),
-    [analytics],
-  );
+/** `demo` is true only when the backend is off. On a live backend a missing
+ *  cost series renders empty rather than the seeded spend curve, which used to
+ *  flip to ₹0 the moment the real (genuinely zero-cost) aggregate landed. */
+export function CostTab({
+  targets,
+  currency,
+  analytics,
+  demo = false,
+  loading = false,
+}: {
+  targets: Batch[];
+  currency: Currency;
+  analytics?: AggregatesDoc | null;
+  demo?: boolean;
+  loading?: boolean;
+}) {
+  const data = useMemo(() => {
+    const rows = analytics?.costOverTime ?? (demo ? costBreakdown() : null);
+    return rows && rows.length ? rows : null;
+  }, [analytics, demo]);
   const { ticks, domain } = useMemo(
-    () => countYAxisScale(seriesMax(data.map((row) => toFiniteNumber(row.telephony) + toFiniteNumber(row.ai)))),
+    () => countYAxisScale(seriesMax((data ?? []).map((row) => toFiniteNumber(row.telephony) + toFiniteNumber(row.ai)))),
     [data],
   );
   const tel = analytics ? analytics.telephonyInr : targets.reduce((a, c) => a + c.telephonyInr, 0);
@@ -37,41 +53,51 @@ export function CostTab({ targets, currency, analytics }: { targets: Batch[]; cu
         <CostStat label="Telephony / delivery" value={fmtMoney(tel, currency)} sub={`${total ? Math.round((tel / total) * 100) : 0}% of spend`} color="var(--accent)" />
         <CostStat label="AI processing" value={fmtMoney(ai, currency)} sub={`${total ? Math.round((ai / total) * 100) : 0}% of spend`} color="#8b3fd6" />
       </div>
-      <ChartCard title="Cost over time" subtitle={`Telephony vs AI processing · times in ${APP_TIMEZONE_LABEL}`} action={<Legend items={[{ c: "var(--accent)", l: "Telephony" }, { c: "#c4b5fd", l: "AI" }]} />}>
-        <div style={{ height: 280 }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data} margin={{ ...VOLUME_CHART_MARGIN }}>
-              <defs>
-                <linearGradient id="cTel" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
-                  <stop offset="100%" stopColor="var(--accent)" stopOpacity={0.03} />
-                </linearGradient>
-                <linearGradient id="cAi" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#c4b5fd" stopOpacity={0.45} />
-                  <stop offset="100%" stopColor="#c4b5fd" stopOpacity={0.03} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
-              <XAxis dataKey="date" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
-              <YAxis
-                type="number"
-                scale="linear"
-                domain={domain}
-                ticks={ticks}
-                interval={0}
-                allowDecimals={false}
-                tick={{ fontSize: 11, fill: "#94a3b8" }}
-                tickLine={false}
-                axisLine={false}
-                tickFormatter={(v: number) => (currency === "usd" ? "$" + fmtCompact(v / FX) : "₹" + fmtCompact(v))}
-                width={COST_Y_AXIS_WIDTH}
-              />
-              <Tooltip content={<CostTip currency={currency} />} />
-              <Area type="monotone" dataKey="telephony" stackId="1" stroke="var(--accent)" strokeWidth={2} fill="url(#cTel)" />
-              <Area type="monotone" dataKey="ai" stackId="1" stroke="#a78bfa" strokeWidth={2} fill="url(#cAi)" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
+      <ChartCard title="Cost over time" subtitle={`Telephony vs AI processing · times in ${APP_TIMEZONE_LABEL}`} action={data && <Legend items={[{ c: "var(--accent)", l: "Telephony" }, { c: "#c4b5fd", l: "AI" }]} />}>
+        {!data ? (
+          <ChartPlaceholder
+            loading={loading}
+            icon="Wallet"
+            title="No cost timeline yet"
+            body="No dated telephony or AI charges have been ingested for this selection."
+            height={280}
+          />
+        ) : (
+          <div style={{ height: 280 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={data} margin={{ ...VOLUME_CHART_MARGIN }}>
+                <defs>
+                  <linearGradient id="cTel" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
+                    <stop offset="100%" stopColor="var(--accent)" stopOpacity={0.03} />
+                  </linearGradient>
+                  <linearGradient id="cAi" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#c4b5fd" stopOpacity={0.45} />
+                    <stop offset="100%" stopColor="#c4b5fd" stopOpacity={0.03} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#eef0f3" vertical={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 11, fill: "#94a3b8" }} tickLine={false} axisLine={false} />
+                <YAxis
+                  type="number"
+                  scale="linear"
+                  domain={domain}
+                  ticks={ticks}
+                  interval={0}
+                  allowDecimals={false}
+                  tick={{ fontSize: 11, fill: "#94a3b8" }}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(v: number) => (currency === "usd" ? "$" + fmtCompact(v / FX) : "₹" + fmtCompact(v))}
+                  width={COST_Y_AXIS_WIDTH}
+                />
+                <Tooltip content={<CostTip currency={currency} />} />
+                <Area type="monotone" dataKey="telephony" stackId="1" stroke="var(--accent)" strokeWidth={2} fill="url(#cTel)" />
+                <Area type="monotone" dataKey="ai" stackId="1" stroke="#a78bfa" strokeWidth={2} fill="url(#cAi)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        )}
       </ChartCard>
     </div>
   );

@@ -34,7 +34,9 @@ describe("AppProvider defaults", () => {
     const { result } = renderHook(() => useApp(), { wrapper });
     expect(result.current.workspace).toBeNull();
     expect(result.current.currency).toBe("inr");
-    expect(result.current.dateRange).toBe("Last 30 days");
+    // A fresh session must not hide history: the shared range starts unfiltered,
+    // so Campaigns lists everything until the user narrows it.
+    expect(result.current.dateRange).toBe("All time");
     expect(result.current.combineTargets).toEqual([]);
     expect(result.current.analyzeTargets).toEqual([]);
   });
