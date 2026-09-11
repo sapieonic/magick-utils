@@ -13,6 +13,12 @@ vi.mock("@/lib/server/repositories", () => ({
   findActiveJobForBatches: vi.fn().mockResolvedValue(null),
   releaseIngestionLocks: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock("@/lib/server/magick-client", () => ({
+  MagickClient: vi.fn(() => ({ getBulkJob })),
+}));
+
+// hoisted so the (also-hoisted) MagickClient factory above can close over it
+const { getBulkJob } = vi.hoisted(() => ({ getBulkJob: vi.fn() }));
 
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext, getSession } from "@/lib/server/session";
@@ -154,13 +160,18 @@ describe("POST /api/ingest", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
-  it("re-pulls ready analyze batches when refresh is true", async () => {
+  it("re-pulls ready analyze batches when refresh is true and the source moved", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
-    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "ready" } as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceFingerprint: "fp-old",
+    } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    // A different upstream summary ⇒ a different fingerprint ⇒ real work to do.
+    getBulkJob.mockResolvedValue({ id: "job-1", total_contacts: 12, status: "completed" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
@@ -168,7 +179,73 @@ describe("POST /api/ingest", () => {
     expect(json).toMatchObject({ total: 10, done: 0, ready: false });
     expect(typeof json.jobId).toBe("string");
     expect(createJob).toHaveBeenCalledTimes(1);
-    expect(countRecords).not.toHaveBeenCalled();
+  });
+
+  // Each ingestion writes a complete new copy of every record, so an
+  // unconditional refresh let repeated clicks fill the cluster's storage.
+  it("skips a refresh whose upstream source has not moved since the last ingestion", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    const job = { id: "job-1", total_contacts: 10, status: "completed" };
+    const { bulkJobSourceFingerprint } = await import("@/lib/server/map");
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceFingerprint: bulkJobSourceFingerprint(job),
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue(job);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  it("refreshes a stale batch, which is readable but behind its source", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "stale",
+      sourceId: "job-1", ingestedSourceFingerprint: "fp-old",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", total_contacts: 12, status: "completed" });
+    const { POST } = await import("@/app/api/ingest/route");
+    expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-ingests rather than skipping when the upstream source check fails", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceFingerprint: "fp-old",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockRejectedValue(new Error("upstream down"));
+    const { POST } = await import("@/app/api/ingest/route");
+    expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not consult upstream for a batch that was never fully ingested", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none", sourceId: "job-1" } as never);
+    vi.mocked(countRecords).mockResolvedValue(0);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
+    expect(getBulkJob).not.toHaveBeenCalled();
+    expect(createJob).toHaveBeenCalledTimes(1);
   });
 
   it("400 invalid_refresh", async () => {

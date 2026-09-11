@@ -20,6 +20,8 @@ vi.mock("recharts", () => {
     Area: Empty,
     BarChart: Pass,
     Bar: Pass,
+    LineChart: Pass,
+    Line: Pass,
     PieChart: Pass,
     Pie: Pass,
     Cell: Pass,
@@ -140,5 +142,59 @@ describe("Analytics page ingest resume", () => {
     await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-2"));
     expect(getAnalytics).not.toHaveBeenCalled();
     expect(await screen.findByText(/Ingesting records/)).toBeInTheDocument();
+  });
+});
+
+describe("Analytics page live/demo separation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+    appState.analyzeTargets = ["b1"];
+  });
+
+  it("never shows seeded analytics while a live ingest is still running", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    // the job never resolves — this is the window the customer was shown mock data in
+    vi.mocked(createIngestJob).mockReturnValue(new Promise(() => {}));
+    render(<Page />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Conversation/ }));
+    expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
+    expect(screen.queryByText("1,284")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("status").length).toBeGreaterThan(0);
+  });
+
+  it("keeps demo mode on the seeded data when the backend is off", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "mock" });
+    vi.mocked(createIngestJob).mockResolvedValue(null);
+    render(<Page />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Conversation/ }));
+    expect(await screen.findByText("Payment plan request")).toBeInTheDocument();
+  });
+
+  it("labels the header count as dispatched, not as a bare record total", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
+    vi.mocked(getAnalytics).mockResolvedValue(aggregates);
+    render(<Page />);
+
+    expect(await screen.findByText("10 records dispatched")).toBeInTheDocument();
+  });
+
+  it("does not enqueue a second ingest when Refresh data is double-clicked", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
+    vi.mocked(getAnalytics).mockResolvedValue(aggregates);
+    render(<Page />);
+    expect(await screen.findByText("Up to date")).toBeInTheDocument();
+
+    const refresh = screen.getByRole("button", { name: /Refresh data/i });
+    fireEvent.click(refresh);
+    fireEvent.click(refresh); // same tick — the disabled flag must already be up
+
+    await waitFor(() => expect(createIngestJob).toHaveBeenCalledWith(["b1"], "ingest", { refresh: true }));
+    const refreshRuns = vi.mocked(createIngestJob).mock.calls.filter(([, , options]) => options?.refresh);
+    expect(refreshRuns).toHaveLength(1);
   });
 });

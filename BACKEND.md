@@ -33,6 +33,20 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
   records, rebuild the `BatchDoc`. Resumable progress via `Job.done`/`cursor`.
 
+### Batch freshness (`BatchDoc.ingestStatus`)
+`none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as
+**`stale`**: upstream's job summary has moved since the revision was ingested, but that revision is
+complete and is still what every reader sees. Stale batches therefore serve analytics, exports and the
+dashboard normally, and keep their ingested figures — including the record total. Resetting them to
+`none` instead made the record count flip between page loads, 409'd the next analytics call, and drove a
+full duplicate re-ingest on every campaigns listing.
+
+Freshness is decided by comparing `sourceFingerprint` (the current upstream summary, via
+`bulkJobSourceFingerprint`) with `ingestedSourceFingerprint` (what the published revision was built
+from). The fingerprint deliberately excludes the job's `updated_at`, which upstream bumps without any
+record changing. `POST /api/ingest` with `refresh: true` re-reads each job and only re-pulls the batches
+whose fingerprint actually moved, so a refresh of unchanged data writes nothing.
+
 ## API routes (`app/api/`)
 | Route | Method | Purpose |
 |-------|--------|---------|
@@ -54,12 +68,23 @@ Typical flow: log in → pick workspace → `GET /api/campaigns` → `POST /api/
 poll `GET /api/jobs/:id` → then `analytics` / `insights` / `export` work against the ingested records.
 
 ## Scheduled cleanup
-`POST /api/cron/cleanup` enforces a strict five-day retention window across persisted application data
-so the MongoDB Atlas free tier stays small. It removes cached **aggregates**, all **jobs**, and cached
-**insights** after five days. It also deletes every source **batch** older than five days together with
-all normalized **records** owned by that batch, and removes retired record revisions after five days.
-The batch's immutable upstream creation date is the retention clock, so listing campaigns again cannot
-extend the lifetime of old data.
+`POST /api/cron/cleanup` enforces a retention window across persisted application data so the MongoDB
+Atlas free tier stays small. The window is `DATA_RETENTION_DAYS` (default 5) and covers cached
+**aggregates**, all **jobs**, cached **insights**, and every source **batch** older than the window
+together with all normalized **records** owned by that batch. The batch's immutable upstream creation
+date is the retention clock, so listing campaigns again cannot extend the lifetime of old data.
+
+**This window is also the product limit on history.** Campaigns older than it are gone, so the Dashboard
+and Analytics cannot show "previous months" until it is raised. Raising it costs storage roughly in
+proportion, so size it against the cluster the deployment actually has.
+
+Retired **record revisions** are not on that clock. Each ingestion stages a complete new copy of a
+batch's records under a fresh revision and publishes it atomically; the superseded copy is unreachable
+from that moment on. The worker reclaims it inline after each publish
+(`deleteSupersededRecordRevisions`), and this endpoint sweeps whatever a crash mid-publish left behind —
+both on a short grace window (`SUPERSEDED_REVISION_GRACE_MS`, minutes) that only covers a reader which
+resolved the old pointer just before the swap. Holding those duplicates for days instead is what
+previously let repeated "Refresh data" clicks exhaust the cluster's storage for every tenant.
 
 The endpoint runs without a user session, guarded by a shared Bearer secret (`CRON_SECRET`). It's driven
 by a daily GitHub Actions cron (`.github/workflows/cleanup.yml`) for the `production` and `dedicated`

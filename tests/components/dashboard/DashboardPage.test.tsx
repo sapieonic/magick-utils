@@ -38,6 +38,15 @@ const campaign: Batch = {
 describe("DashboardScreen campaign volume", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  // The campaigns listing caps how many upstream jobs it scans, so filtering
+  // client-side from an unfiltered pull silently truncated long ranges.
+  it("asks for the selected range rather than filtering a capped pull", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(getDashboardVolume).mockResolvedValue(null);
+    render(<DashboardScreen />);
+    await waitFor(() => expect(listCampaigns).toHaveBeenCalledWith("Last 30 days"));
+  });
+
   it("shows campaign-list call volume without waiting on ingested records", async () => {
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
     vi.mocked(getDashboardVolume).mockRejectedValue(new Error("dashboard unavailable"));

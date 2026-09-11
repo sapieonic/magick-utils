@@ -28,6 +28,9 @@ import {
   consumeAiQuota,
   deleteBatchDataOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
+  deleteSupersededRecordRevisions,
+  failBatchIfOwned,
+  SUPERSEDED_REVISION_GRACE_MS,
   IngestionConflictError,
   refreshBatchFromSource,
 } from "@/lib/server/repositories";
@@ -141,6 +144,83 @@ describe("batch worker ownership", () => {
     batchDb.updateOne.mockResolvedValue({ matchedCount: 0 });
     await expect(beginBatchIngestion({ tenantId: "t1", accountId: "a1", batchId: "b1" } as never, "j1", "old", "2026-08-12T12:01:00Z"))
       .resolves.toBe(false);
+  });
+
+  // A batch behind its source still has a complete published revision, so a
+  // refresh must not make it unreadable while it runs.
+  it("keeps a stale batch readable for the duration of a refresh", async () => {
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+    const doc = { tenantId: "t1", accountId: "a1", batchId: "b1", ingestStatus: "stale" };
+
+    await beginBatchIngestion(doc as never, "j1", "lease-new", "2026-08-12T12:02:00Z");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
+  });
+
+  it("marks a first-time batch as ingesting, since it has nothing to serve yet", async () => {
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+    const doc = { tenantId: "t1", accountId: "a1", batchId: "b1", ingestStatus: "none" };
+
+    await beginBatchIngestion(doc as never, "j1", "lease-new", "2026-08-12T12:02:00Z");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("ingesting");
+  });
+
+  it("resolves a failed refresh back to stale when the source has moved on", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp-new", ingestedSourceFingerprint: "fp-old",
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    // "ready" here would hide the pending work and skip the next refresh.
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
+  });
+
+  it("resolves a failed refresh to ready when the source never moved", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("ready");
+  });
+
+  it("marks a batch with no published revision as errored", async () => {
+    batchDb.findOne.mockResolvedValue({ tenantId: "t1", accountId: "a1", batchId: "b1" });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("error");
+  });
+});
+
+describe("superseded revision reclamation", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("deletes this batch's retired revisions past the grace window, keeping the published one", async () => {
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 6204 });
+    const before = Date.now();
+
+    await expect(deleteSupersededRecordRevisions("t1", "a1", "b1", "rev-new")).resolves.toBe(6204);
+
+    const filter = recordDb.deleteMany.mock.calls[0][0];
+    expect(filter).toMatchObject({
+      tenantId: "t1",
+      accountId: "a1",
+      batchId: "b1",
+      revision: { $exists: true, $ne: "rev-new" },
+    });
+    // Only explicitly retired rows are eligible — a concurrent job's staging
+    // revision carries no retiredAt and must never be swept mid-ingestion.
+    const cutoff = (filter.retiredAt as { $lt: Date }).$lt.getTime();
+    expect(cutoff).toBeLessThanOrEqual(before - SUPERSEDED_REVISION_GRACE_MS);
   });
 });
 

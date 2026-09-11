@@ -36,10 +36,16 @@ export interface BatchDoc {
   /** Revision of the upstream bulk-job summary, distinct from the committed
    * normalized dataset fingerprint above. */
   sourceFingerprint?: string;
+  /** The `sourceFingerprint` the currently published revision was ingested
+   * from. Equal to `sourceFingerprint` means the stored records still match
+   * upstream, so a re-ingest would rewrite an identical dataset. */
+  ingestedSourceFingerprint?: string;
   /** Immutable record revision currently visible to readers. Older documents
    * without this field use the legacy unversioned record set. */
   publishedRevision?: string;
-  ingestStatus: "none" | "ingesting" | "ready" | "error";
+  /** "stale" = a published revision is still readable, but upstream has moved
+   * on since it was ingested. Readable like "ready"; a refresh will re-pull. */
+  ingestStatus: "none" | "ingesting" | "ready" | "stale" | "error";
   /** Current worker ownership, used for conditional revision publication. */
   ingestJobId?: string;
   ingestLeaseId?: string;

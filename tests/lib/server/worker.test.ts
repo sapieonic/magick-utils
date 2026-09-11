@@ -14,6 +14,7 @@ const repositories = vi.hoisted(() => ({
   releaseIngestionLocks: vi.fn(),
   renewIngestionLocks: vi.fn(),
   retireBatchRevision: vi.fn(),
+  deleteSupersededRecordRevisions: vi.fn(),
   replaceBatchRecords: vi.fn(),
   updateClaimedJob: vi.fn(),
 }));
@@ -82,6 +83,7 @@ beforeEach(() => {
   repositories.releaseIngestionLocks.mockResolvedValue(undefined);
   repositories.renewIngestionLocks.mockResolvedValue(undefined);
   repositories.retireBatchRevision.mockResolvedValue(undefined);
+  repositories.deleteSupersededRecordRevisions.mockResolvedValue(0);
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
 });
 
@@ -194,6 +196,47 @@ describe("processJob resume", () => {
     await expect(processJob(job({ batchIds: ["b1"], total: 100 }))).resolves.toBeUndefined();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ total: 0 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // Every ingestion stages a full new copy of a batch's records. Leaving the
+  // superseded copies for a daily cron meant each "Refresh data" click added a
+  // duplicate dataset that lingered for days, until storage ran out.
+  it("reclaims superseded revisions inline once the new one is published", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(repositories.retireBatchRevision).toHaveBeenCalledBefore(
+      repositories.deleteSupersededRecordRevisions,
+    );
+    expect(repositories.deleteSupersededRecordRevisions).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+  });
+
+  it("still completes when the superseded-revision sweep fails", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+    repositories.deleteSupersededRecordRevisions.mockRejectedValue(new Error("mongo down"));
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 1 }))).resolves.toBeUndefined();
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ status: "done" }),
+    );
+  });
+
+  it("stamps the source fingerprint the published revision was built from", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), sourceFingerprint: "src-fp" });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    // Without this stamp a refresh cannot tell an unchanged source from a moved
+    // one, and re-pulls an identical dataset on every click.
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ ingestedSourceFingerprint: "src-fp" }),
       "j1",
       "lease-1",
     );

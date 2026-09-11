@@ -107,6 +107,24 @@ function messageBreakdown(status: string, total: number): BreakdownSeg[] {
   return [{ key, value: total }];
 }
 
+/** Fingerprint of the upstream bulk-job summary, used to decide whether an
+ *  already-ingested batch still matches its source.
+ *
+ *  Deliberately excludes `updated_at`: magick-master bumps it on any write to
+ *  the job, including enrichment that changes no record. Including it made this
+ *  fingerprint churn on ordinary campaign listings, which reset ingested
+ *  batches and cost a full duplicate re-ingest every time. Only fields that
+ *  imply the underlying record set moved belong here. */
+export function bulkJobSourceFingerprint(job: RawBulkJob): string {
+  return fingerprint([
+    (job.id ?? "").toString(),
+    job.total_contacts ?? 0,
+    job.status,
+    JSON.stringify(job.status_summary ?? null),
+    JSON.stringify(job.call_status_counts ?? null),
+  ]);
+}
+
 /** Build a (pre-ingestion) BatchDoc summary from a bulk-dispatch job.
  *
  *  Counts are derived strictly from the data magick-master returns on the job —
@@ -117,28 +135,28 @@ function messageBreakdown(status: string, total: number): BreakdownSeg[] {
  *   - messaging types derive a single bucket from the job's own `status`
  *     (see messageBreakdown) — that is native data, not invented.
  *
- *  Once the ingestion worker has run (existing.ingestStatus === "ready") its exact
- *  per-record figures are authoritative, so we preserve the existing breakdown,
- *  successRate, spend and averages rather than overwrite them with this estimate. */
+ *  Once the ingestion worker has run its exact per-record figures are
+ *  authoritative, so we preserve the existing breakdown, successRate, spend,
+ *  averages and record total rather than overwrite them with this estimate —
+ *  including when the upstream summary has moved on (ingestStatus "stale").
+ *  Downgrading an ingested batch back to "none" here used to make the record
+ *  count visibly jump between page loads, 409 the next analytics call, and
+ *  trigger a full re-ingest. */
 export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?: BatchDoc | null): BatchDoc {
   const map = dispatchTypeToType(job.dispatch_type);
   const sourceId = (job.id ?? "").toString();
   const sourceTotal = job.total_contacts ?? 0;
-  const ingested = existing?.ingestStatus === "ready";
-  const sourceFp = fingerprint([
-    sourceId,
-    sourceTotal,
-    job.status,
-    job.updated_at,
-    JSON.stringify(job.status_summary ?? null),
-    JSON.stringify(job.call_status_counts ?? null),
-  ]);
+  const ingested = existing?.ingestStatus === "ready" || existing?.ingestStatus === "stale";
+  const sourceFp = bulkJobSourceFingerprint(job);
   // Records ingested before source fingerprints were introduced cannot be
-  // proven current. Invalidate them once so the next read rebuilds the source.
+  // proven current, so they count as stale until the next ingestion stamps one.
   const sourceChanged = Boolean(
     ingested && (!existing?.sourceFingerprint || existing.sourceFingerprint !== sourceFp),
   );
-  const committed = Boolean(ingested && !sourceChanged && existing);
+  // An ingested dataset stays authoritative even once upstream moves on: its
+  // records are still the ones every reader sees, so its figures — the record
+  // total above all — must not flip back to the coarse upstream estimate.
+  const committed = Boolean(ingested && existing);
   // Once committed, unique normalized records—not a possibly stale/raw contact
   // count—are authoritative for readiness, analytics, and exports.
   const total = committed ? existing!.total : sourceTotal;
@@ -201,8 +219,13 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     // replace it with the coarser upstream job summary on every list refresh.
     fingerprint: ingested && existing ? existing.fingerprint : sourceFp,
     sourceFingerprint: sourceFp,
+    // Preserved so a refresh can tell an unchanged source (nothing to re-pull)
+    // from a genuinely moved one without asking the worker to prove it.
+    ingestedSourceFingerprint: existing?.ingestedSourceFingerprint,
     publishedRevision: existing?.publishedRevision,
-    ingestStatus: sourceChanged ? "none" : existing?.ingestStatus ?? "none",
+    // "stale" keeps the published revision readable — analytics and exports
+    // keep working off it — while marking that a refresh has something to pull.
+    ingestStatus: sourceChanged ? "stale" : existing?.ingestStatus ?? "none",
     updatedAt: new Date().toISOString(),
   };
 }

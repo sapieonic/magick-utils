@@ -18,6 +18,7 @@ export function InsightsTab({
   analytics,
   dataLoading = false,
   dataError = null,
+  demo = false,
 }: {
   targets: Batch[];
   currency: Currency;
@@ -25,6 +26,9 @@ export function InsightsTab({
   analytics: AggregatesDoc | null;
   dataLoading?: boolean;
   dataError?: string | null;
+  /** True only when the backend is off — the sole case where the seeded
+   *  heatmap may stand in for a real one. */
+  demo?: boolean;
 }) {
   const [gen, setGen] = useState<"loading" | "ready" | "error">("loading");
   const [genError, setGenError] = useState<string | null>(null);
@@ -105,7 +109,7 @@ export function InsightsTab({
   );
   const compareMode = baselineId != null;
 
-  const reach = analytics?.reachByTimeOfDay ?? (analytics == null ? reachHeatmapMock() : undefined);
+  const reach = analytics?.reachByTimeOfDay ?? (demo && analytics == null ? reachHeatmapMock() : undefined);
   const effectiveGen = analytics ? gen : dataLoading ? "loading" : "error";
   const effectiveGenError = analytics
     ? genError

@@ -98,3 +98,57 @@ describe("OverviewTab — analytics vs agg fallback", () => {
     expect(screen.getByText("1m 30s")).toBeInTheDocument();
   });
 });
+
+describe("OverviewTab — no mock data on a live backend", () => {
+  const liveAgg: AggregatesDoc = {
+    tenantId: "t",
+    accountId: "a",
+    key: "k",
+    batchIds: [],
+    totalRecords: 6073,
+    statusMix: [{ key: "completed", value: 6073 }],
+    successRate: 0.5,
+    spendInr: 0,
+    telephonyInr: 0,
+    aiInr: 0,
+    computedAt: "2026-06-13",
+  };
+
+  it("leaves the volume chart empty when the aggregate carries no timeline", () => {
+    render(
+      <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={liveAgg} />,
+    );
+    expect(screen.getByText("No volume timeline yet")).toBeInTheDocument();
+    // the seeded callsOverTime() series would bring its own legend along
+    expect(screen.queryByText("Calls")).not.toBeInTheDocument();
+    expect(screen.queryByText("Messages")).not.toBeInTheDocument();
+  });
+
+  it("shows a loading state rather than an empty one while the pull is running", () => {
+    render(
+      <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={null} loading />,
+    );
+    expect(screen.getAllByRole("status").length).toBeGreaterThan(0);
+    expect(screen.queryByText("No volume timeline yet")).not.toBeInTheDocument();
+  });
+
+  it("renders the seeded volume series in demo mode", () => {
+    render(
+      <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={null} demo />,
+    );
+    expect(screen.queryByText("No volume timeline yet")).not.toBeInTheDocument();
+    expect(screen.getByText("Calls")).toBeInTheDocument();
+  });
+
+  it("names the record counts so ingested and dispatched can't be confused", () => {
+    const { rerender } = render(
+      <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={liveAgg} />,
+    );
+    expect(screen.getByText("Records ingested")).toBeInTheDocument();
+    expect(screen.getByText("6,073")).toBeInTheDocument();
+    expect(screen.queryByText("Records analyzed")).not.toBeInTheDocument();
+
+    rerender(<OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice />);
+    expect(screen.getByText("Records dispatched")).toBeInTheDocument();
+  });
+});

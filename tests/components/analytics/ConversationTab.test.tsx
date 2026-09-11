@@ -93,3 +93,86 @@ describe("ConversationTab — FunnelView", () => {
     expect(screen.getByText("Custom intent X")).toBeInTheDocument();
   });
 });
+
+// The production bug: every card fell back to the seeds in lib/data.ts whenever
+// `analytics` was null, so a real customer saw fabricated topics/sentiment.
+describe("ConversationTab — no mock data on a live backend", () => {
+  it("renders empty states instead of the seeded topics/sentiment when analytics is null", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={null} />);
+
+    // none of the seeded TOPICS rows
+    expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
+    expect(screen.queryByText("Already paid")).not.toBeInTheDocument();
+    expect(screen.queryByText("1,284")).not.toBeInTheDocument();
+    // no seeded duration histogram / sentiment donut
+    expect(screen.queryByText("100")).not.toBeInTheDocument();
+    expect(screen.queryByText("records")).not.toBeInTheDocument();
+
+    expect(screen.getByText("No key topics yet")).toBeInTheDocument();
+    expect(screen.getByText("No sentiment yet")).toBeInTheDocument();
+    expect(screen.getByText("No call durations yet")).toBeInTheDocument();
+    // the cause stated plainly, without over-claiming
+    expect(screen.getAllByText(/don't include per-call AI analysis/).length).toBeGreaterThan(0);
+  });
+
+  it("renders empty states when a cached aggregate is missing individual chart fields", () => {
+    // `[]` is a legitimate real answer and must not fall back to the seeds either.
+    render(<ConversationTab hasVoice hasMsg={false} analytics={{ ...base, topics: [], sentiment: [] }} />);
+    expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
+    expect(screen.getByText("No key topics yet")).toBeInTheDocument();
+    expect(screen.getByText("No sentiment yet")).toBeInTheDocument();
+  });
+
+  it("does not fabricate a sentiment trend — the seeded rising line is demo-only", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={base} />);
+    expect(screen.getByText("Sentiment trend")).toBeInTheDocument();
+    expect(screen.getByText("No sentiment trend available")).toBeInTheDocument();
+    // the old hardcoded claim is gone
+    expect(screen.queryByText("Positive share is climbing late-campaign")).not.toBeInTheDocument();
+    expect(screen.queryByText("Wk 1")).not.toBeInTheDocument();
+  });
+
+  it("distinguishes loading from loaded-and-empty", () => {
+    const { rerender } = render(<ConversationTab hasVoice hasMsg={false} analytics={null} loading />);
+    expect(screen.getAllByRole("status").length).toBeGreaterThan(0);
+    expect(screen.queryByText("No key topics yet")).not.toBeInTheDocument();
+    expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
+
+    rerender(<ConversationTab hasVoice hasMsg={false} analytics={null} />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByText("No key topics yet")).toBeInTheDocument();
+  });
+
+  it("labels the sentiment donut centre as records only for real counts", () => {
+    render(
+      <ConversationTab
+        hasVoice
+        hasMsg={false}
+        analytics={{ ...base, sentiment: [{ name: "Positive", value: 12 }, { name: "Negative", value: 5 }] }}
+      />,
+    );
+    expect(screen.getByText("17")).toBeInTheDocument();
+    expect(screen.getByText("records")).toBeInTheDocument();
+  });
+});
+
+describe("ConversationTab — demo mode (backend off)", () => {
+  it("still renders the seeded topics and sentiment", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={null} demo />);
+    expect(screen.getByText("Payment plan request")).toBeInTheDocument();
+    expect(screen.getByText("1,284")).toBeInTheDocument();
+    // the seeded trend line is fine here, but its subtitle no longer asserts a trend
+    expect(screen.getByText("Positive share by week")).toBeInTheDocument();
+  });
+
+  // The seed used to be percentage shares, which the donut totalled into a
+  // meaningless "100 records" centre on every campaign and every filter.
+  it("never shows a '100 records' sentiment centre", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={null} demo />);
+    expect(screen.queryByText("100")).not.toBeInTheDocument();
+    // The seed is in record counts now, so the centre total is real.
+    expect(screen.getByText("10.0K")).toBeInTheDocument();
+    // …and the legend still shows each segment's share.
+    expect(screen.getByText("47%")).toBeInTheDocument();
+  });
+});

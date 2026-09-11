@@ -71,7 +71,7 @@ function SortHead({
 }
 
 export default function CampaignsScreen() {
-  const { currency, setCombineTargets, setAnalyzeTargets } = useApp();
+  const { currency, dateRange, setCombineTargets, setAnalyzeTargets } = useApp();
   const router = useRouter();
   const [search, setSearch] = useState("");
   const [channel, setChannel] = useState("all");
@@ -84,29 +84,42 @@ export default function CampaignsScreen() {
   // Start empty — never seed with mock. listCampaigns() returns mock only when
   // the backend is off; on a live backend no mock rows ever render here.
   const [campaigns, setCampaigns] = useState<Batch[]>([]);
-  const [loading, setLoading] = useState(true);
+  // The range the rows on screen belong to. Anything else — including the
+  // initial null — means the list is still catching up, so a range switch shows
+  // the skeleton instead of stale rows (same idiom as the dashboard).
+  const [loadedRange, setLoadedRange] = useState<string | null>(null);
+  const loading = loadedRange !== dateRange;
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // load via the data seam — returns mock when the backend is off, live data when on
+  // load via the data seam — returns mock when the backend is off, live data when
+  // on. The Topbar's date range is server-side filtering, so this refetches
+  // whenever it changes; `active` drops a response that a faster switch has
+  // already superseded.
   useEffect(() => {
     let active = true;
-    listCampaigns()
+    listCampaigns(dateRange)
       .then((r) => {
         if (active) {
           setCampaigns(r.batches);
           setLoadError(null);
+          // A new range is a new result set — paging back to the top keeps the
+          // pager inside the filtered count.
+          setPage(1);
         }
       })
       .catch((error: unknown) => {
-        if (active) setLoadError(error instanceof Error ? error.message : "Unable to load campaigns.");
+        if (!active) return;
+        // Never leave the previous range's rows on screen under a failed load.
+        setCampaigns([]);
+        setLoadError(error instanceof Error ? error.message : "Unable to load campaigns.");
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active) setLoadedRange(dateRange);
       });
     return () => {
       active = false;
     };
-  }, []);
+  }, [dateRange]);
 
   const providers = useMemo(() => ["all", ...Array.from(new Set(campaigns.map((c: Batch) => c.provider)))], [campaigns]);
 

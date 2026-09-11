@@ -34,9 +34,10 @@ export const POST = withLogging("analytics", async (req: Request) => {
     return NextResponse.json({ error: "invalid_refresh" }, { status: 400 });
   }
   let batchIds: string[];
+  let batchDocs;
   try {
     batchIds = parseBatchIds(body?.batchIds);
-    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    batchDocs = await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -54,7 +55,11 @@ export const POST = withLogging("analytics", async (req: Request) => {
   }
 
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
-  if (records.length === 0) {
+  // A selection that dispatched nothing has nothing to read, and that is a
+  // valid answer rather than a conflict — 409-ing it surfaced as a hard error
+  // on screen and pushed the client into a pointless re-ingest. Only missing
+  // records the batches claim to have indicate ingestion really has not run.
+  if (records.length === 0 && batchDocs.some((batch) => batch.total > 0)) {
     log().warn({ batchCount: batchIds.length }, "analytics requested for un-ingested batches");
     return NextResponse.json({ error: "not_ingested", message: "Run ingestion for these batches first." }, { status: 409 });
   }

@@ -185,9 +185,42 @@ describe("bulkJobToBatchDoc", () => {
       id: "job-stale", dispatch_type: "ai_voice_call", status: "completed",
       total_contacts: 12, updated_at: "2026-08-12T11:00:00Z",
     }, ctx, committed);
-    expect(refreshed.ingestStatus).toBe("none");
+    // "stale", never "none": the published revision is still what every reader
+    // sees, so analytics must keep serving it instead of 409-ing and re-pulling.
+    expect(refreshed.ingestStatus).toBe("stale");
     expect(refreshed.fingerprint).toBe("dataset-fp");
     expect(refreshed.sourceFingerprint).not.toBe(committed.sourceFingerprint);
+    // The ingested record count must not flip back to the raw contact count —
+    // that is what made the header total jump between page loads.
+    expect(refreshed.total).toBe(committed.total);
+  });
+
+  it("ignores updated_at churn, which upstream bumps without changing records", () => {
+    const base: RawBulkJob = {
+      id: "job-churn", dispatch_type: "ai_voice_call", status: "processing",
+      total_contacts: 10, status_summary: { completed: 4 }, updated_at: "2026-08-12T10:00:00Z",
+    };
+    const first = bulkJobToBatchDoc(base, ctx);
+    const committed: BatchDoc = { ...first, ingestStatus: "ready", total: 9, fingerprint: "dataset-fp" };
+    const refreshed = bulkJobToBatchDoc({ ...base, updated_at: "2026-08-12T11:30:00Z" }, ctx, committed);
+    expect(refreshed.sourceFingerprint).toBe(committed.sourceFingerprint);
+    expect(refreshed.ingestStatus).toBe("ready");
+    expect(refreshed.total).toBe(9);
+  });
+
+  it("keeps a stale batch's ingested figures across further listings", () => {
+    const first = bulkJobToBatchDoc({
+      id: "job-stale-2", dispatch_type: "ai_voice_call", status: "processing", total_contacts: 10,
+    }, ctx);
+    const stale: BatchDoc = {
+      ...first, ingestStatus: "stale", total: 9, spendInr: 42, fingerprint: "dataset-fp",
+    };
+    const refreshed = bulkJobToBatchDoc({
+      id: "job-stale-2", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 11,
+    }, ctx, stale);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.total).toBe(9);
+    expect(refreshed.spendInr).toBe(42);
   });
 
   it("does not copy worker ownership fields from an existing batch", () => {

@@ -9,6 +9,7 @@ import {
   claimNextJob,
   countRecords,
   deleteBatchRevisionRecords,
+  deleteSupersededRecordRevisions,
   deleteUnpublishedBatchRevision,
   failBatchIfOwned,
   getBatch,
@@ -326,6 +327,9 @@ async function ingestBatch(
     date: batch.date,
     fingerprint: freshFp,
     sourceFingerprint: batch.sourceFingerprint,
+    // Stamp what this revision was actually built from, so a later refresh can
+    // tell an unchanged source (nothing to re-pull) from a moved one.
+    ingestedSourceFingerprint: batch.sourceFingerprint,
     publishedRevision: revision,
     ingestStatus: "ready",
     total: records.length,
@@ -348,6 +352,21 @@ async function ingestBatch(
   await retireBatchRevision(ctx.tenantId, ctx.accountId, batchId, previousRevision).catch((error) => {
     log().warn({ error, batchId, revision: previousRevision }, "[worker] retired revision marking deferred");
   });
+  // Reclaim every superseded copy of this batch now rather than leaving a full
+  // duplicate dataset per ingestion for the daily cron to find. Best-effort:
+  // the cron still sweeps whatever a crash here leaves behind.
+  const reclaimed = await deleteSupersededRecordRevisions(
+    ctx.tenantId,
+    ctx.accountId,
+    batchId,
+    revision,
+  ).catch((error) => {
+    log().warn({ error, batchId }, "[worker] superseded revision sweep deferred to cron");
+    return 0;
+  });
+  if (reclaimed > 0) {
+    log().info({ batchId, reclaimed }, "[worker] superseded revision rows reclaimed");
+  }
   const done = completedDone + records.length;
   const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
   if (!transitioned) throw new Error("job lease lost during batch transition");

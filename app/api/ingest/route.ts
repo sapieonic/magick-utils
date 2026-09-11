@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext } from "@/lib/server/session";
+import { MagickClient } from "@/lib/server/magick-client";
+import { bulkJobSourceFingerprint } from "@/lib/server/map";
 import {
   acquireIngestionLocks,
   countRecords,
@@ -10,12 +12,69 @@ import {
   IngestionConflictError,
   releaseIngestionLocks,
 } from "@/lib/server/repositories";
-import type { Job, JobType } from "@/lib/server/types";
+import type { BatchDoc, Job, JobType, TenantContext } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
 import { parseBatchIds, selectionErrorResponse, validateSelection } from "@/lib/server/selection";
 import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
+
+/** Both "ready" and "stale" mean a complete published revision exists. */
+function isReadable(batch: BatchDoc): boolean {
+  return batch.ingestStatus === "ready" || batch.ingestStatus === "stale";
+}
+
+/** Upstream reads issued at once while deciding what a refresh has to re-pull.
+ *  A selection can hold up to MAX_SELECTION_BATCHES batches; firing them all at
+ *  magick-master together invites a 429 on the very request meant to avoid work. */
+const REFRESH_CHECK_CONCURRENCY = 10;
+
+/**
+ * Narrow a refresh to the batches whose source actually moved.
+ *
+ * Every ingestion writes a complete new copy of a batch's records, so an
+ * unconditional refresh rewrote an identical dataset on each click — the
+ * mechanism that repeatedly exhausted the cluster's storage. Re-read each
+ * batch's bulk job and keep only those whose source fingerprint differs from
+ * the one its published revision was built from (or that have no complete
+ * revision at all).
+ *
+ * Deliberately conservative: a batch whose upstream job cannot be read is kept
+ * in the refresh. Doing redundant work is recoverable; skipping a batch the
+ * customer explicitly asked to refresh is not.
+ */
+async function refreshableBatchIds(
+  ctx: TenantContext,
+  batchIds: string[],
+  batchDocs: BatchDoc[],
+  complete: boolean[],
+): Promise<string[]> {
+  const client = new MagickClient(ctx);
+  const keep: string[] = [];
+  for (let i = 0; i < batchIds.length; i += REFRESH_CHECK_CONCURRENCY) {
+    const slice = batchIds.slice(i, i + REFRESH_CHECK_CONCURRENCY);
+    const decisions = await Promise.all(
+      slice.map(async (batchId, offset) => {
+        const index = i + offset;
+        const batch = batchDocs[index];
+        // Nothing complete to compare against — this is a plain first ingest.
+        if (!complete[index] || !batch.ingestedSourceFingerprint || !batch.sourceId) return batchId;
+        try {
+          const job = await client.getBulkJob(batch.sourceId);
+          if (bulkJobSourceFingerprint(job) === batch.ingestedSourceFingerprint) {
+            log().info({ batchId }, "refresh skipped — upstream source unchanged since last ingestion");
+            return null;
+          }
+        } catch (err) {
+          log().warn({ err, batchId }, "refresh source check failed — re-ingesting to be safe");
+        }
+        return batchId;
+      }),
+    );
+    for (const batchId of decisions) if (batchId) keep.push(batchId);
+  }
+  return keep;
+}
 
 /** Enqueue an ingestion (or merge) job for a set of batches. The worker picks it
  *  up, paginates magick-master, normalizes, and persists records to Mongo. */
@@ -56,18 +115,21 @@ export const POST = withLogging("ingest", async (req: Request) => {
   // not; a page reload used to enqueue a second full ingest of ready batches.
   const forceRefresh = type === "ingest" && body.refresh === true;
 
-  // Skip batches whose normalized records already match the known total, unless
-  // the caller explicitly asked to refresh ingest. Merge has always done this
-  // so CSV download does not scale with upstream API speed/rate limits.
-  let batchIds = requestedBatchIds;
-  if (!forceRefresh) {
-    const counts = await Promise.all(
-      requestedBatchIds.map((id) => countRecords(ctx.tenantId, ctx.accountId, [id])),
-    );
-    batchIds = requestedBatchIds.filter((_, index) => batchDocs[index].ingestStatus !== "ready" || counts[index] !== batchDocs[index].total);
-    if (batchIds.length === 0) {
-      return NextResponse.json({ jobId: null, total: 0, done: 0, ready: true });
-    }
+  // Skip batches whose normalized records already match the known total. Merge
+  // has always done this so CSV download does not scale with upstream API
+  // speed/rate limits. A refresh applies the same test against a freshly read
+  // source rather than skipping the test outright — see refreshableBatchIds.
+  const counts = await Promise.all(
+    requestedBatchIds.map((id) => countRecords(ctx.tenantId, ctx.accountId, [id])),
+  );
+  const complete = requestedBatchIds.map(
+    (_, index) => isReadable(batchDocs[index]) && counts[index] === batchDocs[index].total,
+  );
+  const batchIds = forceRefresh
+    ? await refreshableBatchIds(ctx, requestedBatchIds, batchDocs, complete)
+    : requestedBatchIds.filter((_, index) => !complete[index]);
+  if (batchIds.length === 0) {
+    return NextResponse.json({ jobId: null, total: 0, done: 0, ready: true });
   }
 
   const activeJob = await findActiveJobForBatches(ctx.tenantId, ctx.accountId, batchIds);

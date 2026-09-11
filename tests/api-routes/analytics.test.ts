@@ -12,9 +12,10 @@ vi.mock("@/lib/server/fingerprint", () => ({ aggregatesKey: vi.fn(() => "agg-key
 vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
 vi.mock("@/lib/server/selection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/server/selection")>()),
-  validateSelection: vi.fn().mockResolvedValue([]),
+  validateSelection: vi.fn(),
 }));
 
+import { validateSelection } from "@/lib/server/selection";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getRecords, setAggregates } from "@/lib/server/repositories";
@@ -30,7 +31,11 @@ function req(body?: unknown, badJson = false) {
 }
 
 describe("POST /api/analytics", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Default: a selection whose batches are ready and non-empty.
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10 }] as never);
+  });
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
@@ -72,15 +77,32 @@ describe("POST /api/analytics", () => {
     expect(getRecords).not.toHaveBeenCalled();
   });
 
-  it("409 not_ingested when no records", async () => {
+  it("409 not_ingested when records the batch claims to have are missing", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10 }] as never);
     vi.mocked(getRecords).mockResolvedValue([] as never);
     const { POST } = await import("@/app/api/analytics/route");
     const res = await POST(req({ batchIds: ["b1"] }));
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({ error: "not_ingested" });
+  });
+
+  // A campaign that dispatched nothing legitimately has no records. Treating
+  // that as a conflict showed a hard error and pushed the client to re-ingest.
+  it("serves empty aggregates for a selection that dispatched nothing", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 0 }] as never);
+    vi.mocked(getRecords).mockResolvedValue([] as never);
+    vi.mocked(computeAggregates).mockReturnValue({ totalRecords: 0 } as never);
+    const { POST } = await import("@/app/api/analytics/route");
+    const res = await POST(req({ batchIds: ["b1"] }));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ aggregates: { totalRecords: 0 } });
+    expect(computeAggregates).toHaveBeenCalledWith([], ["b1"], ctx, "agg-key");
   });
 
   it("computes + persists aggregates on cache miss", async () => {

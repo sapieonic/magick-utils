@@ -55,3 +55,24 @@ describe("CostTab — % of spend guard", () => {
     expect(screen.getByText("25% of spend")).toBeInTheDocument();
   });
 });
+
+describe("CostTab — no mock spend curve on a live backend", () => {
+  it("renders an empty state when the aggregate has no cost timeline", () => {
+    render(<CostTab targets={[]} currency="inr" analytics={baseAgg} />);
+    expect(screen.getByText("No cost timeline yet")).toBeInTheDocument();
+    // costBreakdown() would bring the telephony/AI legend with it
+    expect(screen.queryByText("Telephony")).not.toBeInTheDocument();
+  });
+
+  it("shows the loading state instead while ingestion is still running", () => {
+    render(<CostTab targets={[]} currency="inr" analytics={null} loading />);
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.queryByText("No cost timeline yet")).not.toBeInTheDocument();
+  });
+
+  it("renders the seeded curve in demo mode", () => {
+    render(<CostTab targets={[]} currency="inr" analytics={null} demo />);
+    expect(screen.queryByText("No cost timeline yet")).not.toBeInTheDocument();
+    expect(screen.getByText("Telephony")).toBeInTheDocument();
+  });
+});

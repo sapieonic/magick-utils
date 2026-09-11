@@ -91,10 +91,15 @@ describe("sentimentData", () => {
   it("returns three fixed sentiment segments", () => {
     const s = sentimentData();
     expect(s).toEqual([
-      { name: "Positive", value: 47, color: "#16a34a" },
-      { name: "Neutral", value: 34, color: "#94a3b8" },
-      { name: "Negative", value: 19, color: "#dc2626" },
+      { name: "Positive", value: 4700, color: "#16a34a" },
+      { name: "Neutral", value: 3400, color: "#94a3b8" },
+      { name: "Negative", value: 1900, color: "#dc2626" },
     ]);
+  });
+
+  // Percentage shares here would sum to a bogus "100 records" donut centre.
+  it("is expressed in record counts, matching the live aggregate's unit", () => {
+    expect(sentimentData().reduce((sum, s) => sum + s.value, 0)).toBeGreaterThan(100);
   });
 
   it("is deterministic and a fresh array each call", () => {

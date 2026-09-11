@@ -129,7 +129,10 @@ export async function beginBatchIngestion(
     {
       $set: {
         ...withoutIngestionOwnership(doc),
-        ingestStatus: doc.ingestStatus === "ready" ? "ready" : "ingesting",
+        // A published revision stays readable while the refresh runs; only a
+        // batch with nothing to serve yet shows as "ingesting".
+        ingestStatus:
+          doc.ingestStatus === "ready" || doc.ingestStatus === "stale" ? doc.ingestStatus : "ingesting",
         ingestJobId: jobId,
         ingestLeaseId: leaseId,
         ingestLeaseUntil: leaseUntil,
@@ -172,11 +175,19 @@ export async function failBatchIfOwned(
   const col = await batches();
   const current = await col.findOne({ tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId });
   if (!current) return;
+  // A failed refresh leaves the previous revision published and readable, but
+  // it did not bring the batch up to date — resolve back to "stale" whenever
+  // the source has moved past what the published revision was built from, so
+  // the next refresh still knows there is something to pull.
+  const readableStatus =
+    current.ingestedSourceFingerprint && current.ingestedSourceFingerprint === current.sourceFingerprint
+      ? "ready"
+      : "stale";
   await col.updateOne(
     { tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId },
     {
       $set: {
-        ingestStatus: current.publishedRevision ? "ready" : "error",
+        ingestStatus: current.publishedRevision ? readableStatus : "error",
         updatedAt: nowIso(),
       },
       $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
@@ -255,6 +266,44 @@ export async function retireBatchRevision(
     { tenantId, accountId, batchId, revision },
     { $set: { retiredAt: new Date() } },
   );
+}
+
+/** Grace period before a superseded revision's rows are physically removed.
+ *  A reader resolves a batch's `publishedRevision` and then queries rows for
+ *  it; this window covers the gap between those two steps if the pointer is
+ *  swapped in between. Minutes are ample for a single query round-trip. */
+export const SUPERSEDED_REVISION_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * Physically delete this batch's retired revisions once they are past the grace
+ * period, keeping only `keepRevision`.
+ *
+ * Every ingestion writes a complete new copy of a batch's records under a fresh
+ * revision. Leaving the superseded copies to a daily cron with a multi-day
+ * window meant each "Refresh data" click added a full duplicate dataset that
+ * lingered for days — enough repeated clicks exhausted the cluster's storage
+ * and blocked writes for every tenant. Reclaiming them here bounds a batch to
+ * its published revision plus whatever was retired inside the grace window.
+ *
+ * Only rows explicitly marked `retiredAt` are eligible, so a concurrent job's
+ * staging revision (which never carries the marker) can never be swept.
+ */
+export async function deleteSupersededRecordRevisions(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  keepRevision: string,
+  graceMs = SUPERSEDED_REVISION_GRACE_MS,
+): Promise<number> {
+  const col = await records();
+  const res = await col.deleteMany({
+    tenantId,
+    accountId,
+    batchId,
+    revision: { $exists: true, $ne: keepRevision },
+    retiredAt: { $lt: new Date(Date.now() - graceMs) },
+  });
+  return res.deletedCount ?? 0;
 }
 
 export async function replaceBatchRecords(
@@ -376,8 +425,11 @@ export async function getDashboardVolume(
   end: Date,
 ): Promise<DashboardVolume> {
   const col = await records();
+  // "stale" counts: its published revision is complete and is what every other
+  // reader sees, so excluding it would drop real campaigns off the dashboard
+  // the moment their upstream summary moved.
   const readyBatches = (await listBatches(tenantId, accountId))
-    .filter((batch) => batch.ingestStatus === "ready");
+    .filter((batch) => batch.ingestStatus === "ready" || batch.ingestStatus === "stale");
   if (readyBatches.length === 0) {
     return emptyDashboardVolume(range, start, end);
   }

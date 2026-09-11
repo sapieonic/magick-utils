@@ -50,16 +50,27 @@ export default function Page() {
   const [ingest, setIngest] = useState(0);
   const [ingesting, setIngesting] = useState(true);
   const [analytics, setAnalytics] = useState<AggregatesDoc | null>(null);
-  const [live, setLive] = useState(false); // backend is on for this run
+  // null until we know which mode this run is in. `listCampaigns` reports it
+  // (its `source` comes from backendStatus), so the flag is set before the
+  // first tab renders instead of after the ingest job resolves. Only a
+  // positively-known "mock" source unlocks the seeded demo charts: an unknown
+  // mode must never show a customer fabricated numbers.
+  const [live, setLive] = useState<boolean | null>(null);
+  const liveRef = useRef<boolean | null>(null);
+  const demo = live === false;
   const [ingestError, setIngestError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
     listCampaigns()
-      .then(({ batches }) => {
-        if (alive && batches.length) setBatches(batches);
+      .then(({ batches, source }) => {
+        if (!alive) return;
+        liveRef.current = source === "live";
+        setLive(liveRef.current);
+        if (batches.length) setBatches(batches);
       })
       .catch((error: unknown) => {
         if (!alive) return;
+        liveRef.current = true;
         setLive(true);
         setIngestError(error instanceof Error ? error.message : "Unable to load campaign batches.");
         setIngesting(false);
@@ -104,7 +115,13 @@ export default function Page() {
   const [runToken, setRunToken] = useState(0); // bumped by "Refresh data"
   const refreshRef = useRef(false);
   const runIngest = () => {
+    // The button is disabled while `ingesting`, but the effect only raised that
+    // flag inside a queueMicrotask — long enough for a double-click to enqueue
+    // two ingest jobs. Flip it here, synchronously, before the run is queued.
+    if (ingesting) return;
     refreshRef.current = true;
+    setIngesting(true);
+    setIngest(0);
     setRunToken((n: number) => n + 1);
   };
 
@@ -222,10 +239,18 @@ export default function Page() {
         .then((job) => {
           if (!alive || settled) return;
           if (!job) {
-            setLive(false);
-            simulate();
+            // No job only means "backend off" in demo mode. On a live backend
+            // it is a lapsed session (the client is already redirecting) — the
+            // simulated progress bar would be theatre over no data at all.
+            if (liveRef.current === false) {
+              setLive(false);
+              simulate();
+              return;
+            }
+            fail(new Error("Ingestion could not be started — your session may have expired."));
             return;
           }
+          liveRef.current = true;
           setLive(true);
           if (job.ready || !job.jobId) {
             void finish();
@@ -368,7 +393,10 @@ export default function Page() {
             <div className="text-[13px] text-slate-400 mt-1.5 flex items-center gap-2 flex-wrap">
               <span className="font-mono">{targets.map((t: Batch) => t.batchId).join(", ").slice(0, 60)}</span>
               <span>·</span>
-              <span>{fmtNum(totalRecords)} records</span>
+              {/* The bulk job's dispatched contact count. Deliberately NOT the
+                  same number as Overview's "Records ingested" — these two
+                  legitimately differ, so each says which one it is. */}
+              <span title="Contacts dispatched by the bulk job, as reported upstream">{fmtNum(totalRecords)} records dispatched</span>
             </div>
           </div>
 
@@ -385,8 +413,8 @@ export default function Page() {
                   <div className="h-1.5 w-full rounded-full bg-slate-200 overflow-hidden">
                     <div className="h-full rounded-full transition-all" style={{ width: ingest + "%", background: "var(--accent)" }} />
                   </div>
-                  <div className="text-[11px] tabnum text-slate-400 mt-1">
-                    {fmtNum(ingested)} / {fmtNum(totalRecords)}
+                  <div className="text-[11px] tabnum text-slate-400 mt-1" title="Estimated progress against the dispatched contact count">
+                    {fmtNum(ingested)} / {fmtNum(totalRecords)} dispatched
                   </div>
                 </div>
               ) : ingestError ? (
@@ -415,22 +443,25 @@ export default function Page() {
 
       {/* live-data notices: surface ingest failure / no-data instead of silently
           rendering demo data on a live backend */}
-      {!ingesting && live && ingestError && (
+      {!ingesting && !demo && ingestError && (
         <div className="mb-5 flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50/70 px-4 py-3 text-[13px] text-red-700">
           <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
           <span>Ingestion failed: {ingestError}. Try “Refresh data” to retry.</span>
         </div>
       )}
-      {!ingesting && live && !ingestError && !analytics && (
+      {!ingesting && !demo && !ingestError && !analytics && (
         <div className="mb-5 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-[13px] text-amber-700">
           <Icon name="Info" size={15} className="mt-0.5 shrink-0" />
-          <span>No analytics available for this selection yet — the batches may have no ingested records. Charts below are illustrative.</span>
+          <span>No analytics available for this selection yet — the batches may have no ingested records. The charts below stay empty rather than showing sample data.</span>
         </div>
       )}
 
-      {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
-      {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} />}
-      {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} />}
+      {/* `demo` unlocks the seeded charts in lib/data.ts and is true only when
+          the backend is off; `loading` keeps "still pulling" distinct from
+          "loaded and genuinely empty". */}
+      {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} demo={demo} loading={ingesting} />}
+      {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} demo={demo} loading={ingesting} />}
+      {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} demo={demo} loading={ingesting} />}
       {tab === "insights" && (
         <InsightsTab
           key={`${idsKey}:${analytics?.key ?? "pending"}`}
@@ -440,6 +471,7 @@ export default function Page() {
           analytics={analytics}
           dataLoading={ingesting}
           dataError={ingestError}
+          demo={demo}
         />
       )}
 

@@ -50,7 +50,11 @@ export default function DashboardScreen() {
   useEffect(() => {
     let active = true;
     const range: DashboardRange = isDashboardRange(dateRange) ? dateRange : "Last 30 days";
-    Promise.allSettled([listCampaigns(), getDashboardVolume(range)])
+    // Push the range server-side: the campaigns listing is capped at a fixed
+    // number of upstream jobs scanned, so pulling everything and filtering here
+    // silently truncated long ranges. `rangeBatches` below still filters, which
+    // keeps mock mode and the pre-refetch render honest.
+    Promise.allSettled([listCampaigns(range), getDashboardVolume(range)])
       .then(([campaignResult, volumeResult]) => {
         if (!active) return;
         if (campaignResult.status === "fulfilled") {

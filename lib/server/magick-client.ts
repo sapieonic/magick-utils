@@ -488,6 +488,26 @@ export class MagickClient {
     return getJson<BulkJobsListResponse>(url, this.headers());
   }
 
+  /** Page through all bulk-dispatch jobs (page size 100) until exhausted. The
+   *  upstream endpoint has no date filter, so date-scoped callers page through
+   *  here and filter on `created_at` themselves — and must bound how far they
+   *  are willing to page (see app/api/campaigns/route.ts). */
+  async *iterateBulkJobs(
+    params: ListBulkJobsParams = {},
+  ): AsyncGenerator<RawBulkJob, void, unknown> {
+    let offset = params.offset ?? 0;
+    const limit = params.limit ?? PAGE_SIZE;
+    for (;;) {
+      const page = await this.listBulkJobs({ ...params, limit, offset });
+      const jobs = page.jobs ?? [];
+      for (const job of jobs) yield job;
+      if (jobs.length < limit) break;
+      offset += limit;
+      const total = page.total ?? 0;
+      if (total > 0 && offset >= total) break;
+    }
+  }
+
   async getBulkJob(id: string): Promise<RawBulkJob> {
     const url = buildUrl(`/bulk-dispatch-jobs/${encodeURIComponent(id)}`);
     return getJson<RawBulkJob>(url, this.headers());

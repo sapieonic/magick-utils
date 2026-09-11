@@ -3,6 +3,7 @@
 // seeded mock data in lib/data.ts so the UI keeps working without credentials.
 
 import { CAMPAIGNS } from "@/lib/data";
+import { inDashboardRange, isDashboardRange } from "@/lib/date-range";
 import type { Batch } from "@/lib/types";
 import type { AggregatesDoc, DashboardVolume, Insight, JobStatus, JobType } from "@/lib/server/types";
 
@@ -77,11 +78,22 @@ export async function backendStatus(): Promise<{ backend: boolean; llm: boolean 
   }
 }
 
-/** List campaigns/batches. Falls back to mock data when the backend is off. */
-export async function listCampaigns(): Promise<{ batches: Batch[]; source: "live" | "mock" }> {
+/** List campaigns/batches. Falls back to mock data when the backend is off.
+ *  `range` is one of the Topbar's date ranges (see lib/date-range); omit it —
+ *  as Dashboard and Analytics do — to get every campaign, unfiltered. */
+export async function listCampaigns(range?: string): Promise<{ batches: Batch[]; source: "live" | "mock" }> {
   const { backend } = await backendStatus();
-  if (!backend) return { batches: CAMPAIGNS, source: "mock" };
-  const res = await fetch("/api/campaigns", { cache: "no-store" });
+  if (!backend) {
+    // Mock mode filters locally so the date control still behaves like the real
+    // one when there are no credentials.
+    const batches =
+      range && isDashboardRange(range)
+        ? CAMPAIGNS.filter((c) => inDashboardRange(c.date, range))
+        : CAMPAIGNS;
+    return { batches, source: "mock" };
+  }
+  const query = range ? `?range=${encodeURIComponent(range)}` : "";
+  const res = await fetch(`/api/campaigns${query}`, { cache: "no-store" });
   if (handleSessionExpiry(res)) throw new Error("session_expired");
   if (!res.ok) throw await responseError(res, "Unable to load campaigns.");
   const j = await res.json();

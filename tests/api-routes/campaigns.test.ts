@@ -9,6 +9,10 @@ vi.mock("@/lib/server/session", () => ({
 }));
 
 const listBulkJobs = vi.fn();
+/** Mirrors the real MagickClient.iterateBulkJobs paging contract (page size 100,
+ *  stop on a short page or once offset passes `total`) so route tests exercise
+ *  the same multi-page behaviour the client provides. */
+const PAGE_SIZE = 100;
 class MagickApiError extends Error {
   status: number;
   constructor(status: number, message = "err") {
@@ -20,6 +24,18 @@ class MagickApiError extends Error {
 vi.mock("@/lib/server/magick-client", () => ({
   MagickClient: class {
     listBulkJobs = listBulkJobs;
+    async *iterateBulkJobs() {
+      let offset = 0;
+      for (;;) {
+        const page = await listBulkJobs({ limit: PAGE_SIZE, offset });
+        const jobs = page.jobs ?? [];
+        for (const job of jobs) yield job;
+        if (jobs.length < PAGE_SIZE) break;
+        offset += PAGE_SIZE;
+        const total = page.total ?? 0;
+        if (total > 0 && offset >= total) break;
+      }
+    }
   },
   MagickApiError,
 }));
@@ -41,13 +57,36 @@ import { getBatch } from "@/lib/server/repositories";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 
+/** An ISO timestamp `days` days before now. */
+function daysAgoISO(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/** `count` jobs with sequential ids starting at `from`. */
+function jobPage(from: number, count: number, createdAt?: string) {
+  return Array.from({ length: count }, (_, i) => ({
+    id: String(from + i),
+    ...(createdAt ? { created_at: createdAt } : {}),
+  }));
+}
+
+async function get(url = "http://localhost/api/campaigns") {
+  const { GET } = await import("@/app/api/campaigns/route");
+  return GET(new Request(url));
+}
+
+function ready() {
+  vi.mocked(isBackendConfigured).mockReturnValue(true);
+  vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+  vi.mocked(getBatch).mockResolvedValue(null as never);
+}
+
 describe("GET /api/campaigns", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
-    const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET(new Request("http://localhost/api/campaigns"));
+    const res = await get();
     expect(res.status).toBe(503);
     await expect(res.json()).resolves.toEqual({ error: "backend_not_configured" });
   });
@@ -55,19 +94,15 @@ describe("GET /api/campaigns", () => {
   it("401 when not authenticated", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(null);
-    const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET(new Request("http://localhost/api/campaigns"));
+    const res = await get();
     expect(res.status).toBe(401);
   });
 
   it("returns sorted {batches} on happy path", async () => {
-    vi.mocked(isBackendConfigured).mockReturnValue(true);
-    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getBatch).mockResolvedValue(null as never);
+    ready();
     listBulkJobs.mockResolvedValue({ jobs: [{ id: "3" }, { id: "1" }, { id: "" }, { id: "2" }] });
 
-    const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET(new Request("http://localhost/api/campaigns"));
+    const res = await get();
     expect(res.status).toBe(200);
     const json = await res.json();
     // empty id filtered out, sorted by dayAgo asc
@@ -79,8 +114,7 @@ describe("GET /api/campaigns", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     listBulkJobs.mockRejectedValue(new Error("upstream 500"));
-    const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET(new Request("http://localhost/api/campaigns"));
+    const res = await get();
     expect(res.status).toBe(502);
     await expect(res.json()).resolves.toMatchObject({ error: "fetch_failed" });
   });
@@ -89,10 +123,110 @@ describe("GET /api/campaigns", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     listBulkJobs.mockRejectedValue(new MagickApiError(401, "Invalid or expired token"));
-    const { GET } = await import("@/app/api/campaigns/route");
-    const res = await GET(new Request("http://localhost/api/campaigns"));
+    const res = await get();
     expect(res.status).toBe(401);
     await expect(res.json()).resolves.toMatchObject({ error: "session_expired" });
     expect(sessionDestroy).toHaveBeenCalledOnce();
+  });
+
+  // --- pagination past the old hard 100 cap ------------------------------
+
+  it("pages past the first 100 jobs instead of stopping at one page", async () => {
+    ready();
+    listBulkJobs
+      .mockResolvedValueOnce({ jobs: jobPage(0, 100), total: 130 })
+      .mockResolvedValueOnce({ jobs: jobPage(100, 30), total: 130 });
+
+    const res = await get();
+    const json = await res.json();
+    expect(json.batches).toHaveLength(130);
+    expect(listBulkJobs).toHaveBeenCalledTimes(2);
+    expect(listBulkJobs).toHaveBeenNthCalledWith(1, { limit: 100, offset: 0 });
+    expect(listBulkJobs).toHaveBeenNthCalledWith(2, { limit: 100, offset: 100 });
+  });
+
+  it("stops paging once offset reaches the reported total", async () => {
+    ready();
+    listBulkJobs
+      .mockResolvedValueOnce({ jobs: jobPage(0, 100), total: 200 })
+      .mockResolvedValueOnce({ jobs: jobPage(100, 100), total: 200 })
+      .mockResolvedValue({ jobs: jobPage(200, 100), total: 200 });
+
+    const res = await get();
+    const json = await res.json();
+    expect(json.batches).toHaveLength(200);
+    expect(listBulkJobs).toHaveBeenCalledTimes(2);
+  });
+
+  // --- date filtering -----------------------------------------------------
+
+  it("filters to the requested range, server-side", async () => {
+    ready();
+    listBulkJobs.mockResolvedValue({
+      jobs: [
+        { id: "1", created_at: daysAgoISO(1) },
+        { id: "2", created_at: daysAgoISO(3) },
+        { id: "3", created_at: daysAgoISO(45) },
+        { id: "4", created_at: daysAgoISO(400) },
+      ],
+    });
+
+    const res = await get("http://localhost/api/campaigns?range=Last+7+days");
+    const json = await res.json();
+    expect(json.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2"]);
+    // out-of-range jobs never reach the per-job refresh fan-out
+    expect(refreshBatchFromSource).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps months-old campaigns under 'All time' (and when no range is given)", async () => {
+    ready();
+    const jobs = [
+      { id: "1", created_at: daysAgoISO(2) },
+      { id: "2", created_at: daysAgoISO(120) },
+      { id: "3", created_at: daysAgoISO(900) },
+    ];
+    listBulkJobs.mockResolvedValue({ jobs });
+
+    const explicit = await (await get("http://localhost/api/campaigns?range=All+time")).json();
+    expect(explicit.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2", "3"]);
+
+    const implicit = await (await get()).json();
+    expect(implicit.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2", "3"]);
+  });
+
+  it("keeps jobs the upstream left undated rather than dropping them", async () => {
+    ready();
+    listBulkJobs.mockResolvedValue({ jobs: [{ id: "1" }, { id: "2", created_at: "not-a-date" }] });
+    const res = await get("http://localhost/api/campaigns?range=Last+7+days");
+    const json = await res.json();
+    expect(json.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2"]);
+  });
+
+  it("400 on an unknown range, without touching the upstream", async () => {
+    ready();
+    const res = await get("http://localhost/api/campaigns?range=Last+decade");
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: "invalid_range" });
+    expect(listBulkJobs).not.toHaveBeenCalled();
+  });
+
+  // --- bound --------------------------------------------------------------
+
+  it("bounds an endlessly-paging upstream at the scan cap", async () => {
+    ready();
+    // Never a short page and never a total — without the cap this would loop forever.
+    let next = 0;
+    listBulkJobs.mockImplementation(async () => {
+      const jobs = jobPage(next, PAGE_SIZE);
+      next += PAGE_SIZE;
+      return { jobs };
+    });
+
+    const res = await get();
+    const json = await res.json();
+    expect(res.status).toBe(200);
+    // 2,500 scanned = 25 upstream pages of 100.
+    expect(listBulkJobs).toHaveBeenCalledTimes(25);
+    expect(json.batches).toHaveLength(2_500);
   });
 });

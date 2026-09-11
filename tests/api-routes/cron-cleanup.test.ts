@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const { SECRET } = vi.hoisted(() => ({ SECRET: "s3cr3t-cron-token" }));
 
 vi.mock("@/lib/server/env", () => ({
-  env: { cronSecret: SECRET },
+  env: { cronSecret: SECRET, dataRetentionDays: 5 },
   isBackendConfigured: vi.fn(),
   isCronConfigured: vi.fn(),
 }));
@@ -14,6 +14,7 @@ vi.mock("@/lib/server/repositories", () => ({
   deleteJobsOlderThan: vi.fn().mockResolvedValue(3),
   deleteInsightsOlderThan: vi.fn().mockResolvedValue(1),
   deleteRetiredRecordRevisionsOlderThan: vi.fn().mockResolvedValue(4),
+  SUPERSEDED_REVISION_GRACE_MS: 5 * 60 * 1000,
 }));
 
 import { isBackendConfigured, isCronConfigured } from "@/lib/server/env";
@@ -82,8 +83,15 @@ describe("POST /api/cron/cleanup", () => {
       const cutoff = vi.mocked(fn).mock.calls[0][0];
       expect(new Date(cutoff).getTime()).toBeLessThan(Date.now());
     }
+    // Superseded revisions are unreachable duplicates, so they are swept on the
+    // short grace window rather than the retention window — holding them for
+    // days is what let repeated refreshes fill the cluster.
     expect(deleteRetiredRecordRevisionsOlderThan).toHaveBeenCalledTimes(1);
-    expect(deleteRetiredRecordRevisionsOlderThan).toHaveBeenCalledWith(expect.any(Date));
+    const revisionCutoff = vi.mocked(deleteRetiredRecordRevisionsOlderThan).mock.calls[0][0];
+    expect(revisionCutoff).toBeInstanceOf(Date);
+    const revisionAgeMs = Date.now() - revisionCutoff.getTime();
+    expect(revisionAgeMs).toBeGreaterThanOrEqual(5 * 60 * 1000);
+    expect(revisionAgeMs).toBeLessThan(60 * 60 * 1000);
     const cutoffs = [
       deleteAggregatesOlderThan,
       deleteJobsOlderThan,

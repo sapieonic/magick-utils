@@ -51,7 +51,7 @@ export interface Batch {
   avgTalkTime: number | null;
   /** Whether normalized records are ready for analytics/export. Live batches
    *  carry this value; seeded demo batches omit it. */
-  ingestStatus?: "none" | "ingesting" | "ready" | "error";
+  ingestStatus?: "none" | "ingesting" | "ready" | "stale" | "error";
 }
 
 export interface Workspace {

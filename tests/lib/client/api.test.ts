@@ -141,6 +141,47 @@ describe("listCampaigns", () => {
     const api = await freshApi();
     await expect(api.listCampaigns()).rejects.toThrow("boom");
   });
+
+  it("passes the date range to the route as a query param", async () => {
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/campaigns": () => jsonRes({ batches: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    await api.listCampaigns("Last 7 days");
+    const campUrl = fetchMock.mock.calls
+      .map((c: [string, (RequestInit | undefined)?]) => String(c[0]))
+      .find((u: string) => u.startsWith("/api/campaigns"));
+    expect(campUrl).toBe("/api/campaigns?range=Last%207%20days");
+  });
+
+  it("omits the query param entirely when no range is given", async () => {
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/campaigns": () => jsonRes({ batches: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    await api.listCampaigns();
+    const campUrl = fetchMock.mock.calls
+      .map((c: [string, (RequestInit | undefined)?]) => String(c[0]))
+      .find((u: string) => u.startsWith("/api/campaigns"));
+    expect(campUrl).toBe("/api/campaigns");
+  });
+
+  it("backend off → mock rows are filtered by the range too", async () => {
+    const fetchMock = makeFetch({ "/api/health": () => jsonRes(HEALTH_OFF) });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    const week = await api.listCampaigns("Last 7 days");
+    expect(week.source).toBe("mock");
+    expect(week.batches.length).toBeLessThan(CAMPAIGNS.length);
+    expect(week.batches.every((b) => b.dayAgo <= 7)).toBe(true);
+    // an unrecognised value is not a filter — never silently empty the list
+    const bogus = await api.listCampaigns("Last decade");
+    expect(bogus.batches).toHaveLength(CAMPAIGNS.length);
+  });
 });
 
 // --- createIngestJob -----------------------------------------------------

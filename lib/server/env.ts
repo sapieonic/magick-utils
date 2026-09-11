@@ -3,6 +3,13 @@
 // the app keeps running (on mock data) when the backend isn't wired yet.
 // (Server-only by convention — only imported from route handlers / server modules.)
 
+/** Parse a positive-integer env var, falling back when unset or malformed — a
+ *  typo must not silently shorten a retention window to zero. */
+function positiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export const env = {
   magickMasterBaseUrl: process.env.MAGICK_MASTER_BASE_URL ?? "",
   sessionSecret: process.env.SESSION_SECRET ?? "",
@@ -14,6 +21,13 @@ export const env = {
   // Shared secret guarding the cron cleanup endpoint (POST /api/cron/cleanup),
   // which the daily GitHub Actions workflow calls with a Bearer token.
   cronSecret: process.env.CRON_SECRET ?? "",
+
+  // How long batches, records, jobs, aggregates and insights are kept, in days.
+  // This is the ceiling on how far back the Dashboard and Analytics can look:
+  // campaigns older than this are deleted with every record they own, so a
+  // customer asking for "previous months" needs this raised. Size it against the
+  // storage the deployment actually has.
+  dataRetentionDays: positiveInt(process.env.DATA_RETENTION_DAYS, 5),
 
   llm: {
     provider: (process.env.LLM_PROVIDER ?? "openai-compatible") as "openai-compatible" | "anthropic",

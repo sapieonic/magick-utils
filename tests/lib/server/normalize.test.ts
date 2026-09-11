@@ -371,6 +371,36 @@ describe("buildBatchDoc", () => {
     expect(doc.avgTalkTime).toBeNull();
   });
 
+  it("drops conversation_log from raw — transcript already carries it", () => {
+    const record = normalizeCall(
+      {
+        call_id: "c1",
+        status: "completed",
+        conversation_log: [
+          { role: "agent", content: "Hello" },
+          { role: "user", content: "Hi" },
+        ],
+        recipient_name: "Ada",
+      },
+      ctx,
+      { selType: "ai", batchId: "b1", fingerprint: "fp" },
+    );
+    // Storing the full transcript twice per record was the largest single
+    // contributor to the collection's size.
+    expect(record.transcript).toBe("agent: Hello\nuser: Hi");
+    expect(record.raw).not.toHaveProperty("conversation_log");
+    // Unmapped fields still survive — only the duplicated one is dropped.
+    expect(record.raw?.recipient_name).toBe("Ada");
+    // raw.status is the one key aggregation re-reads; it must stay.
+    expect(record.raw?.status).toBe("completed");
+  });
+
+  it("does not mutate the caller's upstream payload while compacting raw", () => {
+    const raw = { call_id: "c1", status: "completed", conversation_log: [{ role: "agent", content: "Hi" }] };
+    normalizeCall(raw, ctx, { selType: "ai", batchId: "b1", fingerprint: "fp" });
+    expect(raw.conversation_log).toHaveLength(1);
+  });
+
   it("ingestStatus defaults to ready, honors override", () => {
     expect(buildBatchDoc([], ctx, baseOpts()).ingestStatus).toBe("ready");
     expect(buildBatchDoc([], ctx, baseOpts({ ingestStatus: "ingesting" })).ingestStatus).toBe("ingesting");
