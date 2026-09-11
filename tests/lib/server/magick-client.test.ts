@@ -95,6 +95,24 @@ describe("MagickClient.iterateBulkJobs", () => {
     expect(urls).toHaveLength(1);
   });
 
+  it("floors a non-positive limit instead of looping forever", async () => {
+    // `limit: 0` used to leave the offset pinned at 0 with `jobs.length < 0`
+    // never true — an infinite loop hammering the upstream. Fail fast (rather
+    // than hang the suite) if the guard is gone.
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (++calls > 10) throw new Error(`iterateBulkJobs looped: ${url}`);
+        const page = calls === 1 ? { jobs: jobs(0, 1) } : { jobs: [] };
+        return { ok: true, status: 200, json: async () => page } as unknown as Response;
+      }),
+    );
+    const out = await drain(new MagickClient(ctx).iterateBulkJobs({ limit: 0 }));
+    expect(out).toHaveLength(1);
+    expect(calls).toBe(2);
+  });
+
   it("honours a caller-supplied offset and forwards filter params", async () => {
     const urls = stubPages([{ jobs: jobs(0, 3) }]);
     await drain(new MagickClient(ctx).iterateBulkJobs({ offset: 200, status: "completed", dispatchType: "ivr_call" }));

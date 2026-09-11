@@ -6,15 +6,11 @@ import { ChartTip } from "./ChartTip";
 
 type DonutSeg = { key?: string; name: string; value: number; color: string };
 
-export function StatusDonut({
-  data,
-  unit = "records",
-}: {
-  data: DonutSeg[];
-  /** What the centre total counts. Pass `null` for a share/percentage series —
-   *  summing shares into a "100 records" centre would be a plain lie. */
-  unit?: string | null;
-}) {
+/** Every caller feeds this donut per-record counts, so the centre total and
+ *  the "records" wording are always true of the data. A share/percentage
+ *  series would need the centre suppressed — add that back with the caller
+ *  that needs it rather than carrying an option nothing exercises. */
+export function StatusDonut({ data }: { data: DonutSeg[] }) {
   const total = data.reduce((a, b) => a + b.value, 0);
   return (
     <div className="flex flex-col items-center">
@@ -26,15 +22,13 @@ export function StatusDonut({
                 <Cell key={i} fill={d.color} />
               ))}
             </Pie>
-            <Tooltip content={<ChartTip suffix={unit ? ` ${unit}` : "%"} />} />
+            <Tooltip content={<ChartTip suffix=" records" />} />
           </PieChart>
         </ResponsiveContainer>
-        {unit && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-            <div className="text-[22px] font-extrabold text-slate-900 tabnum leading-none">{fmtCompact(total)}</div>
-            <div className="text-[11px] text-slate-400 mt-0.5">{unit}</div>
-          </div>
-        )}
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+          <div className="text-[22px] font-extrabold text-slate-900 tabnum leading-none">{fmtCompact(total)}</div>
+          <div className="text-[11px] text-slate-400 mt-0.5">records</div>
+        </div>
       </div>
       <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 w-full">
         {data.map((d, i) => (

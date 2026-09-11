@@ -496,7 +496,9 @@ export class MagickClient {
     params: ListBulkJobsParams = {},
   ): AsyncGenerator<RawBulkJob, void, unknown> {
     let offset = params.offset ?? 0;
-    const limit = params.limit ?? PAGE_SIZE;
+    // A non-positive limit would never advance the offset nor hit the short-page
+    // stop, i.e. an infinite loop against the upstream — floor it at one row.
+    const limit = Math.max(1, params.limit ?? PAGE_SIZE);
     for (;;) {
       const page = await this.listBulkJobs({ ...params, limit, offset });
       const jobs = page.jobs ?? [];

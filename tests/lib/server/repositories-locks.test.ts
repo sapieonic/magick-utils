@@ -10,7 +10,7 @@ const locks = vi.hoisted(() => ({
 const usage = vi.hoisted(() => ({ findOneAndUpdate: vi.fn() }));
 const jobs = vi.hoisted(() => ({ findOne: vi.fn() }));
 const batchDb = vi.hoisted(() => ({ deleteMany: vi.fn(), find: vi.fn(), findOne: vi.fn(), findOneAndUpdate: vi.fn(), updateOne: vi.fn() }));
-const recordDb = vi.hoisted(() => ({ deleteMany: vi.fn() }));
+const recordDb = vi.hoisted(() => ({ deleteMany: vi.fn(), updateMany: vi.fn() }));
 
 vi.mock("@/lib/server/db", () => ({
   aggregates: vi.fn(),
@@ -28,8 +28,10 @@ import {
   consumeAiQuota,
   deleteBatchDataOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
+  deleteOrphanedRecordRevisions,
   deleteSupersededRecordRevisions,
   failBatchIfOwned,
+  retireBatchRevision,
   SUPERSEDED_REVISION_GRACE_MS,
   IngestionConflictError,
   refreshBatchFromSource,
@@ -219,8 +221,11 @@ describe("superseded revision reclamation", () => {
     });
     // Only explicitly retired rows are eligible — a concurrent job's staging
     // revision carries no retiredAt and must never be swept mid-ingestion.
+    // The cutoff is computed inside the call, so it trails `before` by exactly
+    // one grace window plus however long the call took.
     const cutoff = (filter.retiredAt as { $lt: Date }).$lt.getTime();
-    expect(cutoff).toBeLessThanOrEqual(before - SUPERSEDED_REVISION_GRACE_MS);
+    expect(cutoff).toBeGreaterThanOrEqual(before - SUPERSEDED_REVISION_GRACE_MS);
+    expect(cutoff).toBeLessThanOrEqual(Date.now() - SUPERSEDED_REVISION_GRACE_MS);
   });
 });
 
@@ -274,20 +279,98 @@ describe("AI generation quota", () => {
 });
 
 describe("retired revision cleanup", () => {
-  it("deletes only revisions explicitly retired before the grace cutoff", async () => {
-    batchDb.find.mockReturnValue({
-      project: vi.fn().mockReturnValue({
-        toArray: vi.fn().mockResolvedValue([
-          { tenantId: "t1", accountId: "a1", batchId: "b1", publishedRevision: "current" },
-        ]),
-      }),
-    });
+  beforeEach(() => vi.clearAllMocks());
+
+  // The marker alone is the filter. `retireBatchRevision` is the only writer and
+  // refuses to mark the published revision, and revision ids are job ids that
+  // are never reused — so a marked row can never become readable again. The
+  // previous per-batch exclusion list was unbounded across every tenant and
+  // blew past MongoDB's 16MB command limit on a large database, at which point
+  // cleanup failed outright and reclaimed nothing.
+  it("deletes every revision retired before the grace cutoff, in one bounded query", async () => {
     recordDb.deleteMany.mockResolvedValue({ deletedCount: 5 });
     await expect(deleteRetiredRecordRevisionsOlderThan(new Date("2026-08-11T00:00:00Z"))).resolves.toBe(5);
     expect(recordDb.deleteMany).toHaveBeenCalledWith({
       retiredAt: { $lt: new Date("2026-08-11T00:00:00Z") },
-      $nor: [{ tenantId: "t1", accountId: "a1", batchId: "b1", revision: "current" }],
     });
+    // No scan of the batches collection — that is what made this unbounded.
+    expect(batchDb.find).not.toHaveBeenCalled();
+  });
+
+  // A crash between publishing a revision and retiring the previous one, or a
+  // SIGKILL mid-staging, leaves rows whose batch document no longer points at
+  // them. The old exclusion-list query could not reach those at all.
+  it("reaches orphans left by a crash, which have no surviving batch document", async () => {
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 2 });
+    await deleteRetiredRecordRevisionsOlderThan(new Date("2026-08-11T00:00:00Z"));
+    const filter = recordDb.deleteMany.mock.calls[0][0];
+    expect(Object.keys(filter)).toEqual(["retiredAt"]);
+  });
+});
+
+describe("orphaned revision reclamation", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // A crash between publishing a revision and retiring the previous one, or a
+  // SIGKILL mid-staging, leaves rows that never receive a retiredAt marker and
+  // are therefore invisible to the ordinary sweep.
+  it("reclaims a batch's unreferenced revisions, sparing every live one", async () => {
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 3 });
+
+    await expect(
+      deleteOrphanedRecordRevisions("t1", "a1", "b1", ["rev-published", "rev-staging"]),
+    ).resolves.toBe(3);
+
+    const filter = recordDb.deleteMany.mock.calls[0][0];
+    expect(filter).toMatchObject({
+      tenantId: "t1",
+      accountId: "a1",
+      batchId: "b1",
+      revision: { $exists: true, $nin: ["rev-published", "rev-staging"] },
+    });
+    // Age-bounded, so a revision created moments ago is never a candidate — a
+    // rate-limited job keeps its staging revision across a long pause.
+    expect((filter.revisionCreatedAt as { $lt: Date }).$lt.getTime()).toBeLessThanOrEqual(
+      Date.now() - SUPERSEDED_REVISION_GRACE_MS,
+    );
+  });
+
+  it("drops undefined from the keep list rather than matching on it", async () => {
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 0 });
+    await deleteOrphanedRecordRevisions("t1", "a1", "b1", [undefined, "rev-staging"]);
+    expect(recordDb.deleteMany.mock.calls[0][0]).toMatchObject({
+      revision: { $exists: true, $nin: ["rev-staging"] },
+    });
+  });
+});
+
+describe("revision retirement invariant", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // Cleanup safety rests entirely on this: nothing may mark the revision that
+  // readers are currently being served.
+  it("refuses to retire the revision a batch currently publishes", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1", publishedRevision: "rev-current",
+    });
+
+    await retireBatchRevision("t1", "a1", "b1", "rev-current");
+
+    expect(recordDb.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("marks a superseded revision", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1", publishedRevision: "rev-new",
+    });
+    recordDb.updateMany.mockResolvedValue({});
+
+    await retireBatchRevision("t1", "a1", "b1", "rev-old");
+
+    expect(recordDb.updateMany).toHaveBeenCalledWith(
+      { tenantId: "t1", accountId: "a1", batchId: "b1", revision: "rev-old" },
+      { $set: { retiredAt: expect.any(Date) } },
+    );
   });
 });
 

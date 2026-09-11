@@ -68,6 +68,19 @@ describe("Analytics page selection validation", () => {
     appState.analyzeTargets = ["b1", "missing"];
   });
 
+  // A refresh that correctly finds nothing new used to look identical to one
+  // that silently failed: progress bar to 100%, same numbers, no explanation.
+  it("says when a refresh found nothing new upstream", async () => {
+    appState.analyzeTargets = ["b1"];
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true, upToDate: true });
+    vi.mocked(getAnalytics).mockResolvedValue(aggregates);
+
+    render(<Page />);
+
+    expect(await screen.findByText("No new data upstream")).toBeInTheDocument();
+  });
+
   it("does not start ingestion for the resolved subset of an incomplete selection", async () => {
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
     render(<Page />);
@@ -162,6 +175,56 @@ describe("Analytics page live/demo separation", () => {
     expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
     expect(screen.queryByText("1,284")).not.toBeInTheDocument();
     expect(screen.getAllByRole("status").length).toBeGreaterThan(0);
+  });
+
+  // Half of the anti-mock fix: a live backend that returns no job means the
+  // session lapsed, not "demo mode" — the simulated progress bar would be
+  // theatre over no data at all.
+  it("surfaces a lapsed session instead of simulating progress on a live backend", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue(null);
+    render(<Page />);
+
+    expect(await screen.findByText(/session may have expired/)).toBeInTheDocument();
+    expect(screen.getByText("Sync failed")).toBeInTheDocument();
+    // no fake progress, no aggregate fetch, and no seeded charts behind it
+    expect(screen.queryByText(/Ingesting records/)).not.toBeInTheDocument();
+    expect(getAnalytics).not.toHaveBeenCalled();
+    expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
+  });
+
+  it("never unlocks the seeds when the campaign list fails to load", async () => {
+    vi.mocked(listCampaigns).mockRejectedValue(new Error("Upstream is unavailable"));
+    render(<Page />);
+
+    expect(await screen.findByText("Analytics are unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Upstream is unavailable")).toBeInTheDocument();
+    // an unknown mode is treated as live: no ingest on seeded ids, no seeds
+    expect(createIngestJob).not.toHaveBeenCalled();
+    expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
+    expect(screen.queryByText("1,284")).not.toBeInTheDocument();
+  });
+
+  it("drops the previous selection's numbers when the selection changes", async () => {
+    const second: Batch = { ...campaign, id: "b2", batchId: "AI-2", name: "Campaign two" };
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign, second], source: "live" });
+    vi.mocked(createIngestJob)
+      .mockResolvedValueOnce({ jobId: null, total: 0, done: 0, ready: true })
+      // the second selection's ingest never settles — the window in which the
+      // first campaign's charts could sit under the second campaign's header
+      .mockReturnValue(new Promise(() => {}));
+    vi.mocked(getAnalytics).mockResolvedValue({ ...aggregates, totalRecords: 4242 });
+    const { rerender } = render(<Page />);
+
+    expect(await screen.findByText("4,242")).toBeInTheDocument();
+    expect(screen.getByText("Records ingested")).toBeInTheDocument();
+
+    appState.analyzeTargets = ["b2"];
+    rerender(<Page />);
+
+    expect(await screen.findByRole("heading", { name: "Campaign two" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("4,242")).not.toBeInTheDocument());
+    expect(screen.getByText("Records dispatched")).toBeInTheDocument();
   });
 
   it("keeps demo mode on the seeded data when the backend is off", async () => {

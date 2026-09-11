@@ -36,6 +36,9 @@ export default function DashboardScreen() {
   const { currency, dateRange, setAnalyzeTargets, user } = useApp();
   const router = useRouter();
   const selectedRange: DashboardRange = isDashboardRange(dateRange) ? dateRange : "Last 30 days";
+  // "over the last 30 days" reads correctly; "over the all time" does not. The
+  // shared range control defaults to All time, so the preposition has to move.
+  const rangeLabel = selectedRange === "All time" ? "across all time" : `over the ${selectedRange.toLowerCase()}`;
   const [loadedRange, setLoadedRange] = useState<DashboardRange | null>(null);
   const loading = loadedRange !== selectedRange;
   // Start empty — never seed with mock. listCampaigns() supplies mock only when
@@ -163,8 +166,8 @@ export default function DashboardScreen() {
         <div>
           <div className="text-sm text-slate-400">{greeting}</div>
           <div className="text-[15px] text-slate-500 mt-0.5">
-            Here&apos;s what happened in your campaigns over the{" "}
-            <span className="font-semibold text-slate-700">{dateRange.toLowerCase()}</span>.
+            Here&apos;s what happened in your campaigns{" "}
+            <span className="font-semibold text-slate-700">{rangeLabel}</span>.
           </div>
         </div>
         <Button variant="secondary" icon="FileDown" className="hidden sm:inline-flex" disabled>
@@ -184,7 +187,7 @@ export default function DashboardScreen() {
         <ChartCard
           className="lg:col-span-2"
           title="Calls & messages over time"
-          subtitle={`Daily volume by campaign start date · ${dateRange.toLowerCase()} · ${APP_TIMEZONE_LABEL}`}
+          subtitle={`Daily volume by campaign start date · ${rangeLabel} · ${APP_TIMEZONE_LABEL}`}
           action={<Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#94a3b8", l: "Messages" }]} />}
         >
           {loading ? (

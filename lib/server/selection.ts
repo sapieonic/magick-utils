@@ -1,5 +1,5 @@
 import { countRecords, getBatch } from "./repositories";
-import type { BatchDoc, TenantContext } from "./types";
+import { isBatchReadable, type BatchDoc, type TenantContext } from "./types";
 
 export const MAX_SELECTION_BATCHES = 50;
 export const MAX_BATCH_ID_LENGTH = 200;
@@ -13,13 +13,6 @@ export class SelectionError extends Error {
     super(message);
     this.name = "SelectionError";
   }
-}
-
-/** A batch whose published revision can be read. "stale" qualifies: upstream
- *  has moved on, but the committed revision is complete and still the one every
- *  reader sees, so analytics and exports must serve it rather than 409. */
-function isReadable(batch: BatchDoc): boolean {
-  return batch.ingestStatus === "ready" || batch.ingestStatus === "stale";
 }
 
 export function parseBatchIds(value: unknown): string[] {
@@ -49,12 +42,12 @@ export async function validateSelection(
   if (new Set(batches.map((batch) => batch.selType)).size > 1) {
     throw new SelectionError(400, "seltype_mismatch", "Select batches of the same type.");
   }
-  if (options.requireReady && batches.some((batch) => !isReadable(batch))) {
+  if (options.requireReady && batches.some((batch) => !isBatchReadable(batch))) {
     throw new SelectionError(409, "not_ingested", "Every selected batch must finish ingestion first.");
   }
   if (options.verifyCounts) {
     const counts = await Promise.all(batchIds.map((id) => countRecords(ctx.tenantId, ctx.accountId, [id])));
-    const incomplete = batches.some((batch, index) => !isReadable(batch) || counts[index] !== batch.total);
+    const incomplete = batches.some((batch, index) => !isBatchReadable(batch) || counts[index] !== batch.total);
     if (incomplete) {
       throw new SelectionError(409, "incomplete_ingestion", "One or more selected batches are incomplete. Run ingestion again.");
     }

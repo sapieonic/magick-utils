@@ -1,9 +1,8 @@
 "use client";
 import { Avatar, Dropdown, Icon, MenuItem, Segmented } from "@/components/ui";
 import type { SessionUserInfo } from "@/lib/api";
+import { DASHBOARD_RANGES } from "@/lib/date-range";
 import type { Currency, Workspace } from "@/lib/types";
-
-const RANGES = ["Last 7 days", "Last 30 days", "Last 90 days", "This quarter", "All time"];
 
 export function Topbar({
   title,
@@ -62,19 +61,22 @@ export function Topbar({
 
       {right}
 
+      {/* Date range — visible at every width: on a phone this control is the only
+          way back to a wider range, so hiding it stranded the user on a list that
+          had been narrowed elsewhere. */}
       <Dropdown
         align="right"
         width={190}
         trigger={
-          <button className="hidden sm:flex items-center gap-2 h-9 rounded-xl border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-600 hover:border-slate-300 hover:bg-slate-50 transition-colors">
+          <button className="flex items-center gap-1.5 sm:gap-2 h-9 shrink-0 rounded-xl border border-slate-200 bg-white px-2.5 sm:px-3 text-[12.5px] sm:text-[13px] font-semibold text-slate-600 whitespace-nowrap hover:border-slate-300 hover:bg-slate-50 transition-colors">
             <Icon name="Calendar" size={15} className="text-slate-400" />
             {dateRange}
-            <Icon name="ChevronDown" size={14} className="text-slate-400" />
+            <Icon name="ChevronDown" size={14} className="text-slate-400 hidden sm:block" />
           </button>
         }
       >
         {(close: () => void) =>
-          RANGES.map((r) => (
+          DASHBOARD_RANGES.map((r) => (
             <MenuItem
               key={r}
               icon={r === dateRange ? "Check" : undefined}

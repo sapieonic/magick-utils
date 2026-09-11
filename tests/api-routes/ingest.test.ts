@@ -111,7 +111,7 @@ describe("POST /api/ingest", () => {
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, done: 0, ready: true });
+    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, done: 0, ready: true, upToDate: false });
     expect(createJob).not.toHaveBeenCalled();
   });
 
@@ -156,7 +156,7 @@ describe("POST /api/ingest", () => {
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest" }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, done: 0, ready: true });
+    await expect(res.json()).resolves.toEqual({ jobId: null, total: 0, done: 0, ready: true, upToDate: false });
     expect(createJob).not.toHaveBeenCalled();
   });
 
@@ -166,12 +166,12 @@ describe("POST /api/ingest", () => {
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceFingerprint: "fp-old",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    // A different upstream summary ⇒ a different fingerprint ⇒ real work to do.
-    getBulkJob.mockResolvedValue({ id: "job-1", total_contacts: 12, status: "completed" });
+    // Upstream wrote to the job after we ingested ⇒ real work to do.
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T11:00:00Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
@@ -183,24 +183,42 @@ describe("POST /api/ingest", () => {
 
   // Each ingestion writes a complete new copy of every record, so an
   // unconditional refresh let repeated clicks fill the cluster's storage.
-  it("skips a refresh whose upstream source has not moved since the last ingestion", async () => {
+  it("skips a refresh whose upstream job has not been touched since ingestion", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
-    const job = { id: "job-1", total_contacts: 10, status: "completed" };
-    const { bulkJobSourceFingerprint } = await import("@/lib/server/map");
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceFingerprint: bulkJobSourceFingerprint(job),
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue(job);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    // Reported distinctly so the screen can say "already up to date" rather
+    // than replaying a progress bar over unchanged numbers.
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true, upToDate: true });
     expect(createJob).not.toHaveBeenCalled();
+  });
+
+  // A running campaign keeps producing records, and its summary fields can sit
+  // still while they do — never skip one, whatever the timestamps say.
+  it("re-ingests a job that has not finished, even with an unchanged timestamp", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "processing", updated_at: "2026-09-01T10:00:00Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+    expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
+    expect(createJob).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes a stale batch, which is readable but behind its source", async () => {
@@ -209,11 +227,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "stale",
-      sourceId: "job-1", ingestedSourceFingerprint: "fp-old",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", total_contacts: 12, status: "completed" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T12:00:00Z" });
     const { POST } = await import("@/app/api/ingest/route");
     expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
     expect(createJob).toHaveBeenCalledTimes(1);
@@ -225,7 +243,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceFingerprint: "fp-old",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);

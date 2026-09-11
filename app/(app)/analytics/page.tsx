@@ -59,6 +59,10 @@ export default function Page() {
   const liveRef = useRef<boolean | null>(null);
   const demo = live === false;
   const [ingestError, setIngestError] = useState<string | null>(null);
+  // Set when a refresh checked upstream and found nothing new. Distinguishes
+  // "your data is current" from a refresh that quietly did nothing — the
+  // ambiguity the customer read as the numbers being unreliable.
+  const [upToDate, setUpToDate] = useState(false);
   useEffect(() => {
     let alive = true;
     listCampaigns()
@@ -121,7 +125,6 @@ export default function Page() {
     if (ingesting) return;
     refreshRef.current = true;
     setIngesting(true);
-    setIngest(0);
     setRunToken((n: number) => n + 1);
   };
 
@@ -253,6 +256,7 @@ export default function Page() {
           liveRef.current = true;
           setLive(true);
           if (job.ready || !job.jobId) {
+            if (job.upToDate) setUpToDate(true);
             void finish();
             return;
           }
@@ -273,10 +277,12 @@ export default function Page() {
       if (!alive) return;
       setIngesting(true);
       setIngestError(null);
-      if (refresh) {
-        setIngest(0);
-        setAnalytics(null);
-      }
+      setUpToDate(false);
+      // Drop the previous aggregate on every re-run, not only on a refresh: a
+      // selection change must never leave the old campaign's charts rendered
+      // under the new campaign's header.
+      setAnalytics(null);
+      if (refresh) setIngest(0);
     });
 
     if (pollJobId) {
@@ -423,7 +429,8 @@ export default function Page() {
                 </div>
               ) : analytics ? (
                 <div className="flex items-center gap-2 text-[13px] font-semibold text-emerald-600">
-                  <Icon name="CircleCheck" size={16} /> Up to date
+                  <Icon name="CircleCheck" size={16} />
+                  {upToDate ? "No new data upstream" : "Up to date"}
                 </div>
               ) : <div className="text-[13px] font-semibold text-amber-600">No analytics available</div>}
             </div>
@@ -459,7 +466,7 @@ export default function Page() {
       {/* `demo` unlocks the seeded charts in lib/data.ts and is true only when
           the backend is off; `loading` keeps "still pulling" distinct from
           "loaded and genuinely empty". */}
-      {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} demo={demo} loading={ingesting} />}
+      {tab === "overview" && <OverviewTab targets={targets} agg={agg} currency={currency} hasVoice={hasVoice} analytics={analytics} demo={demo} loading={ingesting} />}
       {tab === "conversation" && <ConversationTab hasVoice={hasVoice} hasMsg={hasMsg} analytics={analytics} demo={demo} loading={ingesting} />}
       {tab === "cost" && <CostTab targets={targets} currency={currency} analytics={analytics} demo={demo} loading={ingesting} />}
       {tab === "insights" && (

@@ -275,6 +275,7 @@ export interface BuildBatchDocOpts {
   fingerprint: string;
   sourceFingerprint?: string;
   ingestedSourceFingerprint?: string;
+  ingestedSourceUpdatedAt?: string | null;
   publishedRevision?: string;
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
@@ -331,6 +332,7 @@ export function buildBatchDoc(
     fingerprint: opts.fingerprint,
     sourceFingerprint: opts.sourceFingerprint,
     ingestedSourceFingerprint: opts.ingestedSourceFingerprint,
+    ingestedSourceUpdatedAt: opts.ingestedSourceUpdatedAt,
     publishedRevision: opts.publishedRevision,
     ingestStatus: opts.ingestStatus ?? "ready",
     updatedAt: new Date().toISOString(),

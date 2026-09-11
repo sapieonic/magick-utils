@@ -1,8 +1,10 @@
 name: Daily data cleanup
 
-# Enforce five-day retention for batches, records, jobs, aggregates, insights,
-# and retired revisions so the MongoDB Atlas free tier stays small. Calls the app's protected cleanup endpoint
-# (POST /api/cron/cleanup) on a daily schedule.
+# Enforce the deployment's retention window (DATA_RETENTION_DAYS, default five
+# days) for batches, records, jobs, aggregates and insights, and reclaim any
+# superseded record revisions the worker did not, so the MongoDB Atlas free tier
+# stays small. Calls the app's protected cleanup endpoint (POST
+# /api/cron/cleanup) on a daily schedule.
 #
 # Runs once for each GitHub Environment listed in the matrix below. Each
 # environment must define:

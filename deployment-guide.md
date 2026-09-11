@@ -115,6 +115,19 @@ SESSION_SECRET=<32+ char secret>
 MONGODB_URI=mongodb+srv://USER:PASSWORD@cluster.example.mongodb.net/?appName=MagickUtils
 MONGODB_DB=magickutils
 
+# Shared secret guarding POST /api/cron/cleanup, which the daily GitHub Actions
+# workflow calls to prune expired data. Without it the endpoint returns 503 and
+# NOTHING is ever pruned — storage grows until the cluster refuses writes.
+CRON_SECRET=<32+ char secret>
+
+# How long campaign data is kept, in days. Default 5 when unset.
+# This is the ceiling on how far back Dashboard and Analytics can look: batches
+# older than this are deleted along with every record they own. Customers asking
+# for "previous months" need this raised. Storage grows roughly in proportion —
+# size it against the cluster this deployment actually has, and see the
+# retention note in README.md before changing it.
+# DATA_RETENTION_DAYS=5
+
 # LLM (AI insights + chat). openai-compatible covers NVIDIA NIM / OpenRouter / Moonshot / vLLM.
 #   • LLM_BASE_URL must be the API ROOT — the SDK appends "/chat/completions"
 #   • LLM_API_KEY is the RAW key, with NO "Bearer " prefix

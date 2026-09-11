@@ -40,7 +40,6 @@ export function OverviewTab({
   agg: ReturnType<typeof aggregate>;
   currency: Currency;
   hasVoice: boolean;
-  hasMsg?: boolean;
   analytics?: AggregatesDoc | null;
   demo?: boolean;
   loading?: boolean;

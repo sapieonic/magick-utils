@@ -34,10 +34,9 @@ export const POST = withLogging("analytics", async (req: Request) => {
     return NextResponse.json({ error: "invalid_refresh" }, { status: 400 });
   }
   let batchIds: string[];
-  let batchDocs;
   try {
     batchIds = parseBatchIds(body?.batchIds);
-    batchDocs = await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -54,15 +53,12 @@ export const POST = withLogging("analytics", async (req: Request) => {
     }
   }
 
+  // `validateSelection` above ran with verifyCounts, which already proved every
+  // batch's stored record count equals its total — so an empty read here means
+  // the selection genuinely dispatched nothing, not that ingestion is missing.
+  // That is a valid answer: 409-ing it surfaced as a hard error on screen and
+  // pushed the client into a pointless re-ingest.
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
-  // A selection that dispatched nothing has nothing to read, and that is a
-  // valid answer rather than a conflict — 409-ing it surfaced as a hard error
-  // on screen and pushed the client into a pointless re-ingest. Only missing
-  // records the batches claim to have indicate ingestion really has not run.
-  if (records.length === 0 && batchDocs.some((batch) => batch.total > 0)) {
-    log().warn({ batchCount: batchIds.length }, "analytics requested for un-ingested batches");
-    return NextResponse.json({ error: "not_ingested", message: "Run ingestion for these batches first." }, { status: 409 });
-  }
   const agg = computeAggregates(records, batchIds, ctx, key);
   await setAggregates(agg);
   log().info(

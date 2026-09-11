@@ -170,6 +170,46 @@ describe("listCampaigns", () => {
     expect(campUrl).toBe("/api/campaigns");
   });
 
+  it("passes the route's truncation flag through to callers", async () => {
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/campaigns": () => jsonRes({ batches: [], truncated: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    // Without this the screen cannot tell "no campaigns" from "we stopped looking".
+    expect(await api.listCampaigns()).toMatchObject({ truncated: true });
+
+    const plain = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/campaigns": () => jsonRes({ batches: [] }),
+    });
+    vi.stubGlobal("fetch", plain);
+    const api2 = await freshApi();
+    expect((await api2.listCampaigns()).truncated).toBe(false);
+    // Mock mode has the whole set in hand, so nothing is ever truncated there.
+    const off = makeFetch({ "/api/health": () => jsonRes(HEALTH_OFF) });
+    vi.stubGlobal("fetch", off);
+    const api3 = await freshApi();
+    expect((await api3.listCampaigns()).truncated).toBe(false);
+  });
+
+  it("drops an unrecognised range instead of sending it, matching mock mode", async () => {
+    const fetchMock = makeFetch({
+      "/api/health": () => jsonRes(HEALTH_ON),
+      "/api/campaigns": () => jsonRes({ batches: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    // A stale sessionStorage value must not narrow (or 400) the live listing any
+    // more than it narrows the mock one.
+    await api.listCampaigns("Last decade");
+    const campUrl = fetchMock.mock.calls
+      .map((c: [string, (RequestInit | undefined)?]) => String(c[0]))
+      .find((u: string) => u.startsWith("/api/campaigns"));
+    expect(campUrl).toBe("/api/campaigns");
+  });
+
   it("backend off → mock rows are filtered by the range too", async () => {
     const fetchMock = makeFetch({ "/api/health": () => jsonRes(HEALTH_OFF) });
     vi.stubGlobal("fetch", fetchMock);

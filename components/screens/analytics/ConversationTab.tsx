@@ -12,7 +12,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { ChartCard } from "@/components/ui";
+import { ChartCard, cx } from "@/components/ui";
 import {
   TOPICS,
   durationHistogram,
@@ -121,7 +121,11 @@ export function ConversationTab({
         </div>
       )}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <ChartCard title="Key topics" subtitle="Most frequent intents detected by the model">
+        <ChartCard
+          className={cx(!hasMsg && !demo && "lg:col-span-2")}
+          title="Key topics"
+          subtitle="Most frequent intents detected by the model"
+        >
           {topics ? (
             <TopicList topics={topics} />
           ) : (
@@ -143,9 +147,14 @@ export function ConversationTab({
             )}
           </ChartCard>
         ) : (
-          <ChartCard title="Sentiment trend" subtitle="Positive share by week">
-            <SentimentTrend demo={demo} loading={loading} />
-          </ChartCard>
+          // Sentiment-over-time isn't part of `AggregatesDoc`, so outside demo
+          // mode this card could only ever apologise. Drop it entirely and let
+          // "Key topics" span the row instead of leaving an empty cell.
+          demo && (
+            <ChartCard title="Sentiment trend" subtitle="Positive share by week">
+              <SentimentTrend />
+            </ChartCard>
+          )
         )}
       </div>
     </div>
@@ -191,27 +200,14 @@ function DurationChart({ data }: { data: { bucket: string; calls: number; talk: 
   );
 }
 
-/** Sentiment-over-time is not part of `AggregatesDoc`, so on a live backend
- *  there is nothing honest to plot — the seeded rising line only ever existed
- *  for the demo. Render the seed in demo mode, an empty state otherwise. */
-function SentimentTrend({ demo, loading }: { demo: boolean; loading: boolean }) {
+/** Demo-only: the seeded rising line reads no real data, and nothing in
+ *  `AggregatesDoc` can replace it — so this is rendered only when the backend
+ *  is off. */
+function SentimentTrend() {
   const data = useMemo(
-    () =>
-      demo
-        ? sparkline(99, 12, 40, 10).map((d, i) => ({ name: `Wk ${i + 1}`, positive: Math.min(70, 35 + i * 2.5 + (d.v % 8)) }))
-        : null,
-    [demo],
+    () => sparkline(99, 12, 40, 10).map((d, i) => ({ name: `Wk ${i + 1}`, positive: Math.min(70, 35 + i * 2.5 + (d.v % 8)) })),
+    [],
   );
-  if (!data) {
-    return (
-      <ChartPlaceholder
-        loading={loading}
-        icon="TrendingUp"
-        title="No sentiment trend available"
-        body="Sentiment over time isn't computed for this selection."
-      />
-    );
-  }
   return (
     <div style={{ height: 240 }}>
       <ResponsiveContainer width="100%" height="100%">
@@ -249,7 +245,7 @@ function TopicList({ topics }: { topics: { topic: string; count: number; sentime
               <span className="text-[12px] tabnum text-slate-400 ml-2">{fmtNum(t.count)}</span>
             </div>
             <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
-              <div className="h-full rounded-full" style={{ width: `${(t.count / (max || 1)) * 100}%`, background: tone[t.sentiment] }} />
+              <div className="h-full rounded-full" style={{ width: `${(t.count / (max || 1)) * 100}%`, background: tone[t.sentiment] ?? "#94a3b8" }} />
             </div>
           </div>
         </div>

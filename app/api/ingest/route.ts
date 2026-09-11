@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext } from "@/lib/server/session";
 import { MagickClient } from "@/lib/server/magick-client";
-import { bulkJobSourceFingerprint } from "@/lib/server/map";
+import { bulkJobIsUnchangedSince } from "@/lib/server/map";
 import {
   acquireIngestionLocks,
   countRecords,
@@ -12,17 +12,12 @@ import {
   IngestionConflictError,
   releaseIngestionLocks,
 } from "@/lib/server/repositories";
-import type { BatchDoc, Job, JobType, TenantContext } from "@/lib/server/types";
+import { isBatchReadable, type BatchDoc, type Job, type JobType, type TenantContext } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
 import { parseBatchIds, selectionErrorResponse, validateSelection } from "@/lib/server/selection";
 import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
-
-/** Both "ready" and "stale" mean a complete published revision exists. */
-function isReadable(batch: BatchDoc): boolean {
-  return batch.ingestStatus === "ready" || batch.ingestStatus === "stale";
-}
 
 /** Upstream reads issued at once while deciding what a refresh has to re-pull.
  *  A selection can hold up to MAX_SELECTION_BATCHES batches; firing them all at
@@ -35,13 +30,13 @@ const REFRESH_CHECK_CONCURRENCY = 10;
  * Every ingestion writes a complete new copy of a batch's records, so an
  * unconditional refresh rewrote an identical dataset on each click — the
  * mechanism that repeatedly exhausted the cluster's storage. Re-read each
- * batch's bulk job and keep only those whose source fingerprint differs from
- * the one its published revision was built from (or that have no complete
- * revision at all).
+ * batch's bulk job and drop only the ones that can be PROVEN untouched since
+ * their last pull (see bulkJobIsUnchangedSince).
  *
- * Deliberately conservative: a batch whose upstream job cannot be read is kept
- * in the refresh. Doing redundant work is recoverable; skipping a batch the
- * customer explicitly asked to refresh is not.
+ * Deliberately conservative at every step: a batch with no complete revision, no
+ * recorded stamp, or an unreadable upstream job all stay in the refresh. Doing
+ * redundant work is recoverable and the worker reclaims the duplicate itself;
+ * silently refusing the refresh a customer asked for is not.
  */
 async function refreshableBatchIds(
   ctx: TenantContext,
@@ -58,15 +53,15 @@ async function refreshableBatchIds(
         const index = i + offset;
         const batch = batchDocs[index];
         // Nothing complete to compare against — this is a plain first ingest.
-        if (!complete[index] || !batch.ingestedSourceFingerprint || !batch.sourceId) return batchId;
+        if (!complete[index] || !batch.ingestedSourceUpdatedAt || !batch.sourceId) return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
-          if (bulkJobSourceFingerprint(job) === batch.ingestedSourceFingerprint) {
-            log().info({ batchId }, "refresh skipped — upstream source unchanged since last ingestion");
+          if (bulkJobIsUnchangedSince(job, batch.ingestedSourceUpdatedAt)) {
+            log().info({ batchId }, "refresh skipped — upstream job untouched since last ingestion");
             return null;
           }
         } catch (err) {
-          log().warn({ err, batchId }, "refresh source check failed — re-ingesting to be safe");
+          log().warn({ error: err, batchId }, "refresh source check failed — re-ingesting to be safe");
         }
         return batchId;
       }),
@@ -123,13 +118,18 @@ export const POST = withLogging("ingest", async (req: Request) => {
     requestedBatchIds.map((id) => countRecords(ctx.tenantId, ctx.accountId, [id])),
   );
   const complete = requestedBatchIds.map(
-    (_, index) => isReadable(batchDocs[index]) && counts[index] === batchDocs[index].total,
+    (_, index) => isBatchReadable(batchDocs[index]) && counts[index] === batchDocs[index].total,
   );
   const batchIds = forceRefresh
     ? await refreshableBatchIds(ctx, requestedBatchIds, batchDocs, complete)
     : requestedBatchIds.filter((_, index) => !complete[index]);
   if (batchIds.length === 0) {
-    return NextResponse.json({ jobId: null, total: 0, done: 0, ready: true });
+    // `upToDate` distinguishes "we checked upstream and there is nothing new"
+    // from "these batches were already ingested". Without it a refresh that
+    // correctly does nothing is indistinguishable on screen from one that
+    // silently failed — and the whole complaint behind this work was a customer
+    // unable to trust the numbers in front of them.
+    return NextResponse.json({ jobId: null, total: 0, done: 0, ready: true, upToDate: forceRefresh });
   }
 
   const activeJob = await findActiveJobForBatches(ctx.tenantId, ctx.accountId, batchIds);

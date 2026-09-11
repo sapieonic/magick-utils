@@ -15,7 +15,7 @@ vi.mock("@/lib/server/selection", async (importOriginal) => ({
   validateSelection: vi.fn(),
 }));
 
-import { validateSelection } from "@/lib/server/selection";
+import { SelectionError, validateSelection } from "@/lib/server/selection";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getRecords, setAggregates } from "@/lib/server/repositories";
@@ -77,16 +77,19 @@ describe("POST /api/analytics", () => {
     expect(getRecords).not.toHaveBeenCalled();
   });
 
-  it("409 not_ingested when records the batch claims to have are missing", async () => {
+  // Batches that have not finished ingesting are rejected by validateSelection
+  // (requireReady + verifyCounts) before any of this runs.
+  it("delegates the un-ingested check to validateSelection", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getAggregates).mockResolvedValue(null as never);
-    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10 }] as never);
-    vi.mocked(getRecords).mockResolvedValue([] as never);
+    vi.mocked(validateSelection).mockRejectedValue(
+      new SelectionError(409, "incomplete_ingestion", "One or more selected batches are incomplete."),
+    );
     const { POST } = await import("@/app/api/analytics/route");
     const res = await POST(req({ batchIds: ["b1"] }));
     expect(res.status).toBe(409);
-    await expect(res.json()).resolves.toMatchObject({ error: "not_ingested" });
+    await expect(res.json()).resolves.toMatchObject({ error: "incomplete_ingestion" });
+    expect(getRecords).not.toHaveBeenCalled();
   });
 
   // A campaign that dispatched nothing legitimately has no records. Treating

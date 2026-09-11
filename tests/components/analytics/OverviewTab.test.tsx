@@ -132,6 +132,25 @@ describe("OverviewTab — no mock data on a live backend", () => {
     expect(screen.queryByText("No volume timeline yet")).not.toBeInTheDocument();
   });
 
+  // Three placeholders share this tab while a pull is running; each keeps its
+  // own live region, so none of them may shout "Loading…" on its own.
+  it("does not announce three simultaneous loading messages", () => {
+    render(
+      <OverviewTab
+        targets={[voiceBatch]}
+        agg={aggregate([voiceBatch])}
+        currency="inr"
+        hasVoice
+        analytics={{ ...liveAgg, statusMix: [] }}
+        loading
+      />,
+    );
+    const regions = screen.getAllByRole("status");
+    expect(regions).toHaveLength(3);
+    expect(regions.every((r) => r.getAttribute("aria-busy") === "true")).toBe(true);
+    expect(screen.getAllByText("Loading…").every((node) => node.closest("[aria-hidden]") !== null)).toBe(true);
+  });
+
   it("renders the seeded volume series in demo mode", () => {
     render(
       <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={null} demo />,

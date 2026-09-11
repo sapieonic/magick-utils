@@ -44,8 +44,16 @@ full duplicate re-ingest on every campaigns listing.
 Freshness is decided by comparing `sourceFingerprint` (the current upstream summary, via
 `bulkJobSourceFingerprint`) with `ingestedSourceFingerprint` (what the published revision was built
 from). The fingerprint deliberately excludes the job's `updated_at`, which upstream bumps without any
-record changing. `POST /api/ingest` with `refresh: true` re-reads each job and only re-pulls the batches
-whose fingerprint actually moved, so a refresh of unchanged data writes nothing.
+record changing. The comparison is against what was *ingested*, not against the previous listing, so a
+source that moves and moves back resolves to "ready" rather than latching stale.
+
+**Deciding whether to re-pull is a different question and uses a different signal.** That fingerprint is
+one-directional: a change proves the source moved, but no change proves nothing, because
+`status_summary` and `call_status_counts` are call-dispatch-only and no summary field moves for message
+receipts, replies, or post-call AI enrichment. So `POST /api/ingest` with `refresh: true` skips a batch
+only when `bulkJobIsUnchangedSince` holds — the job has reached a terminal status AND its `updated_at`
+matches `ingestedSourceUpdatedAt`, stamped from the same endpoint before the last pull began. Anything
+unproven is re-pulled: redundant work is self-cleaning, silently serving stale data is not.
 
 ## API routes (`app/api/`)
 | Route | Method | Purpose |
@@ -80,11 +88,23 @@ proportion, so size it against the cluster the deployment actually has.
 
 Retired **record revisions** are not on that clock. Each ingestion stages a complete new copy of a
 batch's records under a fresh revision and publishes it atomically; the superseded copy is unreachable
-from that moment on. The worker reclaims it inline after each publish
-(`deleteSupersededRecordRevisions`), and this endpoint sweeps whatever a crash mid-publish left behind —
-both on a short grace window (`SUPERSEDED_REVISION_GRACE_MS`, minutes) that only covers a reader which
-resolved the old pointer just before the swap. Holding those duplicates for days instead is what
-previously let repeated "Refresh data" clicks exhaust the cluster's storage for every tenant.
+from that moment on. Reclaiming it waits out `SUPERSEDED_REVISION_GRACE_MS` — the window in which a
+reader may already have resolved the old pointer, sized to outlast a slowly-drained CSV export, not
+just a query. So the worker does two passes: on publish it reclaims copies left by *earlier* ingestions
+of the same batch (already past the window), and it schedules a second pass for the copy it just
+superseded. This endpoint is the backstop for anything a restart cut short.
+
+A restart can also leave rows that never receive the marker at all — a revision
+orphaned when the process died between publishing and retiring, or a staging revision abandoned
+mid-ingestion. Those are invisible to the marker-based sweep, so the worker clears them per batch
+before it stages (`deleteOrphanedRecordRevisions`), sparing the published revision and its own
+staging one. A batch that is never ingested again keeps its orphan until the batch itself ages out
+of the retention window.
+
+Reclamation keys on the `retiredAt` marker alone. Only `retireBatchRevision` sets it, and it refuses to
+mark a batch's current `publishedRevision`; revision ids are job ids and are never reused, so a marked
+row can never become readable again. Holding these duplicates for days instead is what previously let
+repeated "Refresh data" clicks exhaust the cluster's storage for every tenant.
 
 The endpoint runs without a user session, guarded by a shared Bearer secret (`CRON_SECRET`). It's driven
 by a daily GitHub Actions cron (`.github/workflows/cleanup.yml`) for the `production` and `dedicated`

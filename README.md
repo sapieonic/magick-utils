@@ -85,7 +85,8 @@ See [`BACKEND.md`](./BACKEND.md) for a full local-testing walkthrough against th
 To keep MongoDB small enough for the Atlas free tier, a daily GitHub Actions cron
 ([`.github/workflows/cleanup.yml`](./.github/workflows/cleanup.yml)) calls `POST /api/cron/cleanup`, which
 enforces a retention window — `DATA_RETENTION_DAYS`, default five — for batches and their normalized
-records, jobs, cached aggregates and cached insights. The endpoint is guarded by a Bearer
+records, jobs, cached aggregates and cached insights, and reclaims any superseded record revisions the
+ingestion worker did not (those are unreachable duplicates, so they are not on the retention clock). The endpoint is guarded by a Bearer
 `CRON_SECRET` and no-ops (503) until both `MONGODB_URI` and `CRON_SECRET` are set. The workflow runs for the `production` and `dedicated` GitHub
 Environments. Configure the following under each environment's secrets and variables:
 
@@ -93,7 +94,9 @@ Environments. Configure the following under each environment's secrets and varia
   `https://<your-host>/api/cron/cleanup`
 - `CRON_SECRET` — an environment secret with the same value as that deployment's app env var
 
-See [`BACKEND.md`](./BACKEND.md#scheduled-cleanup) for the retention rationale.
+See [`BACKEND.md`](./BACKEND.md#scheduled-cleanup) for the retention rationale, and
+[`docs/runbooks/storage-recovery.md`](./docs/runbooks/storage-recovery.md) for what to do when a
+cluster has already filled up.
 
 ## Status
 

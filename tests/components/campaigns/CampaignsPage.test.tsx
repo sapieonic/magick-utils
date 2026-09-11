@@ -7,11 +7,12 @@ vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
 
 // dateRange is what the Topbar dropdown drives; the harness mutates it and
 // re-renders, exactly as the real store would.
-const store = vi.hoisted(() => ({ dateRange: "Last 30 days" }));
+const store = vi.hoisted(() => ({ dateRange: "Last 30 days", setDateRange: vi.fn() }));
 vi.mock("@/lib/store", () => ({
   useApp: () => ({
     currency: "inr",
     dateRange: store.dateRange,
+    setDateRange: store.setDateRange,
     setCombineTargets: vi.fn(),
     setAnalyzeTargets: vi.fn(),
   }),
@@ -52,6 +53,10 @@ describe("CampaignsScreen date range", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     store.dateRange = "Last 30 days";
+    // Mirror the real store: a range change re-renders the screen with the new value.
+    store.setDateRange.mockImplementation((r: string) => {
+      store.dateRange = r;
+    });
   });
 
   it("requests the active range and refetches when it changes", async () => {
@@ -118,5 +123,97 @@ describe("CampaignsScreen date range", () => {
     rerender(<CampaignsScreen />);
     await waitFor(() => expect(screen.getByText("Campaigns are unavailable")).toBeInTheDocument());
     expect(screen.queryByText("Old campaign")).not.toBeInTheDocument();
+  });
+
+  it("coerces a stale stored range to 'All time' instead of asking for it", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT], source: "live" });
+    // dateRange is hydrated from sessionStorage, so it can be anything.
+    store.dateRange = "Last decade";
+    render(<CampaignsScreen />);
+    await waitFor(() => expect(listCampaigns).toHaveBeenCalledWith("All time"));
+    expect(listCampaigns).not.toHaveBeenCalledWith("Last decade");
+  });
+
+  it("blames the date range in the empty state and clears it with the filters", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [], source: "live" });
+    store.dateRange = "Last 7 days";
+    render(<CampaignsScreen />);
+
+    await waitFor(() => expect(screen.getByText("No campaigns match your filters")).toBeInTheDocument());
+    // The stated cause must be the real one — the range is what emptied the list.
+    expect(screen.getByText(/Only campaigns from last 7 days are listed/)).toBeInTheDocument();
+
+    // …and the remedy has to undo it: "Clear filters" used to clear everything
+    // except the one filter that was hiding the campaigns.
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(store.setDateRange).toHaveBeenCalledWith("All time");
+    expect(store.dateRange).toBe("All time");
+  });
+
+  it("says nothing about filters when an unfiltered account is simply empty", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [], source: "live" });
+    store.dateRange = "All time";
+    render(<CampaignsScreen />);
+
+    await waitFor(() => expect(screen.getByText("No campaigns yet")).toBeInTheDocument());
+    expect(screen.queryByText("No campaigns match your filters")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the filter-bar Clear affordance while only the range is narrowed", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT], source: "live" });
+    store.dateRange = "Last 7 days";
+    const { rerender } = render(<CampaignsScreen />);
+    await waitFor(() => expect(screen.getByText("Recent campaign")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+
+    store.dateRange = "All time";
+    rerender(<CampaignsScreen />);
+    // No filters left → nothing to clear.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Clear" })).not.toBeInTheDocument());
+  });
+
+  it("says so when the backend could not scan every campaign", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT], source: "live", truncated: true });
+    render(<CampaignsScreen />);
+    await waitFor(() => expect(screen.getByText(/may be missing from this list/)).toBeInTheDocument());
+  });
+
+  it("stays silent about truncation when the whole listing was scanned", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT], source: "live", truncated: false });
+    render(<CampaignsScreen />);
+    await waitFor(() => expect(screen.getByText("Recent campaign")).toBeInTheDocument());
+    expect(screen.queryByText(/may be missing from this list/)).not.toBeInTheDocument();
+  });
+
+  it("drops selected batches that the new range no longer lists", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT, OLD], source: "live" });
+    const { rerender } = render(<CampaignsScreen />);
+    await waitFor(() => expect(screen.getByText("Old campaign")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByLabelText("Select Old campaign"));
+    expect(screen.getByText("AI Call batch")).toBeInTheDocument();
+
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT], source: "live" });
+    store.dateRange = "Last 7 days";
+    rerender(<CampaignsScreen />);
+
+    // The bulk bar counted rows nobody could see, with the type label gone.
+    await waitFor(() => expect(screen.queryByText("AI Call batch")).not.toBeInTheDocument());
+    expect(screen.queryByText("Combine into one CSV")).not.toBeInTheDocument();
+  });
+
+  it("keeps a selection the new range still lists", async () => {
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT, OLD], source: "live" });
+    const { rerender } = render(<CampaignsScreen />);
+    await waitFor(() => expect(screen.getByText("Old campaign")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByLabelText("Select Recent campaign"));
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [RECENT], source: "live" });
+    store.dateRange = "Last 7 days";
+    rerender(<CampaignsScreen />);
+
+    await waitFor(() => expect(screen.queryByText("Old campaign")).not.toBeInTheDocument());
+    expect(screen.getByText("AI Call batch")).toBeInTheDocument();
   });
 });

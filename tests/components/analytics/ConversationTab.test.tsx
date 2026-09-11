@@ -72,8 +72,8 @@ describe("ConversationTab — FunnelView", () => {
     expect(screen.getByText("Read")).toBeInTheDocument();
   });
 
-  it("renders the sentiment trend (not funnel) when hasMsg is false", () => {
-    render(<ConversationTab hasVoice hasMsg={false} analytics={base} />);
+  it("renders the seeded sentiment trend (not funnel) when hasMsg is false in demo mode", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={base} demo />);
     expect(screen.getByText("Sentiment trend")).toBeInTheDocument();
     expect(screen.queryByText("Delivery funnel")).not.toBeInTheDocument();
   });
@@ -123,23 +123,37 @@ describe("ConversationTab — no mock data on a live backend", () => {
     expect(screen.getByText("No sentiment yet")).toBeInTheDocument();
   });
 
-  it("does not fabricate a sentiment trend — the seeded rising line is demo-only", () => {
+  // Sentiment-over-time isn't in AggregatesDoc, so on a live backend the card
+  // could only ever apologise — it is dropped, not emptied.
+  it("does not ship a sentiment trend card that can only apologise", () => {
     render(<ConversationTab hasVoice hasMsg={false} analytics={base} />);
-    expect(screen.getByText("Sentiment trend")).toBeInTheDocument();
-    expect(screen.getByText("No sentiment trend available")).toBeInTheDocument();
-    // the old hardcoded claim is gone
+    expect(screen.queryByText("Sentiment trend")).not.toBeInTheDocument();
+    expect(screen.queryByText("No sentiment trend available")).not.toBeInTheDocument();
+    // the old hardcoded claim is gone too
     expect(screen.queryByText("Positive share is climbing late-campaign")).not.toBeInTheDocument();
     expect(screen.queryByText("Wk 1")).not.toBeInTheDocument();
   });
 
+  it("lets Key topics take the freed grid cell when the trend card is dropped", () => {
+    const { rerender } = render(<ConversationTab hasVoice hasMsg={false} analytics={base} />);
+    expect(screen.getByText("Key topics").closest(".fade-up")?.className).toContain("lg:col-span-2");
+    // …but not in demo mode, where the trend card still shares the row.
+    rerender(<ConversationTab hasVoice hasMsg={false} analytics={base} demo />);
+    expect(screen.getByText("Key topics").closest(".fade-up")?.className).not.toContain("lg:col-span-2");
+  });
+
   it("distinguishes loading from loaded-and-empty", () => {
     const { rerender } = render(<ConversationTab hasVoice hasMsg={false} analytics={null} loading />);
-    expect(screen.getAllByRole("status").length).toBeGreaterThan(0);
+    const busy = screen.getAllByRole("status");
+    expect(busy.length).toBeGreaterThan(0);
+    expect(busy.every((r) => r.getAttribute("aria-busy") === "true")).toBe(true);
     expect(screen.queryByText("No key topics yet")).not.toBeInTheDocument();
     expect(screen.queryByText("Payment plan request")).not.toBeInTheDocument();
 
+    // Same live regions, now settled — the outcome replaces "Loading…" in place
+    // instead of the announcement stopping at the loading state.
     rerender(<ConversationTab hasVoice hasMsg={false} analytics={null} />);
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("status").every((r) => r.getAttribute("aria-busy") === "false")).toBe(true);
     expect(screen.getByText("No key topics yet")).toBeInTheDocument();
   });
 

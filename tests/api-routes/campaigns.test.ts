@@ -202,12 +202,61 @@ describe("GET /api/campaigns", () => {
     expect(json.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2"]);
   });
 
-  it("400 on an unknown range, without touching the upstream", async () => {
+  it("treats an unknown range as 'All time' instead of 400-ing into a dead screen", async () => {
     ready();
+    listBulkJobs.mockResolvedValue({
+      jobs: [
+        { id: "1", created_at: daysAgoISO(2) },
+        { id: "2", created_at: daysAgoISO(400) },
+      ],
+    });
+    // A stale sessionStorage value reaches the route as an arbitrary string.
     const res = await get("http://localhost/api/campaigns?range=Last+decade");
-    expect(res.status).toBe(400);
-    await expect(res.json()).resolves.toEqual({ error: "invalid_range" });
-    expect(listBulkJobs).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.batches.map((b: { id: string }) => b.id)).toEqual(["1", "2"]);
+  });
+
+  it("keeps a campaign dated slightly ahead of our clock (upstream clock skew)", async () => {
+    ready();
+    // magick-master stamps created_at on its own host; a few minutes of skew must
+    // not delete the newest campaign from every range, "All time" included.
+    const ahead = new Date(Date.now() + 60_000).toISOString();
+    listBulkJobs.mockResolvedValue({ jobs: [{ id: "1", created_at: ahead }] });
+
+    const allTime = await (await get("http://localhost/api/campaigns?range=All+time")).json();
+    expect(allTime.batches.map((b: { id: string }) => b.id)).toEqual(["1"]);
+    const week = await (await get("http://localhost/api/campaigns?range=Last+7+days")).json();
+    expect(week.batches.map((b: { id: string }) => b.id)).toEqual(["1"]);
+  });
+
+  // --- dedupe -------------------------------------------------------------
+
+  it("dedupes a job the unordered upstream served on two pages", async () => {
+    ready();
+    // Page 2 repeats id "1" — undeduped it would upsert twice and render two rows
+    // under the same React key.
+    listBulkJobs
+      .mockResolvedValueOnce({ jobs: [...jobPage(1, 99), { id: "1" }], total: 150 })
+      .mockResolvedValueOnce({ jobs: [{ id: "1" }, { id: "200" }], total: 150 });
+
+    const res = await get();
+    const json = await res.json();
+    const ids = json.batches.map((b: { id: string }) => b.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.filter((id: string) => id === "1")).toHaveLength(1);
+    // 99 from page one + the repeat collapsed + "200"
+    expect(ids).toHaveLength(100);
+    expect(refreshBatchFromSource).toHaveBeenCalledTimes(100);
+  });
+
+  // --- truncation ---------------------------------------------------------
+
+  it("reports truncated:false when the whole listing was scanned", async () => {
+    ready();
+    listBulkJobs.mockResolvedValue({ jobs: [{ id: "1" }, { id: "2" }] });
+    const json = await (await get()).json();
+    expect(json.truncated).toBe(false);
   });
 
   // --- bound --------------------------------------------------------------
@@ -228,5 +277,7 @@ describe("GET /api/campaigns", () => {
     // 2,500 scanned = 25 upstream pages of 100.
     expect(listBulkJobs).toHaveBeenCalledTimes(25);
     expect(json.batches).toHaveLength(2_500);
+    // The client cannot tell a short listing from a capped one without this.
+    expect(json.truncated).toBe(true);
   });
 });

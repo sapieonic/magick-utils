@@ -28,22 +28,6 @@ describe("analytics/StatusDonut", () => {
     expect(screen.getByText("69%")).toBeInTheDocument();
   });
 
-  it("suppresses the centre for a share series, so percentages never total to '100 records'", () => {
-    render(
-      <StatusDonut
-        unit={null}
-        data={[
-          { name: "Positive", value: 47, color: "#16a34a" },
-          { name: "Neutral", value: 34, color: "#94a3b8" },
-          { name: "Negative", value: 19, color: "#dc2626" },
-        ]}
-      />,
-    );
-    expect(screen.queryByText("records")).not.toBeInTheDocument();
-    expect(screen.queryByText("100")).not.toBeInTheDocument();
-    expect(screen.getByText("47%")).toBeInTheDocument();
-  });
-
   it("does not divide by zero when every segment is empty", () => {
     render(<StatusDonut data={[{ name: "Completed", value: 0, color: "#16a34a" }]} />);
     expect(screen.getByText("—")).toBeInTheDocument();

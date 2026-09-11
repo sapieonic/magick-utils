@@ -38,6 +38,18 @@ A **batch** = one bulk job's result. `selType(batch)` ∈ `ai | ivr | message` g
 you may only multi-select / combine / analyze-together batches of the **same selType**. `typeKey` keeps
 messaging channels distinct for badges (`ai | ivr | whatsapp | telegram | email`).
 
+`BatchDoc.ingestStatus` is `none | ingesting | ready | stale | error`. **`stale` is readable** — its
+published revision is complete and is what every reader sees, it just has upstream changes waiting.
+Use `isBatchReadable()` from `lib/server/types.ts` rather than comparing to `"ready"`; treating stale as
+un-ingested is what produced intermittent 409s. See BACKEND.md → *Batch freshness*.
+
+Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
+re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see
+`bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`.
+
+`DATA_RETENTION_DAYS` (default 5) is the ceiling on how far back Dashboard and Analytics can see —
+older batches are deleted with every record they own.
+
 ## Status
 - ✅ Full UI ported from the design handoff. `npm run dev`, `npm run build`, `npx tsc --noEmit` pass.
 - ✅ Backend V1 built (see `BACKEND.md`): magick-master client, iron-session auth, MongoDB layer,

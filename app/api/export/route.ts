@@ -109,6 +109,16 @@ async function handle(rawBatchIds: unknown, rawColumns: unknown, ctx: { tenantId
       } finally {
         await cursor.close().catch(() => {});
       }
+      // A short download can outlive the revision it is reading if a refresh
+      // republishes the batch mid-stream. Fail loudly rather than handing the
+      // customer a CSV that is silently missing rows — they have no way to tell
+      // a truncated export from a complete one.
+      if (rows !== count) {
+        const err = new Error(`CSV export truncated: wrote ${rows} of ${count} expected rows`);
+        exportLog.error({ rows, expected: count, durationMs: Date.now() - startedAt }, "CSV export row count mismatch");
+        controller.error(err);
+        return;
+      }
       exportLog.info({ rows, durationMs: Date.now() - startedAt }, "CSV export completed");
       controller.close();
     },

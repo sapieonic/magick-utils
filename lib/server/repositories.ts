@@ -20,6 +20,7 @@ import {
   IVR_HANGUP_NODE_KEYS,
   SHORT_CALL_SECONDS,
 } from "@/lib/server/dashboard-quality";
+import { isBatchReadable } from "@/lib/server/types";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -131,8 +132,7 @@ export async function beginBatchIngestion(
         ...withoutIngestionOwnership(doc),
         // A published revision stays readable while the refresh runs; only a
         // batch with nothing to serve yet shows as "ingesting".
-        ingestStatus:
-          doc.ingestStatus === "ready" || doc.ingestStatus === "stale" ? doc.ingestStatus : "ingesting",
+        ingestStatus: isBatchReadable(doc) ? doc.ingestStatus : "ingesting",
         ingestJobId: jobId,
         ingestLeaseId: leaseId,
         ingestLeaseUntil: leaseUntil,
@@ -269,10 +269,14 @@ export async function retireBatchRevision(
 }
 
 /** Grace period before a superseded revision's rows are physically removed.
- *  A reader resolves a batch's `publishedRevision` and then queries rows for
- *  it; this window covers the gap between those two steps if the pointer is
- *  swapped in between. Minutes are ample for a single query round-trip. */
-export const SUPERSEDED_REVISION_GRACE_MS = 5 * 60 * 1000;
+ *
+ *  A reader resolves a batch's `publishedRevision` and then reads rows for it.
+ *  For most callers that gap is one round-trip, but a CSV export holds its
+ *  cursor open for the whole download, advancing only as fast as the client
+ *  consumes it — so the window has to outlast a large, slowly-drained export,
+ *  not just a query. Sized above MongoDB's own 10-minute idle cursor timeout,
+ *  which caps how long such a stream can survive anyway. */
+export const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
 
 /**
  * Physically delete this batch's retired revisions once they are past the grace
@@ -302,6 +306,40 @@ export async function deleteSupersededRecordRevisions(
     batchId,
     revision: { $exists: true, $ne: keepRevision },
     retiredAt: { $lt: new Date(Date.now() - graceMs) },
+  });
+  return res.deletedCount ?? 0;
+}
+
+/**
+ * Reclaim revisions of one batch that no longer belong to anything: a copy
+ * orphaned when the process died between publishing a revision and retiring the
+ * previous one, or a staging revision abandoned by a SIGKILL mid-ingestion.
+ * Neither ever receives the `retiredAt` marker, so neither is reachable by
+ * `deleteSupersededRecordRevisions` — they used to survive until the whole
+ * batch aged out of the retention window.
+ *
+ * Callers MUST pass every revision that is still live for this batch: the
+ * currently published one and, when called from a worker, the revision it is
+ * about to stage. A resumable job keeps its revision across a rate-limit pause
+ * that can outlast the grace period, so omitting it would delete a running
+ * ingestion's work. Batch-scoped and age-bounded on `revisionCreatedAt`, so the
+ * query stays cheap and cannot touch anything recent.
+ */
+export async function deleteOrphanedRecordRevisions(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  keepRevisions: (string | undefined)[],
+  graceMs = SUPERSEDED_REVISION_GRACE_MS,
+): Promise<number> {
+  const keep = keepRevisions.filter((revision): revision is string => Boolean(revision));
+  const col = await records();
+  const res = await col.deleteMany({
+    tenantId,
+    accountId,
+    batchId,
+    revision: { $exists: true, $nin: keep },
+    revisionCreatedAt: { $lt: new Date(Date.now() - graceMs) },
   });
   return res.deletedCount ?? 0;
 }
@@ -428,8 +466,7 @@ export async function getDashboardVolume(
   // "stale" counts: its published revision is complete and is what every other
   // reader sees, so excluding it would drop real campaigns off the dashboard
   // the moment their upstream summary moved.
-  const readyBatches = (await listBatches(tenantId, accountId))
-    .filter((batch) => batch.ingestStatus === "ready" || batch.ingestStatus === "stale");
+  const readyBatches = (await listBatches(tenantId, accountId)).filter(isBatchReadable);
   if (readyBatches.length === 0) {
     return emptyDashboardVolume(range, start, end);
   }
@@ -1135,29 +1172,27 @@ export async function deleteBatchDataOlderThan(
   };
 }
 
-/** Delete only retired immutable revisions after a grace period. Current
- * published revisions and legacy unversioned records are always retained. */
+/**
+ * Delete retired immutable revisions once they are past the grace period.
+ *
+ * `retiredAt` alone is a sufficient and safe filter, because only
+ * `retireBatchRevision` ever sets it and that function refuses to mark a
+ * batch's current `publishedRevision` — and a revision id is a job id, freshly
+ * generated per job, so a retired revision can never become published again.
+ * Rows carrying the marker are therefore unreachable by construction.
+ *
+ * This previously also excluded every published revision explicitly, by
+ * loading every batch document in the database and building one `$nor` clause
+ * per batch. That list was unbounded and account-agnostic: past roughly a
+ * hundred thousand batches the query document itself exceeds MongoDB's 16 MB
+ * command limit and the whole cleanup fails, reclaiming nothing. The guard was
+ * also ineffective in the direction that mattered — it could not reach rows
+ * whose batch document had already been deleted, which is exactly the orphan a
+ * crash mid-publish leaves behind. Trusting the marker fixes both.
+ */
 export async function deleteRetiredRecordRevisionsOlderThan(cutoff: Date): Promise<number> {
-  const batchCol = await batches();
   const recordCol = await records();
-  // Only explicitly retired revisions are eligible. Active/rate-limited
-  // staging revisions never carry retiredAt and cannot be swept mid-ingestion.
-  const published = await batchCol
-    .find({ publishedRevision: { $exists: true } })
-    .project<Pick<BatchDoc, "tenantId" | "accountId" | "batchId" | "publishedRevision">>({
-      tenantId: 1, accountId: 1, batchId: 1, publishedRevision: 1,
-    })
-    .toArray();
-  const filter: Record<string, unknown> = { retiredAt: { $lt: cutoff } };
-  if (published.length > 0) {
-    filter.$nor = published.map((batch) => ({
-      tenantId: batch.tenantId,
-      accountId: batch.accountId,
-      batchId: batch.batchId,
-      revision: batch.publishedRevision,
-    }));
-  }
-  const res = await recordCol.deleteMany(filter);
+  const res = await recordCol.deleteMany({ retiredAt: { $lt: cutoff } });
   return res.deletedCount ?? 0;
 }
 

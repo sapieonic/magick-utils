@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { isDashboardRange, inDashboardRange, type DashboardRange } from "@/lib/date-range";
+import { isDashboardRange, inListingRange, type DashboardRange } from "@/lib/date-range";
 import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext } from "@/lib/server/session";
 import { MagickClient, MagickApiError, type RawBulkJob } from "@/lib/server/magick-client";
@@ -14,8 +14,9 @@ import { setRequestContext } from "@/lib/server/observability/request-context";
  *  takes no date parameters and guarantees no ordering, so an out-of-range job
  *  is NOT proof that later pages are out of range too — we cannot stop early and
  *  must page through and filter here. This bound is what keeps "All time" from
- *  becoming an unbounded loop against a live upstream; reaching it is logged
- *  (see below) rather than silently truncating the customer's history. */
+ *  becoming an unbounded loop against a live upstream; reaching it is reported
+ *  to the client as `truncated` (a server log alone is invisible to the customer,
+ *  who would otherwise read a capped listing as "my old data is gone"). */
 const MAX_BULK_JOBS_SCANNED = 2_500;
 
 /** How many jobs are refreshed at once. Each one is a Mongo read plus an upsert,
@@ -29,7 +30,7 @@ const REFRESH_CONCURRENCY = 25;
 function jobInRange(job: RawBulkJob, range: DashboardRange, now: Date): boolean {
   const created = job.created_at;
   if (!created || Number.isNaN(new Date(created).getTime())) return true;
-  return inDashboardRange(created, range, now);
+  return inListingRange(created, range, now);
 }
 
 /** List campaigns/batches for the active workspace. Pulls bulk-dispatch jobs from
@@ -45,21 +46,39 @@ export const GET = withLogging("campaigns", async (req: Request) => {
   setRequestContext({ tenantId: ctx.tenantId, accountId: ctx.accountId });
 
   // Unfiltered callers (Dashboard, Analytics) omit the param and keep the old
-  // meaning: every campaign we can reach.
-  const range = new URL(req.url).searchParams.get("range") ?? "All time";
-  if (!isDashboardRange(range)) return NextResponse.json({ error: "invalid_range" }, { status: 400 });
+  // meaning: every campaign we can reach. A value we don't recognise (a stale
+  // sessionStorage range from an older build, a hand-edited URL) is treated the
+  // same way: widening to "All time" shows too much, 400-ing shows nothing and
+  // dead-ends the screen.
+  const requested = new URL(req.url).searchParams.get("range");
+  const range: DashboardRange = requested && isDashboardRange(requested) ? requested : "All time";
+  if (requested && !isDashboardRange(requested)) {
+    log().warn({ requested }, "campaigns got an unknown range — listing all time instead");
+  }
 
   const client = new MagickClient(ctx);
   try {
     const now = new Date();
     const jobs: RawBulkJob[] = [];
+    // The upstream is paged by offset but guarantees no ordering, so the same job
+    // can be served on two pages. Undeduped it would race two upserts on one key
+    // and put two rows with the same id in the table.
+    const seen = new Set<string>();
     let scanned = 0;
+    let truncated = false;
     for await (const job of client.iterateBulkJobs()) {
       scanned += 1;
-      if (jobInRange(job, range, now)) jobs.push(job);
-      if (scanned >= MAX_BULK_JOBS_SCANNED) break;
+      const sourceId = (job.id ?? "").toString();
+      if (sourceId && !seen.has(sourceId)) {
+        seen.add(sourceId);
+        if (jobInRange(job, range, now)) jobs.push(job);
+      }
+      if (scanned >= MAX_BULK_JOBS_SCANNED) {
+        truncated = true;
+        break;
+      }
     }
-    if (scanned >= MAX_BULK_JOBS_SCANNED) {
+    if (truncated) {
       log().warn(
         { scanned, cap: MAX_BULK_JOBS_SCANNED, range },
         "campaigns scan cap reached — older jobs may be missing from this listing",
@@ -87,10 +106,13 @@ export const GET = withLogging("campaigns", async (req: Request) => {
       .map(batchDocToBatch)
       .sort((a, b) => a.dayAgo - b.dayAgo);
     log().info(
-      { jobCount: jobs.length, scanned, range, batchCount: batches.length },
+      { jobCount: jobs.length, scanned, range, batchCount: batches.length, truncated },
       "campaigns listed",
     );
-    return NextResponse.json({ batches });
+    // `truncated` is the client's only way to tell "you have no campaigns here"
+    // apart from "we stopped looking" — the screen says so rather than showing a
+    // bare empty state.
+    return NextResponse.json({ batches, truncated });
   } catch (err) {
     // An expired/invalid magick-master token surfaces as a 401. The stored
     // session is now useless, so clear it and signal the client to re-login

@@ -3,10 +3,10 @@
 // (used by the campaigns listing before any records are ingested).
 
 import type { Batch, BreakdownSeg, StatusKey } from "@/lib/types";
-import type { BatchDoc, TenantContext } from "./types";
+import { isBatchReadable, type BatchDoc, type TenantContext } from "./types";
 import type { RawBulkJob } from "./magick-client";
 import { dispatchTypeToType, normalizeStatus } from "./normalize";
-import { fingerprint } from "./fingerprint";
+import { fingerprint, stableJson } from "./fingerprint";
 
 const PREFIX: Record<string, string> = { ai: "AI", ivr: "IVR", whatsapp: "WA", telegram: "TG", email: "EM" };
 
@@ -108,21 +108,59 @@ function messageBreakdown(status: string, total: number): BreakdownSeg[] {
 }
 
 /** Fingerprint of the upstream bulk-job summary, used to decide whether an
- *  already-ingested batch still matches its source.
+ *  already-ingested batch is still in step with its source — i.e. whether the
+ *  campaigns listing should mark it "stale".
  *
  *  Deliberately excludes `updated_at`: magick-master bumps it on any write to
  *  the job, including enrichment that changes no record. Including it made this
- *  fingerprint churn on ordinary campaign listings, which reset ingested
- *  batches and cost a full duplicate re-ingest every time. Only fields that
- *  imply the underlying record set moved belong here. */
+ *  fingerprint churn on ordinary listings, which reset ingested batches and
+ *  cost a full duplicate re-ingest every time.
+ *
+ *  That omission makes this signal one-directional: a change here proves the
+ *  source moved, but no change does NOT prove it stood still. `status_summary`
+ *  and `call_status_counts` are call-dispatch-only (see RawBulkJob), so for a
+ *  messaging campaign this reduces to id/total/status and cannot see delivery
+ *  receipts or replies arriving. Anything deciding whether to SKIP work must
+ *  therefore use `bulkJobIsUnchangedSince` below, never this alone. */
 export function bulkJobSourceFingerprint(job: RawBulkJob): string {
   return fingerprint([
     (job.id ?? "").toString(),
     job.total_contacts ?? 0,
     job.status,
-    JSON.stringify(job.status_summary ?? null),
-    JSON.stringify(job.call_status_counts ?? null),
+    stableJson(job.status_summary ?? null),
+    stableJson(job.call_status_counts ?? null),
   ]);
+}
+
+/** Upstream job states after which no further records or enrichment arrive.
+ *  Anything else — including an unrecognised state — counts as still moving. */
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled", "canceled"]);
+
+/**
+ * Whether `job` can be proven untouched since a previous ingestion recorded
+ * `ingestedSourceUpdatedAt`, so re-pulling it would rewrite the same dataset.
+ *
+ * Requires both: the job has finished (a running campaign keeps producing
+ * records), and upstream has not written to it since. `updated_at` is the whole
+ * test on purpose. It is the only field that moves for the changes
+ * `bulkJobSourceFingerprint` is blind to — message delivery and read receipts,
+ * replies, and post-call AI enrichment such as sentiment, key topics and cost.
+ * It is also a single scalar present on both the list and the detail payload,
+ * so the value stamped at ingestion and the value checked here are comparable
+ * even if the two endpoints differ in the richer summary fields.
+ *
+ * Errs toward "changed": an unknown status, an upstream that sends no
+ * `updated_at`, or a batch ingested before this marker existed all return false
+ * and get re-ingested. Redundant work is recoverable and self-cleaning;
+ * silently serving a customer stale data is not.
+ */
+export function bulkJobIsUnchangedSince(
+  job: RawBulkJob,
+  ingestedSourceUpdatedAt: string | null | undefined,
+): boolean {
+  if (!ingestedSourceUpdatedAt) return false;
+  if (!TERMINAL_JOB_STATUSES.has((job.status ?? "").toLowerCase().trim())) return false;
+  return (job.updated_at ?? null) === ingestedSourceUpdatedAt;
 }
 
 /** Build a (pre-ingestion) BatchDoc summary from a bulk-dispatch job.
@@ -146,13 +184,15 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
   const map = dispatchTypeToType(job.dispatch_type);
   const sourceId = (job.id ?? "").toString();
   const sourceTotal = job.total_contacts ?? 0;
-  const ingested = existing?.ingestStatus === "ready" || existing?.ingestStatus === "stale";
+  const ingested = Boolean(existing && isBatchReadable(existing));
   const sourceFp = bulkJobSourceFingerprint(job);
-  // Records ingested before source fingerprints were introduced cannot be
-  // proven current, so they count as stale until the next ingestion stamps one.
-  const sourceChanged = Boolean(
-    ingested && (!existing?.sourceFingerprint || existing.sourceFingerprint !== sourceFp),
-  );
+  // Compare against what the PUBLISHED REVISION was built from, not against the
+  // last summary a listing happened to see. Comparing listing-to-listing let a
+  // transient upstream blip (a momentarily absent status_summary) latch a batch
+  // to "stale" with no path back, since only a publish clears it. Records
+  // ingested before markers existed cannot be proven current, so they read as
+  // stale until the next ingestion stamps one.
+  const sourceChanged = Boolean(ingested && existing?.ingestedSourceFingerprint !== sourceFp);
   // An ingested dataset stays authoritative even once upstream moves on: its
   // records are still the ones every reader sees, so its figures — the record
   // total above all — must not flip back to the coarse upstream estimate.
@@ -220,12 +260,16 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     fingerprint: ingested && existing ? existing.fingerprint : sourceFp,
     sourceFingerprint: sourceFp,
     // Preserved so a refresh can tell an unchanged source (nothing to re-pull)
-    // from a genuinely moved one without asking the worker to prove it.
+    // from a genuinely moved one. Only a completed ingestion writes these.
     ingestedSourceFingerprint: existing?.ingestedSourceFingerprint,
+    ingestedSourceUpdatedAt: existing?.ingestedSourceUpdatedAt,
     publishedRevision: existing?.publishedRevision,
     // "stale" keeps the published revision readable — analytics and exports
     // keep working off it — while marking that a refresh has something to pull.
-    ingestStatus: sourceChanged ? "stale" : existing?.ingestStatus ?? "none",
+    // An ingested batch is re-derived from the comparison each time rather than
+    // carried forward, so a source that moves and then moves back resolves to
+    // "ready" again instead of latching stale until someone forces a re-pull.
+    ingestStatus: ingested ? (sourceChanged ? "stale" : "ready") : existing?.ingestStatus ?? "none",
     updatedAt: new Date().toISOString(),
   };
 }
