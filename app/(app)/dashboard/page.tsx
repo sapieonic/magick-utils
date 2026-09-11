@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { Card, Button, TypeDot, TypeBadge, StatusStackBar, SkeletonRow, StatCard, ChartCard } from "@/components/ui";
+import { Card, Button, Icon, TypeDot, TypeBadge, StatusStackBar, SkeletonRow, StatCard, ChartCard } from "@/components/ui";
 import {
   aggregate,
   callsOverTime,
@@ -35,7 +35,12 @@ import { VolumeChart } from "@/components/screens/dashboard/VolumeChart";
 export default function DashboardScreen() {
   const { currency, dateRange, setAnalyzeTargets, user } = useApp();
   const router = useRouter();
-  const selectedRange: DashboardRange = isDashboardRange(dateRange) ? dateRange : "Last 30 days";
+  // An unrecognised range — a stale sessionStorage value from an older build —
+  // widens to All time, matching Campaigns, the campaigns route, and the store's
+  // own default. Narrowing to a 30-day window instead is what produced the
+  // original "where did my campaigns go?" report; a screen must never hide
+  // history because it failed to parse its own filter.
+  const selectedRange: DashboardRange = isDashboardRange(dateRange) ? dateRange : "All time";
   // "over the last 30 days" reads correctly; "over the all time" does not. The
   // shared range control defaults to All time, so the preposition has to move.
   const rangeLabel = selectedRange === "All time" ? "across all time" : `over the ${selectedRange.toLowerCase()}`;
@@ -47,12 +52,17 @@ export default function DashboardScreen() {
   const [source, setSource] = useState<"live" | "mock">("mock");
   const [recordQuality, setRecordQuality] = useState<DashboardVolume | null>(null);
   const [qualityError, setQualityError] = useState(false);
+  // The listing stopped at its scan cap, so these figures describe only the part
+  // of the account it managed to look at. Every stat and chart below is summed
+  // from that subset, so it has to be labelled rather than presented as the
+  // period's total — Campaigns says the same thing about its own list.
+  const [truncated, setTruncated] = useState(false);
 
   // Campaign list drives volume/stats so uningested batches still appear.
   // Ingested records overlay outcomes, short-calls, and IVR drop-off.
   useEffect(() => {
     let active = true;
-    const range: DashboardRange = isDashboardRange(dateRange) ? dateRange : "Last 30 days";
+    const range: DashboardRange = isDashboardRange(dateRange) ? dateRange : "All time";
     // Push the range server-side: the campaigns listing is capped at a fixed
     // number of upstream jobs scanned, so pulling everything and filtering here
     // silently truncated long ranges. `rangeBatches` below still filters, which
@@ -63,10 +73,12 @@ export default function DashboardScreen() {
         if (campaignResult.status === "fulfilled") {
           setBatches(campaignResult.value.batches);
           setSource(campaignResult.value.source);
+          setTruncated(Boolean(campaignResult.value.truncated));
         } else {
           setBatches([]);
           // A failed configured backend must never expose demo data as live data.
           setSource("live");
+          setTruncated(false);
         }
         if (volumeResult.status === "fulfilled") {
           setRecordQuality(volumeResult.value);
@@ -174,6 +186,16 @@ export default function DashboardScreen() {
           Export report
         </Button>
       </div>
+
+      {!loading && truncated && (
+        <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-[13px] text-amber-700">
+          <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
+          <span>
+            This account has more campaigns than one listing can scan, so the figures below cover only
+            the part of your history that was scanned — treat them as a floor, not a total.
+          </span>
+        </div>
+      )}
 
       {/* stat cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">

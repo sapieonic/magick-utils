@@ -40,11 +40,12 @@ vi.mock("@/lib/api", async () => {
     getAnalytics: vi.fn(),
     getJob: vi.fn(),
     listCampaigns: vi.fn(),
+    listCampaignsByIds: vi.fn(),
   };
 });
 
 import Page from "@/app/(app)/analytics/page";
-import { createIngestJob, getAnalytics, getJob, listCampaigns } from "@/lib/api";
+import { createIngestJob, getAnalytics, getJob, listCampaigns, listCampaignsByIds } from "@/lib/api";
 import type { Batch } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
 
@@ -61,6 +62,18 @@ const aggregates: AggregatesDoc = {
   spendInr: 10, telephonyInr: 5, aiInr: 5, computedAt: "2026-08-12T00:00:00Z",
 };
 
+/** The page resolves a known selection by id and only lists the whole account
+ *  when it arrives with none, so both entry points must answer the same way. */
+function mockCampaigns(result: { batches: Batch[]; source: "live" | "mock"; truncated?: boolean }) {
+  vi.mocked(listCampaigns).mockResolvedValue(result);
+  vi.mocked(listCampaignsByIds).mockResolvedValue(result);
+}
+
+function failCampaigns(error: Error) {
+  vi.mocked(listCampaigns).mockRejectedValue(error);
+  vi.mocked(listCampaignsByIds).mockRejectedValue(error);
+}
+
 describe("Analytics page selection validation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -72,7 +85,7 @@ describe("Analytics page selection validation", () => {
   // that silently failed: progress bar to 100%, same numbers, no explanation.
   it("says when a refresh found nothing new upstream", async () => {
     appState.analyzeTargets = ["b1"];
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true, upToDate: true });
     vi.mocked(getAnalytics).mockResolvedValue(aggregates);
 
@@ -81,8 +94,46 @@ describe("Analytics page selection validation", () => {
     expect(await screen.findByText("No new data upstream")).toBeInTheDocument();
   });
 
+  // Resolving a two-batch selection used to page the entire account, and a scan
+  // that stopped at its cap dropped those ids from the result — which this
+  // screen then reported as "no longer available" for live campaigns.
+  it("resolves the selected ids directly instead of listing the account", async () => {
+    appState.analyzeTargets = ["b1"];
+    mockCampaigns({ batches: [campaign], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    vi.mocked(getAnalytics).mockResolvedValue(aggregates);
+
+    render(<Page />);
+
+    await waitFor(() => expect(listCampaignsByIds).toHaveBeenCalledWith(["b1"]));
+    expect(listCampaigns).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a listing only when it arrives with nothing selected", async () => {
+    appState.analyzeTargets = [];
+    mockCampaigns({ batches: [campaign], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    vi.mocked(getAnalytics).mockResolvedValue(aggregates);
+
+    render(<Page />);
+
+    await waitFor(() => expect(listCampaigns).toHaveBeenCalled());
+    expect(listCampaignsByIds).not.toHaveBeenCalled();
+  });
+
+  // An empty result is now meaningful: the ids were looked up and are gone.
+  it("reports every selected id as missing when none of them resolve", async () => {
+    appState.analyzeTargets = ["b1", "missing"];
+    mockCampaigns({ batches: [], source: "live" });
+
+    render(<Page />);
+
+    expect(await screen.findByText("The saved analysis selection is incomplete")).toBeInTheDocument();
+    expect(createIngestJob).not.toHaveBeenCalled();
+  });
+
   it("does not start ingestion for the resolved subset of an incomplete selection", async () => {
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     render(<Page />);
 
     expect(await screen.findByText("The saved analysis selection is incomplete")).toBeInTheDocument();
@@ -96,7 +147,7 @@ describe("Analytics page ingest resume", () => {
     vi.clearAllMocks();
     sessionStorage.clear();
     appState.analyzeTargets = ["b1"];
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(getAnalytics).mockResolvedValue(aggregates);
   });
 
@@ -166,7 +217,7 @@ describe("Analytics page live/demo separation", () => {
   });
 
   it("never shows seeded analytics while a live ingest is still running", async () => {
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     // the job never resolves — this is the window the customer was shown mock data in
     vi.mocked(createIngestJob).mockReturnValue(new Promise(() => {}));
     render(<Page />);
@@ -181,7 +232,7 @@ describe("Analytics page live/demo separation", () => {
   // session lapsed, not "demo mode" — the simulated progress bar would be
   // theatre over no data at all.
   it("surfaces a lapsed session instead of simulating progress on a live backend", async () => {
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(createIngestJob).mockResolvedValue(null);
     render(<Page />);
 
@@ -194,7 +245,7 @@ describe("Analytics page live/demo separation", () => {
   });
 
   it("never unlocks the seeds when the campaign list fails to load", async () => {
-    vi.mocked(listCampaigns).mockRejectedValue(new Error("Upstream is unavailable"));
+    failCampaigns(new Error("Upstream is unavailable"));
     render(<Page />);
 
     expect(await screen.findByText("Analytics are unavailable")).toBeInTheDocument();
@@ -207,7 +258,7 @@ describe("Analytics page live/demo separation", () => {
 
   it("drops the previous selection's numbers when the selection changes", async () => {
     const second: Batch = { ...campaign, id: "b2", batchId: "AI-2", name: "Campaign two" };
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign, second], source: "live" });
+    mockCampaigns({ batches: [campaign, second], source: "live" });
     vi.mocked(createIngestJob)
       .mockResolvedValueOnce({ jobId: null, total: 0, done: 0, ready: true })
       // the second selection's ingest never settles — the window in which the
@@ -228,7 +279,7 @@ describe("Analytics page live/demo separation", () => {
   });
 
   it("keeps demo mode on the seeded data when the backend is off", async () => {
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "mock" });
+    mockCampaigns({ batches: [campaign], source: "mock" });
     vi.mocked(createIngestJob).mockResolvedValue(null);
     render(<Page />);
 
@@ -237,7 +288,7 @@ describe("Analytics page live/demo separation", () => {
   });
 
   it("labels the header count as dispatched, not as a bare record total", async () => {
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
     vi.mocked(getAnalytics).mockResolvedValue(aggregates);
     render(<Page />);
@@ -246,7 +297,7 @@ describe("Analytics page live/demo separation", () => {
   });
 
   it("does not enqueue a second ingest when Refresh data is double-clicked", async () => {
-    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "live" });
+    mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
     vi.mocked(getAnalytics).mockResolvedValue(aggregates);
     render(<Page />);

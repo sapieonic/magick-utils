@@ -4,7 +4,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Card, Icon, Spinner, Tabs, TypeBadge, TypeDot, cx } from "@/components/ui";
 import { aggregate, fmtNum, selType, typeKey } from "@/lib/data";
-import { ApiRequestError, createIngestJob, getAnalytics, getJob, isJobNotFound, jobProgressPercent, listCampaigns } from "@/lib/api";
+import {
+  ApiRequestError,
+  createIngestJob,
+  getAnalytics,
+  getJob,
+  isJobNotFound,
+  jobProgressPercent,
+  listCampaigns,
+  listCampaignsByIds,
+} from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, TypeKey } from "@/lib/types";
 import type { AggregatesDoc } from "@/lib/server/types";
@@ -40,7 +49,7 @@ export default function Page() {
   const router = useRouter();
   const { currency, analyzeTargets } = useApp();
 
-  // live batches — start empty; listCampaigns() supplies mock only when the
+  // live batches — start empty; the data seam supplies mock only when the
   // backend is off. On a live backend mock data never enters this screen.
   const [batches, setBatches] = useState<Batch[]>([]);
   // Gate ingestion until the real campaign list has resolved. Otherwise the
@@ -63,14 +72,26 @@ export default function Page() {
   // "your data is current" from a refresh that quietly did nothing — the
   // ambiguity the customer read as the numbers being unreliable.
   const [upToDate, setUpToDate] = useState(false);
+  // `analyzeTargets` is set by whichever screen sent the customer here, so the
+  // ids are known before this runs and only their names and totals are missing.
+  // Resolve exactly those: listing the whole account to find a handful of them
+  // paged thousands of unrelated jobs, and a scan that hit its cap dropped the
+  // selected ids from the result — which this screen then reported as "no
+  // longer available" for campaigns that were never gone. Only an arrival with
+  // no selection at all still needs a listing, to pick a sensible default.
+  const selectedIds = analyzeTargets ?? [];
+  const selectedKey = selectedIds.join(",");
   useEffect(() => {
     let alive = true;
-    listCampaigns()
+    const ids = selectedKey ? selectedKey.split(",") : [];
+    (ids.length ? listCampaignsByIds(ids) : listCampaigns())
       .then(({ batches, source }) => {
         if (!alive) return;
         liveRef.current = source === "live";
         setLive(liveRef.current);
-        if (batches.length) setBatches(batches);
+        // Applied even when empty: an id that resolved to nothing really is
+        // gone, and `missingTargetIds` below is what tells the customer so.
+        setBatches(batches);
       })
       .catch((error: unknown) => {
         if (!alive) return;
@@ -85,7 +106,7 @@ export default function Page() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [selectedKey]);
 
   const targets = useMemo<Batch[]>(() => {
     if (!batches.length) return [];

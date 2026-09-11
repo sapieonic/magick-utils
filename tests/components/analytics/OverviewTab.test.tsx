@@ -132,6 +132,28 @@ describe("OverviewTab — no mock data on a live backend", () => {
     expect(screen.queryByText("No volume timeline yet")).not.toBeInTheDocument();
   });
 
+  // `statusMix(targets)` is non-empty for any dispatched batch, so the donut and
+  // the stacked bar used to paint upstream's dispatch breakdown immediately and
+  // then redraw with the ingested figures — the labelled version of the numbers
+  // moving under the customer.
+  it("holds the outcome charts back while aggregates are still in flight", () => {
+    render(
+      <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={null} loading />,
+    );
+    // Neither chart is drawn, and nothing claims the records are "dispatched".
+    expect(screen.queryByText(/Share of dispatched records/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Stacked dispatched record counts/)).not.toBeInTheDocument();
+    // The dispatched totals stay, because that stat says so on its face.
+    expect(screen.getByText("Records dispatched")).toBeInTheDocument();
+  });
+
+  it("still shows the dispatched breakdown once the pull has finished without aggregates", () => {
+    render(
+      <OverviewTab targets={[voiceBatch]} agg={aggregate([voiceBatch])} currency="inr" hasVoice analytics={null} />,
+    );
+    expect(screen.getByText(/Share of dispatched records/)).toBeInTheDocument();
+  });
+
   // Three placeholders share this tab while a pull is running; each keeps its
   // own live region, so none of them may shout "Loading…" on its own.
   it("does not announce three simultaneous loading messages", () => {

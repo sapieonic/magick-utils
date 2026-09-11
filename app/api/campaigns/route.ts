@@ -4,6 +4,8 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext } from "@/lib/server/session";
 import { MagickClient, MagickApiError, type RawBulkJob } from "@/lib/server/magick-client";
 import { getBatch, refreshBatchFromSource } from "@/lib/server/repositories";
+import { MAX_SELECTION_BATCHES } from "@/lib/server/selection";
+import type { TenantContext } from "@/lib/server/types";
 import { batchDocToBatch, bulkJobToBatchDoc } from "@/lib/server/map";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
@@ -33,6 +35,52 @@ function jobInRange(job: RawBulkJob, range: DashboardRange, now: Date): boolean 
   return inListingRange(created, range, now);
 }
 
+/** Parse the `ids` query param. Returns null when absent (a full listing) and a
+ *  deduped list when present, including the empty list for `?ids=` — asking for
+ *  no campaigns is a valid, cheap answer, not a request for all of them. */
+function parseIdsParam(raw: string | null): string[] | null {
+  if (raw == null) return null;
+  return [...new Set(raw.split(",").map((id) => id.trim()).filter(Boolean))];
+}
+
+/** Refresh each job's cached BatchDoc and return them in the frontend shape.
+ *  Chunked instead of one big Promise.all: see REFRESH_CONCURRENCY. */
+async function refreshJobsToBatches(ctx: TenantContext, jobs: RawBulkJob[]) {
+  const docs: Array<Awaited<ReturnType<typeof refreshBatchFromSource>> | null> = [];
+  for (let i = 0; i < jobs.length; i += REFRESH_CONCURRENCY) {
+    const chunk = await Promise.all(
+      jobs.slice(i, i + REFRESH_CONCURRENCY).map(async (job) => {
+        const sourceId = (job.id ?? "").toString();
+        if (!sourceId) return null;
+        // BatchDoc is keyed by sourceId, so this lookup preserves prior ingested
+        // figures (spend, exact breakdown) across refreshes.
+        const existing = await getBatch(ctx.tenantId, ctx.accountId, sourceId).catch(() => null);
+        const doc = bulkJobToBatchDoc(job, ctx, existing);
+        return refreshBatchFromSource(doc, existing?.updatedAt ?? null);
+      }),
+    );
+    docs.push(...chunk);
+  }
+  return docs
+    .filter((d): d is NonNullable<typeof d> => Boolean(d))
+    .map(batchDocToBatch)
+    .sort((a, b) => a.dayAgo - b.dayAgo);
+}
+
+/** An expired/invalid magick-master token surfaces as a 401. The stored session
+ *  is now useless, so clear it and signal the client to re-login rather than
+ *  masking it as a generic upstream failure. */
+async function upstreamErrorResponse(err: unknown) {
+  if (err instanceof MagickApiError && err.status === 401) {
+    const session = await getSession();
+    session.destroy();
+    log().warn({ err }, "campaigns fetch hit 401 — session expired, cleared");
+    return NextResponse.json({ error: "session_expired", detail: String(err) }, { status: 401 });
+  }
+  log().error({ err }, "campaigns fetch failed");
+  return NextResponse.json({ error: "fetch_failed", detail: String(err) }, { status: 502 });
+}
+
 /** List campaigns/batches for the active workspace. Pulls bulk-dispatch jobs from
  *  magick-master (calls + messages), refreshes the cached BatchDoc summaries, and
  *  returns them in the frontend `Batch` shape. An optional `?range=` narrows the
@@ -57,6 +105,41 @@ export const GET = withLogging("campaigns", async (req: Request) => {
   }
 
   const client = new MagickClient(ctx);
+
+  // Resolving a known selection does not need — and must not pay for — a full
+  // inventory scan. Analytics arrives holding the ids the customer picked; it
+  // only wants their names and totals. Paging thousands of unrelated jobs to
+  // find a handful of them is slow, and worse, a scan that hit its cap made
+  // those ids look deleted ("no longer available") when they were sitting in
+  // Mongo the whole time. Fetching them directly cannot be truncated.
+  const requestedIds = parseIdsParam(new URL(req.url).searchParams.get("ids"));
+  if (requestedIds) {
+    if (requestedIds.length === 0) return NextResponse.json({ batches: [], truncated: false });
+    if (requestedIds.length > MAX_SELECTION_BATCHES) {
+      return NextResponse.json({ error: "too_many_batches" }, { status: 400 });
+    }
+    try {
+      const jobs = (
+        await Promise.all(
+          requestedIds.map((id) =>
+            // A batch the customer can no longer see upstream is simply absent
+            // from the result; the screen reports that per id rather than
+            // failing the whole selection over one of them.
+            client.getBulkJob(id).catch((err) => {
+              if (err instanceof MagickApiError && err.status === 404) return null;
+              throw err;
+            }),
+          ),
+        )
+      ).filter((job): job is RawBulkJob => Boolean(job));
+      const batches = await refreshJobsToBatches(ctx, jobs);
+      log().info({ requested: requestedIds.length, batchCount: batches.length }, "campaigns resolved by id");
+      return NextResponse.json({ batches, truncated: false });
+    } catch (err) {
+      return upstreamErrorResponse(err);
+    }
+  }
+
   try {
     const now = new Date();
     const jobs: RawBulkJob[] = [];
@@ -85,26 +168,7 @@ export const GET = withLogging("campaigns", async (req: Request) => {
       );
     }
 
-    // Chunked instead of one big Promise.all: see REFRESH_CONCURRENCY.
-    const docs: Array<Awaited<ReturnType<typeof refreshBatchFromSource>> | null> = [];
-    for (let i = 0; i < jobs.length; i += REFRESH_CONCURRENCY) {
-      const chunk = await Promise.all(
-        jobs.slice(i, i + REFRESH_CONCURRENCY).map(async (job) => {
-          const sourceId = (job.id ?? "").toString();
-          if (!sourceId) return null;
-          // BatchDoc is keyed by sourceId, so this lookup preserves prior ingested
-          // figures (spend, exact breakdown) across refreshes.
-          const existing = await getBatch(ctx.tenantId, ctx.accountId, sourceId).catch(() => null);
-          const doc = bulkJobToBatchDoc(job, ctx, existing);
-          return refreshBatchFromSource(doc, existing?.updatedAt ?? null);
-        }),
-      );
-      docs.push(...chunk);
-    }
-    const batches = docs
-      .filter((d): d is NonNullable<typeof d> => Boolean(d))
-      .map(batchDocToBatch)
-      .sort((a, b) => a.dayAgo - b.dayAgo);
+    const batches = await refreshJobsToBatches(ctx, jobs);
     log().info(
       { jobCount: jobs.length, scanned, range, batchCount: batches.length, truncated },
       "campaigns listed",
@@ -114,16 +178,6 @@ export const GET = withLogging("campaigns", async (req: Request) => {
     // bare empty state.
     return NextResponse.json({ batches, truncated });
   } catch (err) {
-    // An expired/invalid magick-master token surfaces as a 401. The stored
-    // session is now useless, so clear it and signal the client to re-login
-    // rather than masking it as a generic upstream failure.
-    if (err instanceof MagickApiError && err.status === 401) {
-      const session = await getSession();
-      session.destroy();
-      log().warn({ err }, "campaigns fetch hit 401 — session expired, cleared");
-      return NextResponse.json({ error: "session_expired", detail: String(err) }, { status: 401 });
-    }
-    log().error({ err }, "campaigns fetch failed");
-    return NextResponse.json({ error: "fetch_failed", detail: String(err) }, { status: 502 });
+    return upstreamErrorResponse(err);
   }
 });

@@ -55,6 +55,19 @@ only when `bulkJobIsUnchangedSince` holds — the job has reached a terminal sta
 matches `ingestedSourceUpdatedAt`, stamped from the same endpoint before the last pull began. Anything
 unproven is re-pulled: redundant work is self-cleaning, silently serving stale data is not.
 
+Because the two signals are different, they can disagree, and one direction deadlocks: the listing marks
+a batch `stale` while `updated_at` stands still, so the skip fires, nothing is pulled, and the batch
+stays latched `stale` with no click able to clear it. A batch already flagged `stale` is therefore never
+skipped — that flag is positive evidence the source moved, so there is nothing left to decide.
+
+For the same reason the worker stamps `ingestedSourceFingerprint` from the *listing's* view of the job
+(`batch.sourceFingerprint`) rather than from the detail payload it fetches for `ingestedSourceUpdatedAt`.
+A fingerprint is only comparable with another of the same shape, and `/bulk-dispatch-jobs` and
+`/bulk-dispatch-jobs/{id}` need not agree on their summary fields; stamping a detail-derived value would
+mark every batch `stale` on the very next listing, forever. Being one listing behind is the safe
+direction: a change that lands mid-ingestion shows up as `stale` next listing, and that refresh is no
+longer skippable.
+
 ## API routes (`app/api/`)
 | Route | Method | Purpose |
 |-------|--------|---------|
@@ -63,7 +76,7 @@ unproven is re-pulled: redundant work is self-cleaning, silently serving stale d
 | `/api/auth/context` | POST `{tenantId,accountId}` | select workspace (validated vs memberships) |
 | `/api/auth/me` | GET | current session/user/context |
 | `/api/auth/logout` | POST | destroy session |
-| `/api/campaigns` | GET | list batches (bulk-dispatch jobs → BatchDocs) |
+| `/api/campaigns` | GET `?range=`\|`?ids=` | list batches (bulk-dispatch jobs → BatchDocs) |
 | `/api/ingest` | POST `{batchIds,type?}` | enqueue ingest/merge job → `{jobId,total}` |
 | `/api/jobs/[id]` | GET | job status/progress (idToken stripped) |
 | `/api/export` | GET/POST `{batchIds,columns}` | streamed CSV from Mongo records (409 if not ingested) |
@@ -71,6 +84,13 @@ unproven is re-pulled: redundant work is self-cleaning, silently serving stale d
 | `/api/insights` | POST `{batchIds,refresh?}` | LLM insight, cached by fingerprint + configured `LLM_MODEL` |
 | `/api/chat` | POST `{batchIds,message,history?}` | SSE-streamed grounded Q&A |
 | `/api/cron/cleanup` | POST | prune stale data (Bearer `CRON_SECRET`); returns `{deleted}` counts |
+
+`/api/campaigns` has two modes. `?range=` (or no param, meaning All time) lists the account by paging
+upstream bulk-dispatch jobs, capped at `MAX_BULK_JOBS_SCANNED` and reporting `truncated` when it stops
+early — that flag must be surfaced, or a capped listing reads to the customer as deleted data. `?ids=`
+resolves a known selection directly instead, with no scan and no truncation; Analytics uses it, since
+listing thousands of jobs to name a handful of selected ones was both slow and, once truncated, made
+live campaigns look deleted. An id the upstream no longer has is simply absent from the response.
 
 Typical flow: log in → pick workspace → `GET /api/campaigns` → `POST /api/ingest` for a selection →
 poll `GET /api/jobs/:id` → then `analytics` / `insights` / `export` work against the ingested records.
@@ -98,8 +118,12 @@ A restart can also leave rows that never receive the marker at all — a revisio
 orphaned when the process died between publishing and retiring, or a staging revision abandoned
 mid-ingestion. Those are invisible to the marker-based sweep, so the worker clears them per batch
 before it stages (`deleteOrphanedRecordRevisions`), sparing the published revision and its own
-staging one. A batch that is never ingested again keeps its orphan until the batch itself ages out
-of the retention window.
+staging one. The cron runs the same reclamation across every batch
+(`deleteOrphanedRecordRevisionsEverywhere`, reported as `orphanedRevisions`), so a batch that is never
+ingested again does not hold its orphan until the batch itself ages out. That pass chunks its query by
+batch and spares each batch's `publishedRevision` and in-flight `ingestJobId`; the bound matters, since
+the unbounded exclusion list it replaced could exceed MongoDB's 16 MB command limit and fail the whole
+cleanup.
 
 Reclamation keys on the `retiredAt` marker alone. Only `retireBatchRevision` sets it, and it refuses to
 mark a batch's current `publishedRevision`; revision ids are job ids and are never reused, so a marked

@@ -14,6 +14,7 @@ vi.mock("@/lib/server/repositories", () => ({
   deleteJobsOlderThan: vi.fn().mockResolvedValue(3),
   deleteInsightsOlderThan: vi.fn().mockResolvedValue(1),
   deleteRetiredRecordRevisionsOlderThan: vi.fn().mockResolvedValue(4),
+  deleteOrphanedRecordRevisionsEverywhere: vi.fn().mockResolvedValue(7),
   SUPERSEDED_REVISION_GRACE_MS: 5 * 60 * 1000,
 }));
 
@@ -24,6 +25,7 @@ import {
   deleteInsightsOlderThan,
   deleteJobsOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
+  deleteOrphanedRecordRevisionsEverywhere,
 } from "@/lib/server/repositories";
 
 function req(token?: string) {
@@ -70,7 +72,10 @@ describe("POST /api/cron/cleanup", () => {
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({
       ok: true,
-      deleted: { aggregates: 2, jobs: 3, insights: 1, batches: 6, records: 500, recordRevisions: 4 },
+      deleted: {
+        aggregates: 2, jobs: 3, insights: 1, batches: 6, records: 500,
+        recordRevisions: 4, orphanedRevisions: 7,
+      },
     });
     // each pruner is called once with an ISO cutoff in the past
     for (const fn of [
@@ -100,5 +105,14 @@ describe("POST /api/cron/cleanup", () => {
     ].map((fn) => vi.mocked(fn).mock.calls[0][0]);
     expect(new Set(cutoffs).size).toBe(1);
     expect(Date.now() - new Date(cutoffs[0]).getTime()).toBeGreaterThanOrEqual(5 * 24 * 60 * 60 * 1000);
+  });
+
+  // A crash between publishing a revision and retiring the previous one leaves a
+  // full duplicate with no `retiredAt`, which the retired-revision sweep cannot
+  // see. Without this pass it survives until the whole batch ages out.
+  it("also sweeps orphaned revisions that never received a retired marker", async () => {
+    const { POST } = await import("@/app/api/cron/cleanup/route");
+    expect((await POST(req(SECRET))).status).toBe(200);
+    expect(deleteOrphanedRecordRevisionsEverywhere).toHaveBeenCalledTimes(1);
   });
 });

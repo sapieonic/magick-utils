@@ -237,6 +237,30 @@ describe("POST /api/ingest", () => {
     expect(createJob).toHaveBeenCalledTimes(1);
   });
 
+  // The regression the two freshness signals can produce together: the listing
+  // marks the batch stale because its source fingerprint moved, while
+  // `updated_at` sits still. Deferring to the timestamp latches the batch stale
+  // in Mongo and makes every later Refresh a no-op against that same timestamp,
+  // so nothing the customer can click ever clears it.
+  it("refreshes a stale batch even when its upstream timestamp has not moved", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "stale",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    expect(res.status).toBe(200);
+    // A real job, not the `{ jobId: null, upToDate: true }` skip response.
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
   it("re-ingests rather than skipping when the upstream source check fails", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);

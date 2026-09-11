@@ -338,6 +338,35 @@ describe("bulkJobSourceFingerprint", () => {
     expect(bulkJobSourceFingerprint(a)).toBe(bulkJobSourceFingerprint(b));
   });
 
+  // call_status_counts is a SET of per-batch rows assembled from webhook
+  // arrivals, so upstream can serve the same rows in a different order. Reading
+  // a reshuffle as a change cost a full duplicate re-ingest.
+  it("ignores row order in call_status_counts", () => {
+    const base = { id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 9 };
+    const a: RawBulkJob = {
+      ...base,
+      call_status_counts: [
+        { batch_id: 1, completed: 4, failed: 1 } as never,
+        { batch_id: 2, completed: 3, failed: 1 } as never,
+      ],
+    };
+    const b: RawBulkJob = {
+      ...base,
+      call_status_counts: [
+        { batch_id: 2, failed: 1, completed: 3 } as never,
+        { failed: 1, batch_id: 1, completed: 4 } as never,
+      ],
+    };
+    expect(bulkJobSourceFingerprint(a)).toBe(bulkJobSourceFingerprint(b));
+  });
+
+  it("still changes when a row's counts change, whatever the order", () => {
+    const base = { id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 9 };
+    const a: RawBulkJob = { ...base, call_status_counts: [{ batch_id: 1, completed: 4 } as never] };
+    const b: RawBulkJob = { ...base, call_status_counts: [{ batch_id: 1, completed: 5 } as never] };
+    expect(bulkJobSourceFingerprint(a)).not.toBe(bulkJobSourceFingerprint(b));
+  });
+
   it("still changes when a count actually changes", () => {
     const base: RawBulkJob = { id: "j", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 5 };
     expect(bulkJobSourceFingerprint({ ...base, status_summary: { completed: 4 } }))

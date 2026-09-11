@@ -3,14 +3,28 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("@/lib/server/env", () => ({ isBackendConfigured: vi.fn() }));
 vi.mock("@/lib/server/session", () => ({ getTenantContext: vi.fn() }));
 vi.mock("@/lib/server/repositories", () => ({
+  // validateSelection's per-batch completeness check still goes through this.
   countRecords: vi.fn(),
   getBatch: vi.fn(),
-  streamRecords: vi.fn(),
+  // The export itself resolves the published revisions once and counts/streams
+  // against that one snapshot, so a mid-export refresh cannot make the two
+  // disagree. PINNED stands in for that opaque filter.
+  resolvePublishedRecordsFilter: vi.fn(async () => PINNED),
+  countRecordsForFilter: vi.fn(),
+  streamRecordsForFilter: vi.fn(),
 }));
+
+const PINNED = { __pinnedRevisions: true };
 
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
-import { countRecords, getBatch, streamRecords } from "@/lib/server/repositories";
+import {
+  countRecords,
+  countRecordsForFilter,
+  getBatch,
+  resolvePublishedRecordsFilter,
+  streamRecordsForFilter,
+} from "@/lib/server/repositories";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 
@@ -47,11 +61,20 @@ async function readAll(res: Response): Promise<string> {
   return out;
 }
 
+/** Both counts describe the same records: `countRecords` is what
+ *  validateSelection checks per batch, `countRecordsForFilter` is what the
+ *  export body counts against its pinned revision snapshot. A test that moves
+ *  one without the other is describing a torn read, not a normal export. */
+function setRecordCount(n: number) {
+  vi.mocked(countRecords).mockResolvedValue(n as never);
+  vi.mocked(countRecordsForFilter).mockResolvedValue(n as never);
+}
+
 describe("POST /api/export", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getBatch).mockResolvedValue({ name: "Camp A", selType: "ai", ingestStatus: "ready", total: 1 } as never);
-    vi.mocked(countRecords).mockResolvedValue(1 as never);
+    setRecordCount(1);
   });
 
   it("503 when backend not configured", async () => {
@@ -86,7 +109,7 @@ describe("POST /api/export", () => {
   it("409 not_ingested when count is 0", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(countRecords).mockResolvedValue(0 as never);
+    setRecordCount(0);
     const { POST } = await import("@/app/api/export/route");
     const res = await POST(postReq({ batchIds: ["b1"] }));
     expect(res.status).toBe(409);
@@ -96,7 +119,7 @@ describe("POST /api/export", () => {
   it("streams CSV with default columns + header on happy path", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(countRecords).mockResolvedValue(1 as never);
+    setRecordCount(1);
     vi.mocked(getBatch).mockResolvedValue({ name: "Camp A", selType: "ai", ingestStatus: "ready", total: 1 } as never);
     const { it, close } = cursor([
       {
@@ -104,7 +127,7 @@ describe("POST /api/export", () => {
         status: "completed", outcome: "answered", timestamp: "2026-01-01", totalCostInr: 1.5,
       },
     ]);
-    vi.mocked(streamRecords).mockResolvedValue(it as never);
+    vi.mocked(streamRecordsForFilter).mockResolvedValue(it as never);
 
     const { POST } = await import("@/app/api/export/route");
     const res = await POST(postReq({ batchIds: ["b1"] }));
@@ -119,13 +142,34 @@ describe("POST /api/export", () => {
     expect(close).toHaveBeenCalled();
   });
 
+  // The count and the stream describe one export. Resolving the published
+  // revisions separately for each let a refresh publish in between, so the count
+  // read the old revision while the cursor walked the new one — and a complete
+  // export was reported to the customer as truncated.
+  it("counts and streams against one resolved revision snapshot", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    setRecordCount(1);
+    const { it } = cursor([{ recordId: "r1", status: "ok" }]);
+    vi.mocked(streamRecordsForFilter).mockResolvedValue(it as never);
+
+    const { POST } = await import("@/app/api/export/route");
+    const res = await POST(postReq({ batchIds: ["b1", "b2"], columns: ["record_id"] }));
+    await readAll(res);
+
+    expect(resolvePublishedRecordsFilter).toHaveBeenCalledTimes(1);
+    expect(resolvePublishedRecordsFilter).toHaveBeenCalledWith("t1", "a1", ["b1", "b2"]);
+    expect(countRecordsForFilter).toHaveBeenCalledWith(PINNED);
+    expect(streamRecordsForFilter).toHaveBeenCalledWith(PINNED);
+  });
+
   it("uses combined filename for multiple batches and honors custom columns", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(countRecords).mockResolvedValue(1 as never);
+    setRecordCount(1);
     vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 1 } as never);
     const { it } = cursor([{ recordId: "r1", status: "x" }]);
-    vi.mocked(streamRecords).mockResolvedValue(it as never);
+    vi.mocked(streamRecordsForFilter).mockResolvedValue(it as never);
     const { POST } = await import("@/app/api/export/route");
     const res = await POST(postReq({ batchIds: ["b1", "b2"], columns: ["record_id", "status"] }));
     expect(res.headers.get("Content-Disposition")).toContain("combined-2-batches.csv");
@@ -137,10 +181,10 @@ describe("POST /api/export", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 7 } as never);
-    vi.mocked(countRecords).mockResolvedValue(7 as never);
+    setRecordCount(7);
     const values = ["=cmd", "+cmd", "-cmd", "@cmd", "  =cmd", "\t=cmd", "\n=cmd"];
     const { it } = cursor(values.map((recipientPhone, index) => ({ recordId: `r${index}`, batchId: "b1", recipientPhone })));
-    vi.mocked(streamRecords).mockResolvedValue(it as never);
+    vi.mocked(streamRecordsForFilter).mockResolvedValue(it as never);
 
     const { POST } = await import("@/app/api/export/route");
     const res = await POST(postReq({ batchIds: ["b1"], columns: ["recipient_phone"] }));
@@ -154,7 +198,7 @@ describe("GET /api/export", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 1 } as never);
-    vi.mocked(countRecords).mockResolvedValue(1 as never);
+    setRecordCount(1);
   });
 
   it("503 when backend not configured", async () => {
@@ -181,10 +225,10 @@ describe("GET /api/export", () => {
   it("streams CSV from query params", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(countRecords).mockResolvedValue(1 as never);
+    setRecordCount(1);
     vi.mocked(getBatch).mockResolvedValue({ name: "C", selType: "ai", ingestStatus: "ready", total: 1 } as never);
     const { it } = cursor([{ recordId: "r1", status: "ok" }]);
-    vi.mocked(streamRecords).mockResolvedValue(it as never);
+    vi.mocked(streamRecordsForFilter).mockResolvedValue(it as never);
     const { GET } = await import("@/app/api/export/route");
     const res = await GET(getReq("batchIds=b1,b2&columns=record_id,status"));
     expect(res.status).toBe(200);
@@ -200,6 +244,6 @@ describe("GET /api/export", () => {
     const res = await GET(getReq("batchIds=b1&columns=record_id,status&preflight=1"));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ready: true });
-    expect(streamRecords).not.toHaveBeenCalled();
+    expect(streamRecordsForFilter).not.toHaveBeenCalled();
   });
 });

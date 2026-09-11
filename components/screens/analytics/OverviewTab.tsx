@@ -44,21 +44,29 @@ export function OverviewTab({
   demo?: boolean;
   loading?: boolean;
 }) {
+  // Aggregates are still being ingested and will replace whatever we draw now.
+  // Painting the dispatched breakdown in the meantime is the labelled version of
+  // the "numbers kept changing" complaint: the donut and the bar fill in, then
+  // silently redraw with different values a few seconds later. Conversation and
+  // Cost already hold their charts back while this is true; Overview does too.
+  const pending = loading && !analytics;
   const mix = useMemo(
     () =>
-      (analytics
-        ? analytics.statusMix.map((s) => ({
-            key: s.key,
-            name: STATUS[s.key as StatusKey]?.label ?? s.key,
-            value: s.value,
-            color: STATUS[s.key as StatusKey]?.color ?? "#94a3b8",
-          }))
-        : // Not a seed: the selected batches' own upstream outcome breakdown.
-          statusMix(targets)
+      (pending
+        ? []
+        : analytics
+          ? analytics.statusMix.map((s) => ({
+              key: s.key,
+              name: STATUS[s.key as StatusKey]?.label ?? s.key,
+              value: s.value,
+              color: STATUS[s.key as StatusKey]?.color ?? "#94a3b8",
+            }))
+          : // Not a seed: the selected batches' own upstream outcome breakdown.
+            statusMix(targets)
       // Hide statuses with no records — an empty bucket shouldn't get a slice,
       // a legend row, or a zero-length bar.
       ).filter((m) => m.value > 0),
-    [analytics, targets],
+    [analytics, pending, targets],
   );
   const time = useMemo(() => {
     const rows = analytics?.volumeOverTime ?? (demo ? callsOverTime() : null);
@@ -68,7 +76,12 @@ export function OverviewTab({
   const records = analytics ? analytics.totalRecords : agg.totalCalls + agg.totalMessages;
   const successRate = analytics ? analytics.successRate : agg.successRate;
   const spend = analytics ? analytics.spendInr : agg.spendInr;
+  // "Ingested" and "dispatched" are different quantities, and which one these
+  // charts will show is not yet decided while aggregates are in flight — so the
+  // subtitle does not claim either until it is.
   const mixSource = analytics ? "ingested" : "dispatched";
+  const mixSubtitle = pending ? "Share of records" : `Share of ${mixSource} records`;
+  const mixBarSubtitle = pending ? "Stacked record counts" : `Stacked ${mixSource} record counts`;
   const stats: { label: string; value: string; sub?: string; icon: string; accentVal?: boolean }[] = [
     // "Ingested" (what analytics actually read) and "dispatched" (what the bulk
     // job sent) are different quantities and legitimately disagree — never
@@ -103,14 +116,14 @@ export function OverviewTab({
         ))}
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <ChartCard title="Outcome distribution" subtitle={`Share of ${mixSource} records`}>
+        <ChartCard title="Outcome distribution" subtitle={mixSubtitle}>
           {mix.length ? (
             <StatusDonut data={mix} />
           ) : (
             <ChartPlaceholder loading={loading} icon="ChartPie" title="No outcomes yet" body="No records with an outcome were found for this selection." height={220} />
           )}
         </ChartCard>
-        <ChartCard className="lg:col-span-2" title="Outcome by volume" subtitle={`Stacked ${mixSource} record counts`}>
+        <ChartCard className="lg:col-span-2" title="Outcome by volume" subtitle={mixBarSubtitle}>
           {mix.length ? (
             <StackedStatusBar mix={mix} />
           ) : (

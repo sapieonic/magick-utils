@@ -34,9 +34,10 @@ const REFRESH_CHECK_CONCURRENCY = 10;
  * their last pull (see bulkJobIsUnchangedSince).
  *
  * Deliberately conservative at every step: a batch with no complete revision, no
- * recorded stamp, or an unreadable upstream job all stay in the refresh. Doing
- * redundant work is recoverable and the worker reclaims the duplicate itself;
- * silently refusing the refresh a customer asked for is not.
+ * recorded stamp, an unreadable upstream job, or a listing that already flagged
+ * it stale all stay in the refresh. Doing redundant work is recoverable and the
+ * worker reclaims the duplicate itself; silently refusing the refresh a customer
+ * asked for is not.
  */
 async function refreshableBatchIds(
   ctx: TenantContext,
@@ -54,6 +55,18 @@ async function refreshableBatchIds(
         const batch = batchDocs[index];
         // Nothing complete to compare against — this is a plain first ingest.
         if (!complete[index] || !batch.ingestedSourceUpdatedAt || !batch.sourceId) return batchId;
+        // A batch the campaigns listing already marked "stale" is one we have
+        // positive evidence has moved, so there is nothing left to decide: pull
+        // it. Skipping here would deadlock the two freshness signals against
+        // each other. They are deliberately different — staleness compares the
+        // listing's source fingerprint, the skip compares `updated_at` — and
+        // they can disagree either way round. When staleness says "changed" and
+        // `updated_at` says "untouched", trusting the timestamp leaves the batch
+        // latched stale in Mongo with every later refresh no-oping against the
+        // same unchanged timestamp, and no click can ever clear it. Re-pulling
+        // costs one redundant ingestion that the worker reclaims itself; the
+        // latch costs the customer their refresh, permanently.
+        if (batch.ingestStatus === "stale") return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
           if (bulkJobIsUnchangedSince(job, batch.ingestedSourceUpdatedAt)) {

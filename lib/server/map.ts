@@ -128,8 +128,21 @@ export function bulkJobSourceFingerprint(job: RawBulkJob): string {
     job.total_contacts ?? 0,
     job.status,
     stableJson(job.status_summary ?? null),
-    stableJson(job.call_status_counts ?? null),
+    unorderedJson(job.call_status_counts),
   ]);
+}
+
+/** `stableJson` canonicalizes object keys but preserves array order, which is
+ *  correct in general and wrong for `call_status_counts`: it is a SET of
+ *  per-batch count rows assembled from webhook arrivals, so upstream is free to
+ *  serve the same rows in a different order on the next listing. Comparing it
+ *  positionally would read a reshuffle as a source change and cost a full
+ *  duplicate re-ingest — the exact churn this fingerprint exists to stop.
+ *  Sorting the canonicalized rows makes the comparison order-insensitive while
+ *  still distinguishing any real change to a row's contents. */
+function unorderedJson(rows: Array<Record<string, number>> | null | undefined): string {
+  if (!rows) return stableJson(null);
+  return `[${rows.map(stableJson).sort().join(",")}]`;
 }
 
 /** Upstream job states after which no further records or enrichment arrive.

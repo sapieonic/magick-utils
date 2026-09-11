@@ -3,7 +3,7 @@
 // never leak across tenants. Server-only.
 
 import { randomUUID } from "node:crypto";
-import type { AnyBulkWriteOperation, FindCursor, WithId } from "mongodb";
+import type { AnyBulkWriteOperation, Filter, FindCursor, WithId } from "mongodb";
 import {
   aggregates,
   aiUsage,
@@ -380,11 +380,30 @@ export async function replaceBatchRecords(
   await col.bulkWrite(ops, { ordered: false });
 }
 
+/**
+ * An immutable snapshot of which revision each batch publishes, resolved once.
+ *
+ * Reads that make two trips to the records collection for one logical result —
+ * a count and the stream it describes — MUST resolve this once and pass the
+ * same value to both. Resolving twice lets an ingestion publish in between, so
+ * the two trips read different revisions of the same batch and their row counts
+ * legitimately disagree.
+ */
+export type PublishedRecordsFilter = Filter<NormalizedRecord>;
+
+export async function resolvePublishedRecordsFilter(
+  tenantId: string,
+  accountId: string,
+  batchIds: string[]
+): Promise<PublishedRecordsFilter> {
+  return publishedRecordsFilter(tenantId, accountId, batchIds);
+}
+
 async function publishedRecordsFilter(
   tenantId: string,
   accountId: string,
   batchIds: string[]
-) {
+): Promise<PublishedRecordsFilter> {
   const col = await batches();
   const docs = await col
     .find({ tenantId, accountId, batchId: { $in: batchIds } })
@@ -434,8 +453,14 @@ export async function streamRecords(
   batchIds: string[]
 ): Promise<FindCursor<WithId<NormalizedRecord>>> {
   if (batchIds.length === 0) throw new Error("Cannot stream an empty batch selection.");
+  return streamRecordsForFilter(await publishedRecordsFilter(tenantId, accountId, batchIds));
+}
+
+/** As `streamRecords`, against a revision snapshot the caller already resolved. */
+export async function streamRecordsForFilter(
+  filter: PublishedRecordsFilter,
+): Promise<FindCursor<WithId<NormalizedRecord>>> {
   const col = await records();
-  const filter = await publishedRecordsFilter(tenantId, accountId, batchIds);
   return col
     .find(filter)
     .sort({ batchId: 1, recordId: 1 });
@@ -447,8 +472,13 @@ export async function countRecords(
   batchIds: string[]
 ): Promise<number> {
   if (batchIds.length === 0) return 0;
+  return countRecordsForFilter(await publishedRecordsFilter(tenantId, accountId, batchIds));
+}
+
+/** As `countRecords`, against a revision snapshot the caller already resolved. */
+export async function countRecordsForFilter(filter: PublishedRecordsFilter): Promise<number> {
   const col = await records();
-  return col.countDocuments(await publishedRecordsFilter(tenantId, accountId, batchIds));
+  return col.countDocuments(filter);
 }
 
 /** Aggregate true placed/sent activity by IST day. The fallback to `timestamp`
@@ -1194,6 +1224,90 @@ export async function deleteRetiredRecordRevisionsOlderThan(cutoff: Date): Promi
   const recordCol = await records();
   const res = await recordCol.deleteMany({ retiredAt: { $lt: cutoff } });
   return res.deletedCount ?? 0;
+}
+
+/** How many batches one orphan-sweep delete query covers. The whole reason the
+ *  previous all-tenant sweep failed was a query document that grew with the
+ *  database until it blew MongoDB's 16 MB command limit; chunking keeps every
+ *  query a fixed size no matter how many batches exist. */
+const ORPHAN_SWEEP_CHUNK = 500;
+
+/**
+ * Reclaim orphaned revisions across every batch, for the daily cron.
+ *
+ * `deleteRetiredRecordRevisionsOlderThan` can only see rows carrying
+ * `retiredAt`, and two kinds of duplicate never get that marker: a copy
+ * orphaned when the process died between publishing a new revision and retiring
+ * the previous one, and a staging revision abandoned by a SIGKILL mid-ingestion.
+ * The worker reclaims both, but only for a batch that gets ingested again — a
+ * batch nobody refreshes keeps its orphan until the whole batch ages out of the
+ * retention window, which on a full cluster is exactly the space that cannot be
+ * waited for.
+ *
+ * Scoped per batch rather than globally: each batch contributes its own
+ * `$nin` of live revisions, so a batch is only ever compared against its own
+ * revisions. That is what makes this safe to run without the unbounded
+ * exclusion list the old implementation built.
+ *
+ * Three guards keep a live ingestion's work out of range:
+ *  - `publishedRevision` — what every reader is currently reading;
+ *  - `ingestJobId` — the in-flight staging revision (a revision id IS the job
+ *    id), which a resumable job keeps across a rate-limit pause that can outlast
+ *    the grace window;
+ *  - `revisionCreatedAt` older than the grace window, so nothing recent is
+ *    touched even if a batch document is momentarily out of date.
+ *
+ * Rows written before revisions existed carry no `revision` at all and are
+ * matched by neither this nor `publishedRecordsFilter`'s `$exists: false`
+ * branch — they are left alone.
+ */
+export async function deleteOrphanedRecordRevisionsEverywhere(
+  graceMs = SUPERSEDED_REVISION_GRACE_MS,
+): Promise<number> {
+  const batchCol = await batches();
+  const recordCol = await records();
+  const cutoff = new Date(Date.now() - graceMs);
+  const cursor = batchCol
+    .find({})
+    .project<Pick<BatchDoc, "tenantId" | "accountId" | "batchId" | "publishedRevision" | "ingestJobId">>({
+      tenantId: 1,
+      accountId: 1,
+      batchId: 1,
+      publishedRevision: 1,
+      ingestJobId: 1,
+    });
+
+  let deleted = 0;
+  let chunk: Array<Record<string, unknown>> = [];
+  const flush = async () => {
+    if (chunk.length === 0) return;
+    const res = await recordCol.deleteMany({
+      revision: { $exists: true },
+      revisionCreatedAt: { $lt: cutoff },
+      $or: chunk,
+    });
+    deleted += res.deletedCount ?? 0;
+    chunk = [];
+  };
+
+  try {
+    for await (const doc of cursor) {
+      const keep = [doc.publishedRevision, doc.ingestJobId].filter(
+        (revision): revision is string => Boolean(revision),
+      );
+      chunk.push({
+        tenantId: doc.tenantId,
+        accountId: doc.accountId,
+        batchId: doc.batchId,
+        revision: { $nin: keep },
+      });
+      if (chunk.length >= ORPHAN_SWEEP_CHUNK) await flush();
+    }
+    await flush();
+  } finally {
+    await cursor.close().catch(() => {});
+  }
+  return deleted;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,11 @@
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
-import { countRecords, getBatch, streamRecords } from "@/lib/server/repositories";
+import {
+  countRecordsForFilter,
+  getBatch,
+  resolvePublishedRecordsFilter,
+  streamRecordsForFilter,
+} from "@/lib/server/repositories";
 import type { NormalizedRecord } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
@@ -77,7 +82,13 @@ async function handle(rawBatchIds: unknown, rawColumns: unknown, ctx: { tenantId
   }
   const columns = [...new Set(rawColumns as string[])];
   if (columns.some((column) => !VALID_COLS.has(column))) return Response.json({ error: "invalid_columns" }, { status: 400 });
-  const count = await countRecords(ctx.tenantId, ctx.accountId, batchIds);
+  // Resolve which revision each batch publishes exactly once, and count and
+  // stream against that one snapshot. Resolving it twice would let a refresh
+  // publish in between: the count would describe the old revision while the
+  // cursor walked the new one, and the row-count check below would report a
+  // perfectly complete export as truncated.
+  const revisions = await resolvePublishedRecordsFilter(ctx.tenantId, ctx.accountId, batchIds);
+  const count = await countRecordsForFilter(revisions);
 
   const nameById = new Map<string, string>();
   for (const id of batchIds) {
@@ -85,7 +96,7 @@ async function handle(rawBatchIds: unknown, rawColumns: unknown, ctx: { tenantId
     if (b) nameById.set(id, b.name);
   }
   const cols = columns.length > 0 ? columns : DEFAULT_COLS;
-  const cursor = await streamRecords(ctx.tenantId, ctx.accountId, batchIds);
+  const cursor = await streamRecordsForFilter(revisions);
 
   const exportLog = log().child({ batchCount: batchIds.length, recordCount: count, columns: cols.length });
   exportLog.info("CSV export started");
@@ -109,10 +120,11 @@ async function handle(rawBatchIds: unknown, rawColumns: unknown, ctx: { tenantId
       } finally {
         await cursor.close().catch(() => {});
       }
-      // A short download can outlive the revision it is reading if a refresh
-      // republishes the batch mid-stream. Fail loudly rather than handing the
-      // customer a CSV that is silently missing rows — they have no way to tell
-      // a truncated export from a complete one.
+      // Count and cursor read the same pinned revisions, so a mismatch is never
+      // a concurrent publish — it means rows went missing underneath the open
+      // cursor (a revision reclaimed mid-stream). Fail loudly rather than
+      // handing the customer a CSV that is silently short: they have no way to
+      // tell a truncated export from a complete one.
       if (rows !== count) {
         const err = new Error(`CSV export truncated: wrote ${rows} of ${count} expected rows`);
         exportLog.error({ rows, expected: count, durationMs: Date.now() - startedAt }, "CSV export row count mismatch");

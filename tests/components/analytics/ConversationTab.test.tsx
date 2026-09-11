@@ -190,3 +190,46 @@ describe("ConversationTab — demo mode (backend off)", () => {
     expect(screen.getByText("47%")).toBeInTheDocument();
   });
 });
+
+describe("ConversationTab — duration histogram", () => {
+  // `aggregate()` emits all six buckets unconditionally, so an unanswered
+  // selection arrives as six zero rows rather than an empty array. Keying the
+  // empty state on length alone drew an empty chart and said nothing.
+  it("shows the empty state when every bucket is zero", () => {
+    render(
+      <ConversationTab
+        hasVoice
+        hasMsg={false}
+        analytics={{
+          ...base,
+          durationHistogram: [
+            { bucket: "0–30s", calls: 0, talk: 0 },
+            { bucket: "30–60s", calls: 0, talk: 0 },
+            { bucket: "1–2m", calls: 0, talk: 0 },
+            { bucket: "2–3m", calls: 0, talk: 0 },
+            { bucket: "3–5m", calls: 0, talk: 0 },
+            { bucket: "5m+", calls: 0, talk: 0 },
+          ],
+        }}
+      />,
+    );
+    expect(screen.getByText("No call durations yet")).toBeInTheDocument();
+  });
+
+  it("charts the histogram when talk-time alone carries a value", () => {
+    render(
+      <ConversationTab
+        hasVoice
+        hasMsg={false}
+        analytics={{
+          ...base,
+          durationHistogram: [
+            { bucket: "0–30s", calls: 0, talk: 3 },
+            { bucket: "30–60s", calls: 0, talk: 0 },
+          ],
+        }}
+      />,
+    );
+    expect(screen.queryByText("No call durations yet")).not.toBeInTheDocument();
+  });
+});

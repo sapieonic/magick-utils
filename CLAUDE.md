@@ -45,7 +45,13 @@ un-ingested is what produced intermittent 409s. See BACKEND.md → *Batch freshn
 
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see
-`bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`.
+`bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`. The one refresh that is never skipped
+is a batch already flagged `stale` — the two freshness signals can disagree, and deferring to the
+timestamp there latches the batch stale with no click able to clear it.
+
+Anything that both counts and then reads the same records (the CSV export) must resolve the published
+revisions once with `resolvePublishedRecordsFilter` and pass that to both; resolving twice lets a
+refresh publish in between and the two disagree.
 
 `DATA_RETENTION_DAYS` (default 5) is the ceiling on how far back Dashboard and Analytics can see —
 older batches are deleted with every record they own.

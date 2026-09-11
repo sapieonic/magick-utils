@@ -58,8 +58,16 @@ export function ConversationTab({
   demo?: boolean;
   loading?: boolean;
 }) {
+  // Unlike every other series here, the duration histogram is always six rows:
+  // `aggregate()` emits one per bucket whether or not anything landed in it. A
+  // selection of unanswered calls — or one with no ingested records at all —
+  // therefore arrives as six zeroes, and a length check alone would draw an
+  // empty chart instead of saying so.
   const dur = useMemo(
-    () => nonEmpty(analytics?.durationHistogram ?? (demo ? durationHistogram() : null)),
+    () => withSignal(
+      analytics?.durationHistogram ?? (demo ? durationHistogram() : null),
+      (row) => row.calls > 0 || row.talk > 0,
+    ),
     [analytics, demo],
   );
   const sent = useMemo(
@@ -165,6 +173,12 @@ export function ConversationTab({
  *  would otherwise render an axis with no bars. Collapse both holes to null. */
 function nonEmpty<T>(rows: T[] | null | undefined): T[] | null {
   return rows && rows.length ? rows : null;
+}
+
+/** As `nonEmpty`, for a series whose rows exist regardless of whether anything
+ *  was measured: present only when at least one row carries a real value. */
+function withSignal<T>(rows: T[] | null | undefined, hasValue: (row: T) => boolean): T[] | null {
+  return rows && rows.some(hasValue) ? rows : null;
 }
 
 function DurationChart({ data }: { data: { bucket: string; calls: number; talk: number }[] }) {

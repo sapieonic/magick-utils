@@ -393,9 +393,25 @@ async function ingestBatch(
     date: batch.date,
     fingerprint: freshFp,
     sourceFingerprint: batch.sourceFingerprint,
-    // Stamp what this revision was actually built from. The fingerprint is what
-    // later listings compare against to flag the batch stale; the timestamp is
-    // what a refresh checks before deciding it has nothing to pull.
+    // Stamp what this revision was built from. The fingerprint is what later
+    // listings compare against to flag the batch stale; the timestamp is what a
+    // refresh checks before deciding it has nothing to pull.
+    //
+    // The fingerprint comes from the batch document — i.e. from the LIST payload
+    // the campaigns route last saw — and not from the detail payload fetched
+    // just above for `sourceUpdatedAt`, even though that one is fresher. A
+    // fingerprint is only meaningful against another fingerprint of the same
+    // shape: `/bulk-dispatch-jobs` and `/bulk-dispatch-jobs/{id}` are separate
+    // endpoints whose summary fields (`status_summary`, `call_status_counts`)
+    // need not agree, so stamping a detail-derived value would make the very
+    // next listing compute a different fingerprint and mark this batch stale
+    // forever, on every batch, immediately after a successful ingestion.
+    //
+    // Being a listing behind instead is the safe direction: a source change that
+    // landed mid-ingestion shows up as "stale" on the next listing, and the
+    // refresh that follows is no longer skippable (see refreshableBatchIds,
+    // which never skips a stale batch), so the two signals converge on the next
+    // pull rather than deadlocking.
     ingestedSourceFingerprint: batch.sourceFingerprint,
     ingestedSourceUpdatedAt: sourceUpdatedAt,
     publishedRevision: revision,

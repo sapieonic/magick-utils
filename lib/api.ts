@@ -110,6 +110,32 @@ export async function listCampaigns(range?: string): Promise<CampaignListResult>
   return { batches: j.batches as Batch[], source: "live", truncated: Boolean(j.truncated) };
 }
 
+/** Resolve a known set of campaign ids without listing the account.
+ *
+ *  Analytics and Combine already hold the ids the customer selected; all they
+ *  need back is each batch's name and totals. Going through `listCampaigns()`
+ *  for that paged the whole inventory, and when that scan hit its cap the
+ *  selected ids dropped out of the result and the screen reported perfectly
+ *  live campaigns as "no longer available". A direct lookup cannot truncate:
+ *  an id missing from the response really is missing.
+ *
+ *  Ids absent upstream are simply not returned, so compare what comes back
+ *  against what you asked for rather than assuming a full result. */
+export async function listCampaignsByIds(ids: string[]): Promise<CampaignListResult> {
+  const wanted = [...new Set(ids.filter(Boolean))];
+  const { backend } = await backendStatus();
+  if (!backend) {
+    return { batches: CAMPAIGNS.filter((c) => wanted.includes(c.id)), source: "mock", truncated: false };
+  }
+  if (wanted.length === 0) return { batches: [], source: "live", truncated: false };
+  const query = `?ids=${encodeURIComponent(wanted.join(","))}`;
+  const res = await fetch(`/api/campaigns${query}`, { cache: "no-store" });
+  if (handleSessionExpiry(res)) throw new Error("session_expired");
+  if (!res.ok) throw await responseError(res, "Unable to load the selected campaigns.");
+  const j = await res.json();
+  return { batches: j.batches as Batch[], source: "live", truncated: false };
+}
+
 export interface IngestJobResult {
   jobId: string | null;
   total: number;

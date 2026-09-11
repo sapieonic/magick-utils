@@ -78,14 +78,27 @@ describe("MagickClient.iterateBulkJobs", () => {
     expect(urls).toHaveLength(1);
   });
 
-  it("stops once the offset reaches the reported total", async () => {
-    // Both pages are full, so only `total` can end the loop.
+  it("keeps paging past a stale-low reported total", async () => {
+    // magick-master counts `total` separately from the rows it serves, so it can
+    // lag behind. Trusting it here stopped the listing at the reported figure and
+    // silently dropped every job beyond it — the "only 100 campaigns" report.
     const urls = stubPages([
-      { jobs: jobs(0, 100), total: 200 },
-      { jobs: jobs(100, 100), total: 200 },
-      { jobs: jobs(200, 100), total: 200 },
+      { jobs: jobs(0, 100), total: 100 },
+      { jobs: jobs(100, 100), total: 100 },
+      { jobs: jobs(200, 40), total: 100 },
     ]);
-    expect(await drain(new MagickClient(ctx).iterateBulkJobs())).toHaveLength(200);
+    expect(await drain(new MagickClient(ctx).iterateBulkJobs())).toHaveLength(240);
+    expect(urls).toHaveLength(3);
+  });
+
+  it("stops on a short page even when the reported total is higher", async () => {
+    // The short page is the authoritative end-of-list signal; an over-reported
+    // total must not keep the loop running against an exhausted upstream.
+    const urls = stubPages([
+      { jobs: jobs(0, 100), total: 500 },
+      { jobs: jobs(100, 30), total: 500 },
+    ]);
+    expect(await drain(new MagickClient(ctx).iterateBulkJobs())).toHaveLength(130);
     expect(urls).toHaveLength(2);
   });
 

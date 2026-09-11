@@ -29,6 +29,7 @@ import {
   deleteBatchDataOlderThan,
   deleteRetiredRecordRevisionsOlderThan,
   deleteOrphanedRecordRevisions,
+  deleteOrphanedRecordRevisionsEverywhere,
   deleteSupersededRecordRevisions,
   failBatchIfOwned,
   retireBatchRevision,
@@ -341,6 +342,70 @@ describe("orphaned revision reclamation", () => {
     expect(recordDb.deleteMany.mock.calls[0][0]).toMatchObject({
       revision: { $exists: true, $nin: ["rev-staging"] },
     });
+  });
+});
+
+/** A cursor over `docs` shaped like the projected batch cursor the sweep uses. */
+function batchCursor(docs: unknown[]) {
+  return {
+    project: vi.fn().mockReturnValue({
+      [Symbol.asyncIterator]: async function* () {
+        for (const doc of docs) yield doc;
+      },
+      close: vi.fn().mockResolvedValue(undefined),
+    }),
+  };
+}
+
+describe("cron-wide orphaned revision reclamation", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("scopes the sweep per batch and spares both live revisions of each", async () => {
+    batchDb.find.mockReturnValue(
+      batchCursor([
+        { tenantId: "t1", accountId: "a1", batchId: "b1", publishedRevision: "rev-1" },
+        // Mid-ingestion: its staging revision IS the job id, and a rate-limited
+        // job can hold it open for longer than the grace window.
+        { tenantId: "t1", accountId: "a2", batchId: "b2", publishedRevision: "rev-2", ingestJobId: "job-9" },
+      ]),
+    );
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 4 });
+
+    await expect(deleteOrphanedRecordRevisionsEverywhere()).resolves.toBe(4);
+
+    const filter = recordDb.deleteMany.mock.calls[0][0];
+    expect(filter.$or).toEqual([
+      { tenantId: "t1", accountId: "a1", batchId: "b1", revision: { $nin: ["rev-1"] } },
+      { tenantId: "t1", accountId: "a2", batchId: "b2", revision: { $nin: ["rev-2", "job-9"] } },
+    ]);
+    // Legacy rows predate revisions entirely and must never be swept.
+    expect(filter.revision).toEqual({ $exists: true });
+    expect((filter.revisionCreatedAt as { $lt: Date }).$lt.getTime()).toBeLessThanOrEqual(
+      Date.now() - SUPERSEDED_REVISION_GRACE_MS,
+    );
+  });
+
+  // The unbounded exclusion list is what broke the previous cleanup: past
+  // roughly a hundred thousand batches the query document itself exceeded
+  // MongoDB's 16MB command limit and the whole run reclaimed nothing.
+  it("chunks the sweep so the query never grows with the database", async () => {
+    const docs = Array.from({ length: 1_100 }, (_, i) => ({
+      tenantId: "t1", accountId: "a1", batchId: `b${i}`, publishedRevision: `rev-${i}`,
+    }));
+    batchDb.find.mockReturnValue(batchCursor(docs));
+    recordDb.deleteMany.mockResolvedValue({ deletedCount: 1 });
+
+    await expect(deleteOrphanedRecordRevisionsEverywhere()).resolves.toBe(3);
+
+    expect(recordDb.deleteMany).toHaveBeenCalledTimes(3);
+    const sizes = recordDb.deleteMany.mock.calls.map((c) => (c[0].$or as unknown[]).length);
+    expect(sizes).toEqual([500, 500, 100]);
+  });
+
+  it("issues no delete at all when there are no batches", async () => {
+    batchDb.find.mockReturnValue(batchCursor([]));
+    await expect(deleteOrphanedRecordRevisionsEverywhere()).resolves.toBe(0);
+    expect(recordDb.deleteMany).not.toHaveBeenCalled();
   });
 });
 

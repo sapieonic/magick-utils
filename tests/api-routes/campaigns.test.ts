@@ -9,9 +9,13 @@ vi.mock("@/lib/server/session", () => ({
 }));
 
 const listBulkJobs = vi.fn();
+const getBulkJob = vi.fn();
 /** Mirrors the real MagickClient.iterateBulkJobs paging contract (page size 100,
- *  stop on a short page or once offset passes `total`) so route tests exercise
- *  the same multi-page behaviour the client provides. */
+ *  stop on a short page and ONLY on a short page) so route tests exercise the
+ *  same multi-page behaviour the client provides. The reported `total` is
+ *  deliberately not consulted: magick-master counts it separately from the rows
+ *  it serves, so trusting it truncated long listings. Keep this in step with
+ *  lib/server/magick-client.ts. */
 const PAGE_SIZE = 100;
 class MagickApiError extends Error {
   status: number;
@@ -24,6 +28,7 @@ class MagickApiError extends Error {
 vi.mock("@/lib/server/magick-client", () => ({
   MagickClient: class {
     listBulkJobs = listBulkJobs;
+    getBulkJob = getBulkJob;
     async *iterateBulkJobs() {
       let offset = 0;
       for (;;) {
@@ -32,8 +37,6 @@ vi.mock("@/lib/server/magick-client", () => ({
         for (const job of jobs) yield job;
         if (jobs.length < PAGE_SIZE) break;
         offset += PAGE_SIZE;
-        const total = page.total ?? 0;
-        if (total > 0 && offset >= total) break;
       }
     }
   },
@@ -145,17 +148,19 @@ describe("GET /api/campaigns", () => {
     expect(listBulkJobs).toHaveBeenNthCalledWith(2, { limit: 100, offset: 100 });
   });
 
-  it("stops paging once offset reaches the reported total", async () => {
+  it("keeps paging past a stale-low reported total", async () => {
+    // A `total` that lags the rows actually served must not end the listing: that
+    // is how an account with hundreds of campaigns saw only the first hundred.
     ready();
     listBulkJobs
-      .mockResolvedValueOnce({ jobs: jobPage(0, 100), total: 200 })
-      .mockResolvedValueOnce({ jobs: jobPage(100, 100), total: 200 })
-      .mockResolvedValue({ jobs: jobPage(200, 100), total: 200 });
+      .mockResolvedValueOnce({ jobs: jobPage(0, 100), total: 100 })
+      .mockResolvedValueOnce({ jobs: jobPage(100, 100), total: 100 })
+      .mockResolvedValue({ jobs: jobPage(200, 40), total: 100 });
 
     const res = await get();
     const json = await res.json();
-    expect(json.batches).toHaveLength(200);
-    expect(listBulkJobs).toHaveBeenCalledTimes(2);
+    expect(json.batches).toHaveLength(240);
+    expect(listBulkJobs).toHaveBeenCalledTimes(3);
   });
 
   // --- date filtering -----------------------------------------------------
@@ -279,5 +284,71 @@ describe("GET /api/campaigns", () => {
     expect(json.batches).toHaveLength(2_500);
     // The client cannot tell a short listing from a capped one without this.
     expect(json.truncated).toBe(true);
+  });
+});
+
+// Analytics and Combine arrive already holding the ids the customer picked, so
+// they ask for exactly those. Making them page the whole inventory was slow and,
+// once the scan hit its cap, made live campaigns look deleted.
+describe("GET /api/campaigns?ids=", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBatch).mockResolvedValue(null as never);
+  });
+
+  it("resolves the named jobs directly, without listing the account", async () => {
+    ready();
+    getBulkJob.mockImplementation(async (id: string) => ({ id }));
+
+    const res = await get("http://localhost/api/campaigns?ids=b2,b1");
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.batches.map((b: { id: string }) => b.id).sort()).toEqual(["b1", "b2"]);
+    expect(json.truncated).toBe(false);
+    expect(listBulkJobs).not.toHaveBeenCalled();
+    expect(getBulkJob).toHaveBeenCalledTimes(2);
+  });
+
+  it("omits an id the upstream no longer has instead of failing the selection", async () => {
+    ready();
+    getBulkJob.mockImplementation(async (id: string) => {
+      if (id === "gone") throw new MagickApiError(404);
+      return { id };
+    });
+
+    const json = await (await get("http://localhost/api/campaigns?ids=b1,gone")).json();
+
+    expect(json.batches.map((b: { id: string }) => b.id)).toEqual(["b1"]);
+  });
+
+  it("surfaces a non-404 upstream failure rather than reporting a short selection", async () => {
+    ready();
+    getBulkJob.mockRejectedValue(new MagickApiError(500));
+    expect((await get("http://localhost/api/campaigns?ids=b1")).status).toBe(502);
+  });
+
+  it("clears the session on a 401, as the full listing does", async () => {
+    ready();
+    getBulkJob.mockRejectedValue(new MagickApiError(401));
+    const res = await get("http://localhost/api/campaigns?ids=b1");
+    expect(res.status).toBe(401);
+    expect(sessionDestroy).toHaveBeenCalledOnce();
+  });
+
+  it("answers an empty ids list without touching the upstream", async () => {
+    ready();
+    const json = await (await get("http://localhost/api/campaigns?ids=")).json();
+    expect(json).toEqual({ batches: [], truncated: false });
+    expect(getBulkJob).not.toHaveBeenCalled();
+    expect(listBulkJobs).not.toHaveBeenCalled();
+  });
+
+  it("rejects a selection larger than the selection cap", async () => {
+    ready();
+    const ids = Array.from({ length: 51 }, (_, i) => `b${i}`).join(",");
+    const res = await get(`http://localhost/api/campaigns?ids=${ids}`);
+    expect(res.status).toBe(400);
+    expect(getBulkJob).not.toHaveBeenCalled();
   });
 });

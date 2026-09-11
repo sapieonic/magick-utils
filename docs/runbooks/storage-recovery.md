@@ -13,10 +13,11 @@ dataset that survived for days. Enough clicks exhausted the cluster's storage an
 blocked writes for **every tenant on it**, not just the account doing the
 clicking.
 
-Three things changed: a refresh now re-pulls only what upstream actually
-touched; the worker reclaims superseded copies itself (see
-`SUPERSEDED_REVISION_GRACE_MS`); and the cron sweeps them on that short window
-rather than the retention window.
+Four things changed: a refresh now re-pulls only what upstream actually touched;
+the worker reclaims superseded copies itself (see
+`SUPERSEDED_REVISION_GRACE_MS`); the cron sweeps them on that short window rather
+than the retention window; and the cron additionally sweeps the copies a crash
+left behind with no retirement marker, which previously nothing could reach.
 
 ## 1. Deploy, then check the cron is wired up
 
@@ -43,11 +44,14 @@ curl -fsS -X POST "$CLEANUP_URL" -H "Authorization: Bearer $CRON_SECRET"
 It returns the counts it removed:
 
 ```json
-{"ok":true,"deleted":{"aggregates":N,"jobs":N,"insights":N,"batches":N,"records":N,"recordRevisions":N}}
+{"ok":true,"deleted":{"aggregates":N,"jobs":N,"insights":N,"batches":N,"records":N,"recordRevisions":N,"orphanedRevisions":N}}
 ```
 
-`recordRevisions` is the number that matters here — those are the duplicate rows.
-Expect it to be large on the first run after this deploy and near zero afterwards.
+`recordRevisions` and `orphanedRevisions` are the numbers that matter here — both
+count duplicate rows. `recordRevisions` are copies a clean publish retired;
+`orphanedRevisions` are copies a crash left with no marker at all, which nothing
+used to reclaim until the whole batch aged out. Expect both to be large on the
+first run after this deploy and near zero afterwards.
 
 If the call itself fails because the cluster is refusing writes, a delete is
 normally still permitted where an insert is not; if it is genuinely rejected,
