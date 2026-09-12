@@ -166,9 +166,11 @@ describe("mockDashboardQuality", () => {
       const ivr = q.ivrDropoff;
       expect(ivr.withPath).toBeLessThanOrEqual(ivr.totalIvr);
       expect(ivr.hangupCount).toBeLessThanOrEqual(ivr.withPath);
-      // This used to carry a denominator of its own that had drifted out of
-      // step with the counts printed beside it.
-      expect(ivr.hangupRate).toBeCloseTo(ivr.hangupCount / ivr.withPath, 6);
+      // Over every IVR call, the same denominator assembleDashboardQuality uses
+      // for the live figure (hangupCount / totalIvr) and the same one the card
+      // prints in the caption under the percentage. It used to carry a third
+      // denominator that matched neither.
+      expect(ivr.hangupRate).toBeCloseTo(ivr.hangupCount / ivr.totalIvr, 6);
       for (const r of [short.shortRate, short.hangupRate, ivr.hangupRate]) {
         expect(r).toBeGreaterThanOrEqual(0);
         expect(r).toBeLessThanOrEqual(1);

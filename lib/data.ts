@@ -321,8 +321,11 @@ export function mockDashboardQuality(range: DashboardRange = "Last 30 days", now
   const shortCount = bad(1263, connectedWithDuration);
   const connectedWithTalk = n(7980);
   const hangupCount = bad(958, connectedWithTalk);
-  const ivrWithPath = n(3410);
-  const ivrHangupCount = bad(620, ivrWithPath);
+  const ivrTotal = n(3640);
+  const ivrWithPath = Math.min(ivrTotal, n(3410));
+  // Bounded by the total, not by the subset with a recorded path: a call can end
+  // on a hangup node without one. Matches how the live figure is counted.
+  const ivrHangupCount = bad(620, ivrTotal);
 
   return {
     voiceConnectMix: [
@@ -366,12 +369,13 @@ export function mockDashboardQuality(range: DashboardRange = "Last 30 days", now
       ],
     },
     ivrDropoff: {
-      totalIvr: n(3640),
+      totalIvr: ivrTotal,
       withPath: ivrWithPath,
       hangupCount: ivrHangupCount,
-      // Derived from the counts beside it rather than carrying its own
-      // denominator, which had drifted out of step with them.
-      hangupRate: rate(ivrHangupCount, ivrWithPath),
+      // Over every IVR call, matching assembleDashboardQuality and the caption
+      // the card prints directly beneath it ("N hang-ups of {totalIvr} IVR
+      // calls"). It used to carry a denominator of its own that matched neither.
+      hangupRate: rate(ivrHangupCount, ivrTotal),
       depthFunnel: [
         { stage: "Entered IVR", value: ivrWithPath },
         { stage: "2nd node", value: n(2480) },
