@@ -7,6 +7,7 @@ import {
   aggregate,
   callsOverTime,
   mockDashboardQuality,
+  mockPreviousPeriod,
   sparkline,
   typeKey,
   fmtNum,
@@ -20,7 +21,7 @@ import {
 import { useApp } from "@/lib/store";
 import type { Batch, StatusKey } from "@/lib/types";
 import { getDashboardVolume, listCampaigns } from "@/lib/api";
-import { DASHBOARD_RANGES, inDashboardRange, isDashboardRange, rangeDays, rangeStart, type DashboardRange } from "@/lib/date-range";
+import { DASHBOARD_RANGES, inDashboardRange, isDashboardRange, rangeDays, type DashboardRange } from "@/lib/date-range";
 import type { DashboardVolume } from "@/lib/server/types";
 import { dashboardVolumeFromCampaigns, fillDashboardDays } from "@/lib/dashboard";
 import { APP_TIMEZONE_LABEL, formatAppDate, getAppTimeParts, parseAppYmd } from "@/lib/timezone";
@@ -106,8 +107,9 @@ export default function DashboardScreen() {
     [rangeBatches, selectedRange],
   );
   const timeData = useMemo(() => {
-    // Same window the quality panels below are scaled to — one helper, so the
-    // chart and the panels can never describe different periods.
+    // A synthetic series with no total to anchor to, so it takes the window's
+    // length. The quality panels below deliberately do NOT: they scale from the
+    // in-range campaign aggregate, so they can never outgrow the stat cards.
     if (source === "mock") return callsOverTime(rangeDays(selectedRange));
     return fillDashboardDays(campaignVolume).map((point) => ({
       ...point,
@@ -162,19 +164,10 @@ export default function DashboardScreen() {
   // campaigns in the window immediately before this one, and simply absent when
   // there is no prior window to compare against ("All time", or a period the
   // seed does not reach back far enough to cover).
-  const previousAgg = useMemo(() => {
-    if (source !== "mock") return null;
-    const now = new Date();
-    const start = rangeStart(selectedRange, now);
-    if (!start) return null;
-    const spanMs = rangeDays(selectedRange, now) * 86_400_000;
-    const prevStart = start.getTime() - spanMs;
-    const prior = batches.filter((batch) => {
-      const at = new Date(batch.date).getTime();
-      return Number.isFinite(at) && at >= prevStart && at < start.getTime();
-    });
-    return prior.length ? aggregate(prior) : null;
-  }, [batches, selectedRange, source]);
+  const previousAgg = useMemo(
+    () => (source === "mock" ? mockPreviousPeriod(selectedRange) : null),
+    [selectedRange, source],
+  );
   /** Whole-percent change against the prior window, or null when incomparable. */
   const deltaVs = (current: number, previous: number | undefined) =>
     previous != null && previous > 0 ? Math.round(((current - previous) / previous) * 100) : null;

@@ -24,10 +24,14 @@ export const ALL_TIME_DAYS = 180;
 
 /** How many days a range covers, inclusive of today.
  *
- *  Demo mode has nothing to filter: with the backend off there are no records
- *  for a date range to narrow, so anything seeded has to be scaled to the range
- *  by hand. Every such series goes through this one helper, so the volume chart
- *  and the quality panels below it always describe the same window. */
+ *  For SYNTHETIC series only — demo data generated from nothing, like the mock
+ *  volume chart, which needs a window length and has no totals to anchor to.
+ *
+ *  A breakdown that sits beside a figure it decomposes must NOT be scaled by
+ *  this: scale it from that figure instead. Day-count scaling let the demo
+ *  quality panels outgrow their own seed, drawing a connect-mix donut claiming
+ *  more calls than the "Total calls" card above it — see `mockDashboardQuality`,
+ *  which derives from the in-range campaign aggregate for exactly that reason. */
 export function rangeDays(range: DashboardRange, now = new Date()): number {
   const start = rangeStart(range, now);
   if (start == null) return ALL_TIME_DAYS;

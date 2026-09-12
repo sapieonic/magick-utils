@@ -175,6 +175,16 @@ describe("DashboardScreen demo-mode date filter", () => {
     expect(week.shortRate).toBeCloseTo(month.shortRate, 4);
   });
 
+  // The first attempt at un-freezing these derived the prior window from the
+  // screen's own campaign list — already narrowed to the current range — so it
+  // matched nothing and removed all five badges instead of making them move.
+  it("shows trend badges against a real prior period", async () => {
+    app.dateRange = "Last 7 days";
+    render(<DashboardScreen />);
+    await waitFor(() => expect(screen.getByText("Total calls")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText(/^\d+%$/).length).toBeGreaterThan(0));
+  });
+
   it("moves Voice connect mix when the range changes", async () => {
     const week = await renderAt("Last 7 days");
     const quarter = await renderAt("Last 90 days");

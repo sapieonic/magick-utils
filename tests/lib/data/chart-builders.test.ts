@@ -9,6 +9,7 @@ import {
   sentimentData,
   messagingFunnel,
   mockDashboardQuality,
+  mockPreviousPeriod,
   costBreakdown,
   TOPICS,
 } from "@/lib/data";
@@ -171,15 +172,41 @@ describe("mockDashboardQuality", () => {
   });
 
   // Scaling off the same figure the cards use means the panels can only differ
-  // when the cards differ. The seeds stop at 55 days, so these three windows
-  // hold identical campaigns — and must therefore render identically, rather
-  // than swinging on a day count the data does not back.
+  // when the cards differ. Asserted against the cards themselves rather than
+  // against named ranges: which windows happen to hold identical seeds depends
+  // on today's date (early in a quarter, "This quarter" is far shorter than
+  // "Last 90 days"), so naming them would make this fail on a calendar.
   it("stands still exactly when the rest of the screen does", () => {
-    const ninety = mockDashboardQuality("Last 90 days");
-    const quarter = mockDashboardQuality("This quarter");
-    const allTime = mockDashboardQuality("All time");
-    expect(quarter).toEqual(ninety);
-    expect(allTime).toEqual(ninety);
+    const byCardTotals = new Map<string, ReturnType<typeof mockDashboardQuality>>();
+    for (const range of DASHBOARD_RANGES) {
+      const card = aggregate(CAMPAIGNS.filter((c) => inDashboardRange(c.date, range)));
+      const key = `${card.totalCalls}/${card.totalMessages}`;
+      const seen = byCardTotals.get(key);
+      const panels = mockDashboardQuality(range);
+      if (seen) expect(panels, `${range} has the same cards but different panels`).toEqual(seen);
+      else byCardTotals.set(key, panels);
+    }
+    // The seeds stop well inside the longest window, so at least two ranges do
+    // coincide — otherwise this would pass by never comparing anything.
+    expect(byCardTotals.size).toBeLessThan(DASHBOARD_RANGES.length);
+  });
+
+  it("finds a prior window to compare the trend badges against", () => {
+    // The screen's own campaign list is already narrowed to the current range,
+    // so deriving this from it returned nothing at every range and removed all
+    // five trend badges instead of making them move. It has to read the seed.
+    for (const range of ["Last 7 days", "Last 30 days"] as const) {
+      const prior = mockPreviousPeriod(range);
+      expect(prior, `${range} should have a comparable prior window`).not.toBeNull();
+      expect(prior!.totalCalls).toBeGreaterThan(0);
+    }
+  });
+
+  it("offers no comparison where there is honestly none to make", () => {
+    // "All time" has no window before it, and the seed does not reach back far
+    // enough to cover the 90 days before "Last 90 days".
+    expect(mockPreviousPeriod("All time")).toBeNull();
+    expect(mockPreviousPeriod("Last 90 days")).toBeNull();
   });
 
   it("keeps each panel internally consistent at every range", () => {

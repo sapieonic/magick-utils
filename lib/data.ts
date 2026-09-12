@@ -23,7 +23,7 @@ import {
   getAppTimeParts,
   startOfAppDay,
 } from "./timezone";
-import { inDashboardRange, type DashboardRange } from "./date-range";
+import { inDashboardRange, rangeDays, rangeStart, type DashboardRange } from "./date-range";
 
 // ---- seeded RNG so data is stable across reloads ----
 function mulberry32(a: number) {
@@ -282,6 +282,30 @@ export function messagingFunnel() {
     { stage: "Read", value: 31840, color: "#16a34a" },
     { stage: "Replied", value: 9420, color: "#6366f1" },
   ];
+}
+
+/**
+ * Demo-mode period-over-period figures: the seeded campaigns in the window
+ * immediately before `range`, or null when there is nothing to compare against.
+ *
+ * Reads the seed directly rather than the screen's own campaign list, which is
+ * already narrowed to the current range — filtering that for dates *before* the
+ * range start can only ever return nothing, which silently removes every trend
+ * badge instead of making it move.
+ *
+ * Null for "All time" (no prior window exists) and for any window the seed does
+ * not reach back far enough to cover. Callers show no badge in that case rather
+ * than inventing a comparison.
+ */
+export function mockPreviousPeriod(range: DashboardRange, now = new Date()) {
+  const start = rangeStart(range, now);
+  if (!start) return null;
+  const prevStart = start.getTime() - rangeDays(range, now) * 86_400_000;
+  const prior = CAMPAIGNS.filter((c) => {
+    const at = new Date(c.date).getTime();
+    return Number.isFinite(at) && at >= prevStart && at < start.getTime();
+  });
+  return prior.length ? aggregate(prior) : null;
 }
 
 /** The seeded voice connect mix, as a shape rather than absolute counts. It is
