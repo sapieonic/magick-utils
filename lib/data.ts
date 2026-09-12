@@ -23,6 +23,7 @@ import {
   getAppTimeParts,
   startOfAppDay,
 } from "./timezone";
+import { rangeDays, type DashboardRange } from "./date-range";
 
 // ---- seeded RNG so data is stable across reloads ----
 function mulberry32(a: number) {
@@ -283,78 +284,119 @@ export function messagingFunnel() {
   ];
 }
 
+/** The window the seeded quality figures below are written for. */
+const MOCK_QUALITY_BASELINE_DAYS = 30;
+
+/** A small, stable per-range tilt applied to the "went badly" counts, so each
+ *  window has its own profile rather than the same percentages at five
+ *  different volumes. Keyed on the range so a re-render never changes it. */
+const MOCK_QUALITY_TILT: Record<DashboardRange, number> = {
+  "Last 7 days": 1.18,
+  "Last 30 days": 1,
+  "Last 90 days": 0.93,
+  "This quarter": 0.96,
+  "All time": 0.88,
+};
+
 /** Demo-mode dashboard quality panels (backend off). Mirrors the live
- *  `DashboardVolume` quality fields so the home screen still looks complete. */
-export function mockDashboardQuality() {
+ *  `DashboardVolume` quality fields so the home screen still looks complete.
+ *
+ *  Scaled to `range`, because with the backend off there are no records for the
+ *  date filter to narrow and these panels would otherwise be the only things on
+ *  the screen that never move: the stat cards, the volume chart and the campaign
+ *  table all respond to it, so five frozen widgets read as a broken filter
+ *  rather than as demo data. Counts scale with the window; per-call
+ *  characteristics (durations, thresholds) do not, because they genuinely do not
+ *  depend on how long you look. */
+export function mockDashboardQuality(range: DashboardRange = "Last 30 days", now = new Date()) {
+  const scale = rangeDays(range, now) / MOCK_QUALITY_BASELINE_DAYS;
+  const tilt = MOCK_QUALITY_TILT[range] ?? 1;
+  /** Scale a volume with the window. */
+  const n = (value: number) => Math.max(0, Math.round(value * scale));
+  /** Scale a "went badly" count, tilted so the derived rate moves too. */
+  const bad = (value: number, ceiling: number) => Math.min(ceiling, Math.max(0, Math.round(value * scale * tilt)));
+  const rate = (part: number, whole: number) => (whole > 0 ? part / whole : 0);
+
+  const connectedWithDuration = n(8420);
+  const shortCount = bad(1263, connectedWithDuration);
+  const connectedWithTalk = n(7980);
+  const hangupCount = bad(958, connectedWithTalk);
+  const ivrWithPath = n(3410);
+  const ivrHangupCount = bad(620, ivrWithPath);
+
   return {
     voiceConnectMix: [
-      { key: "completed", value: 8420 },
-      { key: "noanswer", value: 3910 },
-      { key: "busy", value: 1640 },
-      { key: "switchedoff", value: 980 },
-      { key: "voicemail", value: 410 },
-      { key: "failed", value: 240 },
+      { key: "completed", value: connectedWithDuration },
+      { key: "noanswer", value: n(3910) },
+      { key: "busy", value: n(1640) },
+      { key: "switchedoff", value: n(980) },
+      { key: "voicemail", value: n(410) },
+      { key: "failed", value: n(240) },
     ],
-    messageFunnel: messagingFunnel().map(({ stage, value }) => ({ stage, value })),
+    messageFunnel: messagingFunnel().map(({ stage, value }) => ({ stage, value: n(value) })),
     outcomes: [
-      { key: "promise_to_pay", label: "Promise To Pay", value: 1840 },
-      { key: "callback", label: "Callback", value: 1120 },
-      { key: "already_paid", label: "Already Paid", value: 760 },
-      { key: "not_interested", label: "Not Interested", value: 540 },
-      { key: "wrong_number", label: "Wrong Number", value: 310 },
-      { key: "hardship", label: "Hardship", value: 220 },
+      { key: "promise_to_pay", label: "Promise To Pay", value: n(1840) },
+      { key: "callback", label: "Callback", value: n(1120) },
+      { key: "already_paid", label: "Already Paid", value: n(760) },
+      { key: "not_interested", label: "Not Interested", value: n(540) },
+      { key: "wrong_number", label: "Wrong Number", value: n(310) },
+      { key: "hardship", label: "Hardship", value: n(220) },
     ],
     shortCalls: {
-      connectedWithDuration: 8420,
-      shortCount: 1263,
-      shortRate: 1263 / 8420,
-      connectedWithTalk: 7980,
-      hangupCount: 958,
-      hangupRate: 958 / 7980,
+      connectedWithDuration,
+      shortCount,
+      shortRate: rate(shortCount, connectedWithDuration),
+      connectedWithTalk,
+      hangupCount,
+      hangupRate: rate(hangupCount, connectedWithTalk),
+      // Per-call characteristics, not volumes: how long a call runs does not
+      // depend on how wide a window you look at it through.
       avgDuration: 78.4,
       avgTalkTime: 51.2,
       talkRatio: 51.2 / 78.4,
       thresholdSeconds: 15,
       hangupTalkSeconds: 10,
       durationHistogram: [
-        { bucket: "0–30s", calls: 1680 },
-        { bucket: "30–60s", calls: 2210 },
-        { bucket: "1–2m", calls: 2480 },
-        { bucket: "2–3m", calls: 1120 },
-        { bucket: "3–5m", calls: 640 },
-        { bucket: "5m+", calls: 290 },
+        { bucket: "0–30s", calls: n(1680) },
+        { bucket: "30–60s", calls: n(2210) },
+        { bucket: "1–2m", calls: n(2480) },
+        { bucket: "2–3m", calls: n(1120) },
+        { bucket: "3–5m", calls: n(640) },
+        { bucket: "5m+", calls: n(290) },
       ],
     },
     ivrDropoff: {
-      totalIvr: 3640,
-      withPath: 3410,
-      hangupCount: 620,
-      hangupRate: 620 / 3180,
+      totalIvr: n(3640),
+      withPath: ivrWithPath,
+      hangupCount: ivrHangupCount,
+      // Derived from the counts beside it rather than carrying its own
+      // denominator, which had drifted out of step with them.
+      hangupRate: rate(ivrHangupCount, ivrWithPath),
       depthFunnel: [
-        { stage: "Entered IVR", value: 3410 },
-        { stage: "2nd node", value: 2480 },
-        { stage: "3rd node", value: 1510 },
-        { stage: "4th node+", value: 420 },
+        { stage: "Entered IVR", value: ivrWithPath },
+        { stage: "2nd node", value: n(2480) },
+        { stage: "3rd node", value: n(1510) },
+        { stage: "4th node+", value: n(420) },
       ],
       completedNodes: [
-        { key: "agent_transfer", label: "Agent Transfer", value: 1280 },
-        { key: "hangup", label: "Hangup", value: 620 },
-        { key: "self_serve", label: "Self Serve", value: 540 },
-        { key: "callback", label: "Callback", value: 410 },
-        { key: "optout", label: "Optout", value: 330 },
+        { key: "agent_transfer", label: "Agent Transfer", value: n(1280) },
+        { key: "hangup", label: "Hangup", value: ivrHangupCount },
+        { key: "self_serve", label: "Self Serve", value: n(540) },
+        { key: "callback", label: "Callback", value: n(410) },
+        { key: "optout", label: "Optout", value: n(330) },
       ],
       topPaths: [
-        { path: "main › billing › agent", value: 820 },
-        { path: "main › optout", value: 410 },
-        { path: "main › repeat › end", value: 360 },
-        { path: "main › callback", value: 290 },
-        { path: "main › billing › self_serve", value: 210 },
+        { path: "main › billing › agent", value: n(820) },
+        { path: "main › optout", value: n(410) },
+        { path: "main › repeat › end", value: n(360) },
+        { path: "main › callback", value: n(290) },
+        { path: "main › billing › self_serve", value: n(210) },
       ],
       dtmf: [
-        { input: "1", value: 1420 },
-        { input: "2", value: 880 },
-        { input: "9", value: 310 },
-        { input: "3", value: 240 },
+        { input: "1", value: n(1420) },
+        { input: "2", value: n(880) },
+        { input: "9", value: n(310) },
+        { input: "3", value: n(240) },
       ],
     },
   };

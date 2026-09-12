@@ -31,6 +31,7 @@ import { useApp } from "@/lib/store";
 import { DASHBOARD_RANGES, isDashboardRange, type DashboardRange } from "@/lib/date-range";
 import type { Batch, BreakdownSeg, SelType } from "@/lib/types";
 import { listCampaigns } from "@/lib/api";
+import { pageSlots } from "@/lib/pagination";
 import { FilterSelect } from "@/components/screens/campaigns/FilterSelect";
 import { DownloadModal } from "@/components/screens/campaigns/DownloadModal";
 
@@ -484,7 +485,7 @@ export default function CampaignsScreen() {
 
         {/* pagination */}
         {!loading && filtered.length > 0 && (
-          <div className="flex items-center justify-between px-5 py-3 border-t border-slate-100">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-5 py-3 border-t border-slate-100">
             <div className="text-[13px] text-slate-400">
               Showing{" "}
               <span className="font-semibold text-slate-600">
@@ -501,19 +502,31 @@ export default function CampaignsScreen() {
                 onClick={() => setPage((p: number) => Math.max(1, p - 1))}
                 className={page === 1 ? "opacity-40 pointer-events-none" : ""}
               />
-              {Array.from({ length: pages }).map((_, i) => (
-                <button
-                  key={i}
-                  onClick={() => setPage(i + 1)}
-                  className={cx(
-                    "h-8 min-w-8 px-2 rounded-lg text-[13px] font-semibold transition-colors",
-                    page === i + 1 ? "text-white" : "text-slate-500 hover:bg-slate-100"
-                  )}
-                  style={page === i + 1 ? { background: "var(--accent)" } : undefined}
-                >
-                  {i + 1}
-                </button>
-              ))}
+              {pageSlots(page, pages).map((slot, i) =>
+                slot === "gap" ? (
+                  <span
+                    key={`gap-${i}`}
+                    aria-hidden
+                    className="h-8 min-w-6 px-1 inline-flex items-end justify-center text-[13px] font-semibold text-slate-300"
+                  >
+                    …
+                  </span>
+                ) : (
+                  <button
+                    key={slot}
+                    onClick={() => setPage(slot)}
+                    aria-label={`Page ${slot}`}
+                    aria-current={page === slot ? "page" : undefined}
+                    className={cx(
+                      "h-8 min-w-8 px-2 rounded-lg text-[13px] font-semibold transition-colors",
+                      page === slot ? "text-white" : "text-slate-500 hover:bg-slate-100"
+                    )}
+                    style={page === slot ? { background: "var(--accent)" } : undefined}
+                  >
+                    {slot}
+                  </button>
+                ),
+              )}
               <IconButton
                 icon="ChevronRight"
                 size="sm"

@@ -17,6 +17,24 @@ export function rangeStart(range: DashboardRange, now = new Date()): Date | null
   return addAppDays(startOfAppDay(now), -(days - 1));
 }
 
+/** The span "All time" stands in for wherever a concrete number of days is
+ *  needed. Only demo mode needs one — it has no records to aggregate, so it
+ *  synthesizes a window instead of measuring one. */
+export const ALL_TIME_DAYS = 180;
+
+/** How many days a range covers, inclusive of today.
+ *
+ *  Demo mode has nothing to filter: with the backend off there are no records
+ *  for a date range to narrow, so anything seeded has to be scaled to the range
+ *  by hand. Every such series goes through this one helper, so the volume chart
+ *  and the quality panels below it always describe the same window. */
+export function rangeDays(range: DashboardRange, now = new Date()): number {
+  const start = rangeStart(range, now);
+  if (start == null) return ALL_TIME_DAYS;
+  const elapsed = startOfAppDay(now).getTime() - start.getTime();
+  return Math.max(1, Math.round(elapsed / 86_400_000) + 1);
+}
+
 /** The Dashboard's "campaigns started in this period" predicate: bounded at both
  *  ends, so a future-dated campaign is not counted into a period that has not
  *  happened yet. */

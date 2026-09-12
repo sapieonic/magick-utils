@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { DASHBOARD_RANGES } from "@/lib/date-range";
 import {
   sparkline,
   callsOverTime,
@@ -127,6 +128,69 @@ describe("mockDashboardQuality", () => {
     expect(q.outcomes[0]?.key).toBe("promise_to_pay");
     expect(q.shortCalls?.connectedWithDuration).toBeGreaterThan(0);
     expect(q.ivrDropoff?.topPaths[0]?.path).toContain("›");
+  });
+
+  // The reported bug: with the backend off there are no records for the date
+  // filter to narrow, so these panels sat still while the stat cards, the volume
+  // chart and the campaign table all moved — which reads as a broken filter.
+  it("scales every panel with the selected range", () => {
+    const week = mockDashboardQuality("Last 7 days");
+    const month = mockDashboardQuality("Last 30 days");
+    const quarter = mockDashboardQuality("Last 90 days");
+
+    const connected = (q: typeof week) => q.shortCalls.connectedWithDuration;
+    expect(connected(week)).toBeLessThan(connected(month));
+    expect(connected(month)).toBeLessThan(connected(quarter));
+
+    // Seven days is a quarter of the 30-day baseline, give or take rounding.
+    expect(connected(week) / connected(month)).toBeCloseTo(7 / 30, 2);
+    expect(connected(quarter) / connected(month)).toBeCloseTo(3, 1);
+  });
+
+  it("moves the headline rates too, not just the volumes behind them", () => {
+    const week = mockDashboardQuality("Last 7 days");
+    const month = mockDashboardQuality("Last 30 days");
+    expect(week.shortCalls.shortRate).not.toBeCloseTo(month.shortCalls.shortRate, 4);
+    expect(week.shortCalls.hangupRate).not.toBeCloseTo(month.shortCalls.hangupRate, 4);
+  });
+
+  it("keeps each panel internally consistent at every range", () => {
+    for (const range of DASHBOARD_RANGES) {
+      const q = mockDashboardQuality(range);
+      const short = q.shortCalls;
+      expect(short.shortCount).toBeLessThanOrEqual(short.connectedWithDuration);
+      expect(short.hangupCount).toBeLessThanOrEqual(short.connectedWithTalk);
+      expect(short.shortRate).toBeCloseTo(short.shortCount / short.connectedWithDuration, 6);
+      expect(short.hangupRate).toBeCloseTo(short.hangupCount / short.connectedWithTalk, 6);
+
+      const ivr = q.ivrDropoff;
+      expect(ivr.withPath).toBeLessThanOrEqual(ivr.totalIvr);
+      expect(ivr.hangupCount).toBeLessThanOrEqual(ivr.withPath);
+      // This used to carry a denominator of its own that had drifted out of
+      // step with the counts printed beside it.
+      expect(ivr.hangupRate).toBeCloseTo(ivr.hangupCount / ivr.withPath, 6);
+      for (const r of [short.shortRate, short.hangupRate, ivr.hangupRate]) {
+        expect(r).toBeGreaterThanOrEqual(0);
+        expect(r).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  // Call length is a property of the calls, not of the window you view them
+  // through — scaling it with the range would be fabrication, not filtering.
+  it("leaves per-call characteristics alone", () => {
+    for (const range of DASHBOARD_RANGES) {
+      const { shortCalls } = mockDashboardQuality(range);
+      expect(shortCalls.avgDuration).toBe(78.4);
+      expect(shortCalls.avgTalkTime).toBe(51.2);
+      expect(shortCalls.thresholdSeconds).toBe(15);
+      expect(shortCalls.hangupTalkSeconds).toBe(10);
+    }
+  });
+
+  it("is stable across calls, so the demo never flickers", () => {
+    const now = new Date("2026-09-12T10:00:00Z");
+    expect(mockDashboardQuality("Last 7 days", now)).toEqual(mockDashboardQuality("Last 7 days", now));
   });
 });
 

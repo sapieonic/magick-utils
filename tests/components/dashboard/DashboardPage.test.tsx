@@ -18,10 +18,24 @@ vi.mock("@/lib/api", () => ({
 }));
 vi.mock("@/components/screens/dashboard/Legend", () => ({ Legend: () => null }));
 vi.mock("@/components/screens/dashboard/VolumeChart", () => ({ VolumeChart: () => null }));
-vi.mock("@/components/screens/dashboard/StatusDonut", () => ({ StatusDonut: () => null }));
+// Recorded rather than rendered: these two are what the customer reported as
+// frozen, and what matters is the data the screen hands them per range.
+const donutProps = vi.hoisted(() => [] as Array<{ data: Array<{ key: string; value: number }> }>);
+const shortCallProps = vi.hoisted(() => [] as Array<{ stats: { connectedWithDuration: number; shortRate: number } | null }>);
+vi.mock("@/components/screens/dashboard/StatusDonut", () => ({
+  StatusDonut: (props: { data: Array<{ key: string; value: number }> }) => {
+    donutProps.push(props);
+    return null;
+  },
+}));
 vi.mock("@/components/screens/dashboard/FunnelBars", () => ({ FunnelBars: () => null }));
 vi.mock("@/components/screens/dashboard/RankedBars", () => ({ RankedBars: () => null }));
-vi.mock("@/components/screens/dashboard/ShortCallCard", () => ({ ShortCallCard: () => null }));
+vi.mock("@/components/screens/dashboard/ShortCallCard", () => ({
+  ShortCallCard: (props: { stats: { connectedWithDuration: number; shortRate: number } | null }) => {
+    shortCallProps.push(props);
+    return null;
+  },
+}));
 vi.mock("@/components/screens/dashboard/IvrDropoffCard", () => ({ IvrDropoffCard: () => null }));
 
 import DashboardScreen from "@/app/(app)/dashboard/page";
@@ -114,5 +128,54 @@ describe("DashboardScreen range fallback and truncation", () => {
     render(<DashboardScreen />);
     await waitFor(() => expect(listCampaigns).toHaveBeenCalled());
     expect(screen.queryByText(/more campaigns than one listing can scan/)).not.toBeInTheDocument();
+  });
+});
+
+// Reported as: "the values in the Short calls & hang-ups and Voice connect mix
+// widgets are not updating when filters are changed with days". With the backend
+// off there are no records for the range to narrow, and the seed behind these
+// panels was a fixed constant — so they were the only things on the screen that
+// did not answer the date filter.
+describe("DashboardScreen demo-mode date filter", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    donutProps.length = 0;
+    shortCallProps.length = 0;
+    app.dateRange = "Last 30 days";
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: [campaign], source: "mock" });
+    vi.mocked(getDashboardVolume).mockResolvedValue(null);
+  });
+
+  async function renderAt(range: string) {
+    app.dateRange = range;
+    donutProps.length = 0;
+    shortCallProps.length = 0;
+    const view = render(<DashboardScreen />);
+    await waitFor(() => expect(shortCallProps.at(-1)?.stats).toBeTruthy());
+    const result = {
+      connected: shortCallProps.at(-1)!.stats!.connectedWithDuration,
+      shortRate: shortCallProps.at(-1)!.stats!.shortRate,
+      voiceMix: donutProps.at(-1)?.data.reduce((sum, s) => sum + s.value, 0) ?? 0,
+    };
+    view.unmount();
+    return result;
+  }
+
+  it("moves Short calls & hang-ups when the range changes", async () => {
+    const week = await renderAt("Last 7 days");
+    const month = await renderAt("Last 30 days");
+    const quarter = await renderAt("Last 90 days");
+
+    expect(week.connected).toBeLessThan(month.connected);
+    expect(month.connected).toBeLessThan(quarter.connected);
+    // The headline percentage moves too, not only the counts beneath it.
+    expect(week.shortRate).not.toBeCloseTo(month.shortRate, 4);
+  });
+
+  it("moves Voice connect mix when the range changes", async () => {
+    const week = await renderAt("Last 7 days");
+    const quarter = await renderAt("Last 90 days");
+    expect(week.voiceMix).toBeGreaterThan(0);
+    expect(week.voiceMix).toBeLessThan(quarter.voiceMix);
   });
 });

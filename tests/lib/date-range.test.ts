@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { LISTING_CLOCK_SKEW_MS, inDashboardRange, inListingRange } from "@/lib/date-range";
+import {
+  ALL_TIME_DAYS,
+  DASHBOARD_RANGES,
+  LISTING_CLOCK_SKEW_MS,
+  inDashboardRange,
+  inListingRange,
+  rangeDays,
+} from "@/lib/date-range";
 
 const now = new Date("2026-08-12T12:00:00Z");
 
@@ -33,5 +40,37 @@ describe("inListingRange", () => {
 
   it("rejects an unparseable timestamp", () => {
     expect(inListingRange("not-a-date", "All time", now)).toBe(false);
+  });
+});
+
+describe("rangeDays", () => {
+  const now = new Date("2026-09-12T10:00:00Z");
+
+  it("counts the days a fixed range covers, inclusive of today", () => {
+    expect(rangeDays("Last 7 days", now)).toBe(7);
+    expect(rangeDays("Last 30 days", now)).toBe(30);
+    expect(rangeDays("Last 90 days", now)).toBe(90);
+  });
+
+  it("stands in a fixed span for All time, which has no start", () => {
+    expect(rangeDays("All time", now)).toBe(ALL_TIME_DAYS);
+  });
+
+  it("measures This quarter from the quarter's start", () => {
+    const days = rangeDays("This quarter", now);
+    // 12 Sep sits in the Jul–Sep quarter: 31 + 31 + 12 days.
+    expect(days).toBe(74);
+  });
+
+  it("never returns a non-positive span", () => {
+    for (const range of DASHBOARD_RANGES) {
+      expect(rangeDays(range, now)).toBeGreaterThan(0);
+    }
+  });
+
+  // The first day of a quarter is one day, not zero — a zero would scale every
+  // demo figure to nothing.
+  it("returns one on the first day of a quarter", () => {
+    expect(rangeDays("This quarter", new Date("2026-07-01T06:00:00Z"))).toBe(1);
   });
 });

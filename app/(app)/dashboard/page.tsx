@@ -20,7 +20,7 @@ import {
 import { useApp } from "@/lib/store";
 import type { Batch, StatusKey } from "@/lib/types";
 import { getDashboardVolume, listCampaigns } from "@/lib/api";
-import { inDashboardRange, isDashboardRange, rangeStart, type DashboardRange } from "@/lib/date-range";
+import { inDashboardRange, isDashboardRange, rangeDays, type DashboardRange } from "@/lib/date-range";
 import type { DashboardVolume } from "@/lib/server/types";
 import { dashboardVolumeFromCampaigns, fillDashboardDays } from "@/lib/dashboard";
 import { APP_TIMEZONE_LABEL, formatAppDate, getAppTimeParts, parseAppYmd } from "@/lib/timezone";
@@ -106,15 +106,9 @@ export default function DashboardScreen() {
     [rangeBatches, selectedRange],
   );
   const timeData = useMemo(() => {
-    if (source === "mock") {
-      const now = new Date();
-      const start = rangeStart(selectedRange, now);
-      const mockDays = selectedRange === "Last 7 days" ? 7
-        : selectedRange === "Last 30 days" ? 30
-          : start ? Math.max(1, Math.floor((now.getTime() - start.getTime()) / 86_400_000) + 1)
-            : 180;
-      return callsOverTime(mockDays);
-    }
+    // Same window the quality panels below are scaled to — one helper, so the
+    // chart and the panels can never describe different periods.
+    if (source === "mock") return callsOverTime(rangeDays(selectedRange));
     return fillDashboardDays(campaignVolume).map((point) => ({
       ...point,
       date: formatAppDate(parseAppYmd(point.date), {
@@ -123,7 +117,10 @@ export default function DashboardScreen() {
     }));
   }, [campaignVolume, selectedRange, source]);
   const quality = useMemo(() => {
-    if (source === "mock") return mockDashboardQuality();
+    // Demo mode has no records for the range to narrow, so the seed is scaled to
+    // it instead — otherwise these are the only panels on the screen that do not
+    // answer the date filter.
+    if (source === "mock") return mockDashboardQuality(selectedRange);
     return {
       voiceConnectMix: recordQuality?.voiceConnectMix?.length
         ? recordQuality.voiceConnectMix
@@ -135,7 +132,7 @@ export default function DashboardScreen() {
       shortCalls: recordQuality?.shortCalls ?? null,
       ivrDropoff: recordQuality?.ivrDropoff ?? null,
     };
-  }, [campaignVolume, recordQuality, source]);
+  }, [campaignVolume, recordQuality, selectedRange, source]);
   const voiceMix = useMemo(
     () => (quality.voiceConnectMix ?? []).map(({ key, value }) => ({
       key,
