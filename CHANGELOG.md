@@ -1,3 +1,10 @@
+## [1.3.5](https://github.com/sapieonic/magick-utils/compare/v1.3.4...v1.3.5) (2026-09-12)
+
+
+### Bug Fixes
+
+* window the campaigns pager and make demo panels follow the date filter ([#35](https://github.com/sapieonic/magick-utils/issues/35)) ([0864dbc](https://github.com/sapieonic/magick-utils/commit/0864dbca36672287e636f588319884d33cef6280)), closes [#34](https://github.com/sapieonic/magick-utils/issues/34)
+
 ## [1.3.4](https://github.com/sapieonic/magick-utils/compare/v1.3.3...v1.3.4) (2026-09-11)
 
 
