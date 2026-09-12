@@ -26,8 +26,10 @@ const MAX_SLOTS = 2 * NEIGHBOURS + 5;
  * useful than the number itself.
  */
 export function pageSlots(page: number, pages: number): PageSlot[] {
-  const total = Math.max(1, Math.floor(pages) || 1);
-  const current = Math.min(total, Math.max(1, Math.floor(page) || 1));
+  // `|| 1` catches NaN and 0; Infinity survives both and would hang the loop
+  // below forever, so it is screened explicitly rather than implicitly.
+  const total = Number.isFinite(pages) ? Math.max(1, Math.floor(pages) || 1) : 1;
+  const current = Number.isFinite(page) ? Math.min(total, Math.max(1, Math.floor(page) || 1)) : 1;
   if (total <= MAX_SLOTS) return Array.from({ length: total }, (_, i) => i + 1);
 
   // Keep the window the same width at the ends of the range, where it would

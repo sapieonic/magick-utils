@@ -77,6 +77,12 @@ It is bounded: the worker reclaims the superseded copy after the grace window, s
 peak usage is roughly 2× that batch for the length of the window, not permanently.
 If the cluster is very tight, run step 2 first so the re-ingest has headroom.
 
+One batch always re-pulls regardless of its stamp: a batch the campaigns listing
+has flagged `stale`. That flag is evidence the source moved, so the timestamp
+check is skipped entirely — without that escape hatch the two freshness signals
+can disagree and latch a batch stale with no click able to clear it. If you see a
+batch refuse to leave `stale`, that rule is the thing to check first.
+
 ## 5. Watch the logs
 
 Two lines confirm the fix is working in production:

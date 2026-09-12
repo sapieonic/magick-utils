@@ -1,5 +1,10 @@
 # OTel → Grafana Logging Implementation Plan
 
+> **STATUS: SHIPPED.** This plan was implemented in `2e82c94` — see `lib/server/logger.ts`,
+> `lib/server/observability/otel-logs.ts` and `otel-pino-sink.ts`, with tests in
+> `tests/lib/server/otel-pino-sink.test.ts`. The unchecked boxes below are the original
+> task list, kept as a record of the approach; they are not outstanding work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a structured Pino logger to magick-utils whose log records are exported to Grafana Cloud via OpenTelemetry (OTLP/logs), and migrate existing server-side `console.*` calls to it.

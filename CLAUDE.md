@@ -77,6 +77,9 @@ older batches are deleted with every record they own.
   a date filter to narrow, so anything range-dependent must be scaled by hand through `rangeDays()`
   (`lib/date-range.ts`) — a widget sitting still while the rest of the screen moves reads as a broken
   filter, not as demo data.
+- The Topbar date range is a **Dashboard and Campaigns** control. Combine and Analytics are scoped to an
+  explicit batch selection, not a period, so they deliberately ignore it — don't "fix" that by wiring the
+  range in, and don't add a range-dependent widget to either screen.
 - Never render one control per item for an unbounded collection. The campaigns pager windows through
   `pageSlots()` (`lib/pagination.ts`); a row of several hundred page buttons overflows its card with no
   way to reach what it hides.

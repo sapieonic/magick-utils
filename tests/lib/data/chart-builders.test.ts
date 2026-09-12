@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { DASHBOARD_RANGES } from "@/lib/date-range";
+import { DASHBOARD_RANGES, inDashboardRange } from "@/lib/date-range";
 import {
+  CAMPAIGNS,
+  aggregate,
   sparkline,
   callsOverTime,
   durationHistogram,
@@ -133,25 +135,51 @@ describe("mockDashboardQuality", () => {
   // The reported bug: with the backend off there are no records for the date
   // filter to narrow, so these panels sat still while the stat cards, the volume
   // chart and the campaign table all moved — which reads as a broken filter.
-  it("scales every panel with the selected range", () => {
+  it("moves with the range when the range holds different data", () => {
     const week = mockDashboardQuality("Last 7 days");
     const month = mockDashboardQuality("Last 30 days");
-    const quarter = mockDashboardQuality("Last 90 days");
-
     const connected = (q: typeof week) => q.shortCalls.connectedWithDuration;
+    expect(connected(week)).toBeGreaterThan(0);
     expect(connected(week)).toBeLessThan(connected(month));
-    expect(connected(month)).toBeLessThan(connected(quarter));
-
-    // Seven days is a quarter of the 30-day baseline, give or take rounding.
-    expect(connected(week) / connected(month)).toBeCloseTo(7 / 30, 2);
-    expect(connected(quarter) / connected(month)).toBeCloseTo(3, 1);
+    expect(week.voiceConnectMix.reduce((a, s) => a + s.value, 0))
+      .toBeLessThan(month.voiceConnectMix.reduce((a, s) => a + s.value, 0));
   });
 
-  it("moves the headline rates too, not just the volumes behind them", () => {
-    const week = mockDashboardQuality("Last 7 days");
-    const month = mockDashboardQuality("Last 30 days");
-    expect(week.shortCalls.shortRate).not.toBeCloseTo(month.shortCalls.shortRate, 4);
-    expect(week.shortCalls.hangupRate).not.toBeCloseTo(month.shortCalls.hangupRate, 4);
+  // The regression that scaling by day count produced: the seeded campaigns stop
+  // 55 days back, so a 180-day "All time" multiplier grew the panels past their
+  // own data — the connect-mix donut claimed 93,600 calls under a "Total calls"
+  // card reading 77,165, on the DEFAULT range. A breakdown may never exceed the
+  // figure it breaks down.
+  it("never claims more than the stat cards it breaks down", () => {
+    for (const range of DASHBOARD_RANGES) {
+      const card = aggregate(CAMPAIGNS.filter((c) => inDashboardRange(c.date, range)));
+      const q = mockDashboardQuality(range);
+
+      const donut = q.voiceConnectMix.reduce((a, s) => a + s.value, 0);
+      expect(donut).toBe(card.totalCalls);
+      expect(q.messageFunnel[0].value).toBe(card.totalMessages);
+
+      for (const stage of q.messageFunnel) expect(stage.value).toBeLessThanOrEqual(card.totalMessages);
+      for (const v of [
+        q.shortCalls.connectedWithDuration,
+        q.shortCalls.connectedWithTalk,
+        q.ivrDropoff.totalIvr,
+      ]) {
+        expect(v).toBeLessThanOrEqual(card.totalCalls);
+      }
+    }
+  });
+
+  // Scaling off the same figure the cards use means the panels can only differ
+  // when the cards differ. The seeds stop at 55 days, so these three windows
+  // hold identical campaigns — and must therefore render identically, rather
+  // than swinging on a day count the data does not back.
+  it("stands still exactly when the rest of the screen does", () => {
+    const ninety = mockDashboardQuality("Last 90 days");
+    const quarter = mockDashboardQuality("This quarter");
+    const allTime = mockDashboardQuality("All time");
+    expect(quarter).toEqual(ninety);
+    expect(allTime).toEqual(ninety);
   });
 
   it("keeps each panel internally consistent at every range", () => {

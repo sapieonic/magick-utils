@@ -43,6 +43,14 @@ describe("inListingRange", () => {
   });
 });
 
+describe("inDashboardRange", () => {
+  // `inListingRange` has this guard tested; its dashboard sibling did not.
+  it("rejects a date it cannot parse rather than counting it in", () => {
+    expect(inDashboardRange("not-a-date", "Last 30 days", now)).toBe(false);
+    expect(inDashboardRange("", "All time", now)).toBe(false);
+  });
+});
+
 describe("rangeDays", () => {
   const now = new Date("2026-09-12T10:00:00Z");
 

@@ -23,7 +23,7 @@ import {
   getAppTimeParts,
   startOfAppDay,
 } from "./timezone";
-import { rangeDays, type DashboardRange } from "./date-range";
+import { inDashboardRange, type DashboardRange } from "./date-range";
 
 // ---- seeded RNG so data is stable across reloads ----
 function mulberry32(a: number) {
@@ -284,59 +284,78 @@ export function messagingFunnel() {
   ];
 }
 
-/** The window the seeded quality figures below are written for. */
-const MOCK_QUALITY_BASELINE_DAYS = 30;
+/** The seeded voice connect mix, as a shape rather than absolute counts. It is
+ *  scaled to whatever call volume the selected range actually contains, so the
+ *  donut always totals the "Total calls" card sitting beside it. */
+const VOICE_MIX_SHAPE: Array<{ key: string; value: number }> = [
+  { key: "completed", value: 8420 },
+  { key: "noanswer", value: 3910 },
+  { key: "busy", value: 1640 },
+  { key: "switchedoff", value: 980 },
+  { key: "voicemail", value: 410 },
+  { key: "failed", value: 240 },
+];
+const VOICE_MIX_TOTAL = VOICE_MIX_SHAPE.reduce((sum, s) => sum + s.value, 0);
 
-/** A small, stable per-range tilt applied to the "went badly" counts, so each
- *  window has its own profile rather than the same percentages at five
- *  different volumes. Keyed on the range so a re-render never changes it. */
-const MOCK_QUALITY_TILT: Record<DashboardRange, number> = {
-  "Last 7 days": 1.18,
-  "Last 30 days": 1,
-  "Last 90 days": 0.93,
-  "This quarter": 0.96,
-  "All time": 0.88,
-};
+/** Scale a shape so it sums to exactly `total`, so a breakdown can never claim
+ *  more than the figure it breaks down. The rounding remainder goes to the
+ *  largest bucket, which leaves the shape's ordering intact. */
+function distribute(total: number, shape: number[]): number[] {
+  const shapeTotal = shape.reduce((a, b) => a + b, 0);
+  if (shapeTotal <= 0 || total <= 0) return shape.map(() => 0);
+  const scaled = shape.map((v) => Math.floor((v * total) / shapeTotal));
+  let largest = 0;
+  for (let i = 1; i < shape.length; i += 1) if (shape[i] > shape[largest]) largest = i;
+  scaled[largest] += total - scaled.reduce((a, b) => a + b, 0);
+  return scaled;
+}
 
 /** Demo-mode dashboard quality panels (backend off). Mirrors the live
  *  `DashboardVolume` quality fields so the home screen still looks complete.
  *
- *  Scaled to `range`, because with the backend off there are no records for the
- *  date filter to narrow and these panels would otherwise be the only things on
- *  the screen that never move: the stat cards, the volume chart and the campaign
- *  table all respond to it, so five frozen widgets read as a broken filter
- *  rather than as demo data. Counts scale with the window; per-call
- *  characteristics (durations, thresholds) do not, because they genuinely do not
- *  depend on how long you look. */
+ *  Scaled to the volume the selected range actually contains, because with the
+ *  backend off there are no records for the date filter to narrow and these
+ *  panels would otherwise be the only things on the screen that never move.
+ *
+ *  The scale comes from the seeded campaigns in range — the same figure the stat
+ *  cards above are computed from — and NOT from the width of the window. Scaling
+ *  by day count instead let the panels outgrow their own data: the seeds stop 55
+ *  days back, so a 180-day "All time" multiplier produced a connect-mix donut
+ *  claiming more calls than the "Total calls" card it breaks down, on the default
+ *  range. Tying both to one number makes that impossible, and makes the panels
+ *  move exactly when the rest of the screen moves.
+ *
+ *  Per-call characteristics (durations, thresholds, and the rates derived from
+ *  the shape) do not scale: they do not depend on how long you look. */
 export function mockDashboardQuality(range: DashboardRange = "Last 30 days", now = new Date()) {
-  const scale = rangeDays(range, now) / MOCK_QUALITY_BASELINE_DAYS;
-  const tilt = MOCK_QUALITY_TILT[range] ?? 1;
-  /** Scale a volume with the window. */
-  const n = (value: number) => Math.max(0, Math.round(value * scale));
-  /** Scale a "went badly" count, tilted so the derived rate moves too. */
-  const bad = (value: number, ceiling: number) => Math.min(ceiling, Math.max(0, Math.round(value * scale * tilt)));
+  const inRange = aggregate(CAMPAIGNS.filter((c) => inDashboardRange(c.date, range, now)));
+  const callScale = VOICE_MIX_TOTAL > 0 ? inRange.totalCalls / VOICE_MIX_TOTAL : 0;
+  /** Scale a call-derived volume. */
+  const n = (value: number) => Math.max(0, Math.round(value * callScale));
   const rate = (part: number, whole: number) => (whole > 0 ? part / whole : 0);
+  const voiceMix = distribute(inRange.totalCalls, VOICE_MIX_SHAPE.map((s) => s.value));
+  const funnelShape = messagingFunnel();
+  const messageScale = funnelShape[0]?.value ? inRange.totalMessages / funnelShape[0].value : 0;
 
-  const connectedWithDuration = n(8420);
-  const shortCount = bad(1263, connectedWithDuration);
-  const connectedWithTalk = n(7980);
-  const hangupCount = bad(958, connectedWithTalk);
-  const ivrTotal = n(3640);
+  const connectedWithDuration = Math.min(inRange.totalCalls, n(8420));
+  const shortCount = Math.min(connectedWithDuration, n(1263));
+  const connectedWithTalk = Math.min(inRange.totalCalls, n(7980));
+  const hangupCount = Math.min(connectedWithTalk, n(958));
+  const ivrTotal = Math.min(inRange.totalCalls, n(3640));
   const ivrWithPath = Math.min(ivrTotal, n(3410));
   // Bounded by the total, not by the subset with a recorded path: a call can end
   // on a hangup node without one. Matches how the live figure is counted.
-  const ivrHangupCount = bad(620, ivrTotal);
+  const ivrHangupCount = Math.min(ivrTotal, n(620));
 
   return {
-    voiceConnectMix: [
-      { key: "completed", value: connectedWithDuration },
-      { key: "noanswer", value: n(3910) },
-      { key: "busy", value: n(1640) },
-      { key: "switchedoff", value: n(980) },
-      { key: "voicemail", value: n(410) },
-      { key: "failed", value: n(240) },
-    ],
-    messageFunnel: messagingFunnel().map(({ stage, value }) => ({ stage, value: n(value) })),
+    voiceConnectMix: VOICE_MIX_SHAPE.map(({ key }, i) => ({ key, value: voiceMix[i] })),
+    // "Sent" is the whole messaging volume for the range by definition, so it is
+    // pinned to the card rather than scaled into disagreement with it; the later
+    // stages keep their seeded proportions and so stay below it.
+    messageFunnel: funnelShape.map(({ stage, value }, i) => ({
+      stage,
+      value: i === 0 ? inRange.totalMessages : Math.max(0, Math.round(value * messageScale)),
+    })),
     outcomes: [
       { key: "promise_to_pay", label: "Promise To Pay", value: n(1840) },
       { key: "callback", label: "Callback", value: n(1120) },

@@ -80,5 +80,9 @@ describe("pageSlots", () => {
   it("survives a degenerate page count", () => {
     expect(pageSlots(1, 0)).toEqual([1]);
     expect(pageSlots(1, Number.NaN)).toEqual([1]);
+    // `Math.floor(Infinity) || 1` is Infinity, which would leave the window loop
+    // incrementing towards a bound it can never reach — an OOM, not a bad render.
+    expect(pageSlots(1, Number.POSITIVE_INFINITY)).toEqual([1]);
+    expect(pageSlots(Number.POSITIVE_INFINITY, 313)).toEqual([1, 2, 3, 4, "gap", 313]);
   });
 });
