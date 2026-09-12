@@ -155,8 +155,8 @@ mock/canned output when the backend/LLM is off.
    sole account auto-selects, several open a picker, and manual entry still works if none come back. →
    **Continue** (calls `/api/auth/context`, which magick-master membership-checks).
 5. `/campaigns` now lists your real bulk-dispatch jobs (read-only).
-6. The other screens (dashboard / combine / analytics) still read mock data until wired (next iterate).
-   You can exercise the rest of the pipeline directly with the session cookie, e.g.:
+6. Dashboard, Combine and Analytics are live too — all four screens read through `lib/api.ts`.
+   You can also exercise the pipeline directly with the session cookie, e.g.:
    ```bash
    # after logging in via the browser, copy the mu_session cookie, then:
    curl -s localhost:3000/api/ingest -X POST -H 'Content-Type: application/json' \

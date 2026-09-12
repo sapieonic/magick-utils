@@ -84,7 +84,7 @@ describe("CampaignsScreen date range", () => {
     expect(screen.getByText("12")).toBeInTheDocument();
 
     // A narrower range must not strand the user on a page that no longer exists.
-    await userEvent.click(screen.getByRole("button", { name: "2" }));
+    await userEvent.click(screen.getByRole("button", { name: "Page 2" }));
     expect(screen.getByText("9–12")).toBeInTheDocument();
 
     vi.mocked(listCampaigns).mockResolvedValue({ batches: many.slice(0, 3), source: "live" });
@@ -215,5 +215,58 @@ describe("CampaignsScreen date range", () => {
 
     await waitFor(() => expect(screen.queryByText("Old campaign")).not.toBeInTheDocument());
     expect(screen.getByText("AI Call batch")).toBeInTheDocument();
+  });
+});
+
+describe("CampaignsScreen pagination", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.dateRange = "All time";
+  });
+
+  /** Page buttons only — the prev/next chevrons carry their own aria-labels. */
+  function pageButtons() {
+    return screen.getAllByRole("button", { name: /^Page \d+$/ });
+  }
+
+  // Once the listing stopped stopping at the upstream's first page, an account
+  // could reach hundreds of pages. One button each ran the row past the edge of
+  // the card, and nothing scrolled, so those pages were simply unreachable.
+  it("keeps the control small when there are hundreds of pages", async () => {
+    const many = Array.from({ length: 800 }, (_, i) => batch(`c${i}`, i % 20));
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: many, source: "live" });
+
+    render(<CampaignsScreen />);
+
+    await waitFor(() => expect(pageButtons().length).toBeGreaterThan(0));
+    // 800 campaigns at 8 per page is 100 pages; the control shows a handful.
+    expect(pageButtons().length).toBeLessThanOrEqual(7);
+    expect(screen.getByText(/of 800/)).toBeInTheDocument();
+  });
+
+  it("keeps the first and last page reachable from anywhere in the range", async () => {
+    const many = Array.from({ length: 800 }, (_, i) => batch(`c${i}`, i % 20));
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: many, source: "live" });
+
+    render(<CampaignsScreen />);
+    await waitFor(() => expect(pageButtons().length).toBeGreaterThan(0));
+
+    const labels = () => pageButtons().map((b) => b.textContent);
+    expect(labels()).toContain("1");
+    expect(labels()).toContain("100");
+
+    await userEvent.click(screen.getByRole("button", { name: "Page 100" }));
+    await waitFor(() => expect(labels()).toContain("1"));
+    expect(labels()).toContain("100");
+  });
+
+  it("still lists every page when a filtered list has only a few", async () => {
+    const few = Array.from({ length: 20 }, (_, i) => batch(`c${i}`, i % 5));
+    vi.mocked(listCampaigns).mockResolvedValue({ batches: few, source: "live" });
+
+    render(<CampaignsScreen />);
+
+    await waitFor(() => expect(pageButtons().length).toBe(3));
+    expect(pageButtons().map((b) => b.textContent)).toEqual(["1", "2", "3"]);
   });
 });

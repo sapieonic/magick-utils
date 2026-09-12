@@ -17,6 +17,28 @@ export function rangeStart(range: DashboardRange, now = new Date()): Date | null
   return addAppDays(startOfAppDay(now), -(days - 1));
 }
 
+/** The span "All time" stands in for wherever a concrete number of days is
+ *  needed. Only demo mode needs one — it has no records to aggregate, so it
+ *  synthesizes a window instead of measuring one. */
+export const ALL_TIME_DAYS = 180;
+
+/** How many days a range covers, inclusive of today.
+ *
+ *  For SYNTHETIC series only — demo data generated from nothing, like the mock
+ *  volume chart, which needs a window length and has no totals to anchor to.
+ *
+ *  A breakdown that sits beside a figure it decomposes must NOT be scaled by
+ *  this: scale it from that figure instead. Day-count scaling let the demo
+ *  quality panels outgrow their own seed, drawing a connect-mix donut claiming
+ *  more calls than the "Total calls" card above it — see `mockDashboardQuality`,
+ *  which derives from the in-range campaign aggregate for exactly that reason. */
+export function rangeDays(range: DashboardRange, now = new Date()): number {
+  const start = rangeStart(range, now);
+  if (start == null) return ALL_TIME_DAYS;
+  const elapsed = startOfAppDay(now).getTime() - start.getTime();
+  return Math.max(1, Math.round(elapsed / 86_400_000) + 1);
+}
+
 /** The Dashboard's "campaigns started in this period" predicate: bounded at both
  *  ends, so a future-dated campaign is not counted into a period that has not
  *  happened yet. */

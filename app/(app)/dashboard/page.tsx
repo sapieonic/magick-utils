@@ -7,6 +7,7 @@ import {
   aggregate,
   callsOverTime,
   mockDashboardQuality,
+  mockPreviousPeriod,
   sparkline,
   typeKey,
   fmtNum,
@@ -20,7 +21,7 @@ import {
 import { useApp } from "@/lib/store";
 import type { Batch, StatusKey } from "@/lib/types";
 import { getDashboardVolume, listCampaigns } from "@/lib/api";
-import { inDashboardRange, isDashboardRange, rangeStart, type DashboardRange } from "@/lib/date-range";
+import { DASHBOARD_RANGES, inDashboardRange, isDashboardRange, rangeDays, type DashboardRange } from "@/lib/date-range";
 import type { DashboardVolume } from "@/lib/server/types";
 import { dashboardVolumeFromCampaigns, fillDashboardDays } from "@/lib/dashboard";
 import { APP_TIMEZONE_LABEL, formatAppDate, getAppTimeParts, parseAppYmd } from "@/lib/timezone";
@@ -106,15 +107,10 @@ export default function DashboardScreen() {
     [rangeBatches, selectedRange],
   );
   const timeData = useMemo(() => {
-    if (source === "mock") {
-      const now = new Date();
-      const start = rangeStart(selectedRange, now);
-      const mockDays = selectedRange === "Last 7 days" ? 7
-        : selectedRange === "Last 30 days" ? 30
-          : start ? Math.max(1, Math.floor((now.getTime() - start.getTime()) / 86_400_000) + 1)
-            : 180;
-      return callsOverTime(mockDays);
-    }
+    // A synthetic series with no total to anchor to, so it takes the window's
+    // length. The quality panels below deliberately do NOT: they scale from the
+    // in-range campaign aggregate, so they can never outgrow the stat cards.
+    if (source === "mock") return callsOverTime(rangeDays(selectedRange));
     return fillDashboardDays(campaignVolume).map((point) => ({
       ...point,
       date: formatAppDate(parseAppYmd(point.date), {
@@ -123,7 +119,10 @@ export default function DashboardScreen() {
     }));
   }, [campaignVolume, selectedRange, source]);
   const quality = useMemo(() => {
-    if (source === "mock") return mockDashboardQuality();
+    // Demo mode has no records for the range to narrow, so the seed is scaled to
+    // it instead — otherwise these are the only panels on the screen that do not
+    // answer the date filter.
+    if (source === "mock") return mockDashboardQuality(selectedRange);
     return {
       voiceConnectMix: recordQuality?.voiceConnectMix?.length
         ? recordQuality.voiceConnectMix
@@ -135,7 +134,7 @@ export default function DashboardScreen() {
       shortCalls: recordQuality?.shortCalls ?? null,
       ivrDropoff: recordQuality?.ivrDropoff ?? null,
     };
-  }, [campaignVolume, recordQuality, source]);
+  }, [campaignVolume, recordQuality, selectedRange, source]);
   const voiceMix = useMemo(
     () => (quality.voiceConnectMix ?? []).map(({ key, value }) => ({
       key,
@@ -159,17 +158,33 @@ export default function DashboardScreen() {
     return first ? `Good ${part}, ${first} 👋` : `Good ${part} 👋`;
   }, [user]);
 
+  // Demo-mode trend badges used to be five hardcoded percentages, identical at
+  // every range — the same "control does nothing" symptom the quality panels had.
+  // They are now a real period-over-period comparison against the seeded
+  // campaigns in the window immediately before this one, and simply absent when
+  // there is no prior window to compare against ("All time", or a period the
+  // seed does not reach back far enough to cover).
+  const previousAgg = useMemo(
+    () => (source === "mock" ? mockPreviousPeriod(selectedRange) : null),
+    [selectedRange, source],
+  );
+  /** Whole-percent change against the prior window, or null when incomparable. */
+  const deltaVs = (current: number, previous: number | undefined) =>
+    previous != null && previous > 0 ? Math.round(((current - previous) / previous) * 100) : null;
+  // Decorative only, but it must not be pixel-identical at every range either.
+  const sparkSeed = DASHBOARD_RANGES.indexOf(selectedRange) + 1;
+
   const recordQualityUnavailable = source === "live" && qualityError;
   const calls = source === "mock" ? agg.totalCalls : campaignVolume.totalCalls;
   const messages = source === "mock" ? agg.totalMessages : campaignVolume.totalMessages;
   const successRate = source === "mock" ? agg.successRate : campaignVolume.successRate;
   const spendInr = source === "mock" ? agg.spendInr : campaignVolume.spendInr;
   const stats = [
-    { label: "Campaigns started", value: fmtNum(agg.totalCampaigns), icon: "Layers", delta: source === "mock" ? 12 : null, sub: "batch start date in this period", spark: source === "mock" ? sparkline(11, 14, 18, 8) : undefined },
-    { label: "Total calls", value: fmtCompact(calls), icon: "PhoneCall", delta: source === "mock" ? 8 : null, sub: fmtNum(calls) + " from campaigns started in this period", spark: source === "mock" ? sparkline(22, 14, 60, 30) : undefined },
-    { label: "Total messages", value: fmtCompact(messages), icon: "MessageSquare", delta: source === "mock" ? 23 : null, sub: fmtNum(messages) + " from campaigns started in this period", spark: source === "mock" ? sparkline(33, 14, 70, 40) : undefined },
-    { label: "Success / answer rate", value: fmtPct(successRate), icon: "Target", delta: source === "mock" ? -3 : null, deltaGood: true, sub: "weighted across campaigns in this period", spark: source === "mock" ? sparkline(44, 14, 55, 14) : undefined },
-    { label: "Total spend", value: fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: source === "mock" ? 6 : null, deltaGood: false, sub: fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55, 14, 50, 22) : undefined },
+    { label: "Campaigns started", value: fmtNum(agg.totalCampaigns), icon: "Layers", delta: deltaVs(agg.totalCampaigns, previousAgg?.totalCampaigns), sub: "batch start date in this period", spark: source === "mock" ? sparkline(11 * sparkSeed, 14, 18, 8) : undefined },
+    { label: "Total calls", value: fmtCompact(calls), icon: "PhoneCall", delta: deltaVs(calls, previousAgg?.totalCalls), sub: fmtNum(calls) + " from campaigns started in this period", spark: source === "mock" ? sparkline(22 * sparkSeed, 14, 60, 30) : undefined },
+    { label: "Total messages", value: fmtCompact(messages), icon: "MessageSquare", delta: deltaVs(messages, previousAgg?.totalMessages), sub: fmtNum(messages) + " from campaigns started in this period", spark: source === "mock" ? sparkline(33 * sparkSeed, 14, 70, 40) : undefined },
+    { label: "Success / answer rate", value: fmtPct(successRate), icon: "Target", delta: deltaVs(successRate, previousAgg?.successRate), deltaGood: true, sub: "weighted across campaigns in this period", spark: source === "mock" ? sparkline(44 * sparkSeed, 14, 55, 14) : undefined },
+    { label: "Total spend", value: fmtMoney(spendInr, currency), icon: currency === "usd" ? "DollarSign" : "IndianRupee", delta: deltaVs(spendInr, previousAgg?.spendInr), deltaGood: false, sub: fmtMoneyFull(spendInr, currency), spark: source === "mock" ? sparkline(55 * sparkSeed, 14, 50, 22) : undefined },
   ];
 
   return (

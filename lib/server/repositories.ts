@@ -446,17 +446,12 @@ export async function getRecordsForRevision(
   return col.find({ tenantId, accountId, batchId, revision }).sort({ recordId: 1 }).toArray();
 }
 
-/** Raw cursor for streaming large exports without buffering in memory. */
-export async function streamRecords(
-  tenantId: string,
-  accountId: string,
-  batchIds: string[]
-): Promise<FindCursor<WithId<NormalizedRecord>>> {
-  if (batchIds.length === 0) throw new Error("Cannot stream an empty batch selection.");
-  return streamRecordsForFilter(await publishedRecordsFilter(tenantId, accountId, batchIds));
-}
-
-/** As `streamRecords`, against a revision snapshot the caller already resolved. */
+/** Raw cursor for streaming large exports without buffering in memory.
+ *
+ *  Takes an already-resolved revision snapshot rather than resolving its own:
+ *  the export counts the rows it is about to stream, and resolving twice let a
+ *  refresh publish in between, so the count described one revision while the
+ *  cursor walked another. Resolve once with `resolvePublishedRecordsFilter`. */
 export async function streamRecordsForFilter(
   filter: PublishedRecordsFilter,
 ): Promise<FindCursor<WithId<NormalizedRecord>>> {

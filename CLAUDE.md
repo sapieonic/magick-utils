@@ -73,6 +73,19 @@ older batches are deleted with every record they own.
 - ⏳ Deferred (noted in `BACKEND.md`): token refresh for long jobs, prettier batch ids, GridFS export retention.
 
 ## Conventions
+- Demo mode (backend off) has to answer the same controls as live mode. Seeded data has no records for
+  a date filter to narrow, so anything range-dependent must be scaled by hand — a widget sitting still
+  while the rest of the screen moves reads as a broken filter, not as demo data. **Scale from the figure
+  the widget sits beside, not from the width of the window**: a breakdown scaled by `rangeDays()` grew
+  past its own seed and drew a donut claiming more calls than the card above it. `rangeDays()`
+  (`lib/date-range.ts`) is for synthetic series that have no total to anchor to; anything that
+  decomposes a number scales from that number (see `mockDashboardQuality`).
+- The Topbar date range is a **Dashboard and Campaigns** control. Combine and Analytics are scoped to an
+  explicit batch selection, not a period, so they deliberately ignore it — don't "fix" that by wiring the
+  range in, and don't add a range-dependent widget to either screen.
+- Never render one control per item for an unbounded collection. The campaigns pager windows through
+  `pageSlots()` (`lib/pagination.ts`); a row of several hundred page buttons overflows its card with no
+  way to reach what it hides.
 - Client components that use hooks/state/recharts/handlers start with `"use client";`.
 - Money always goes through `fmtMoney`/`fmtMoneyFull(inr, currency)` with `currency` from `useApp()`.
 - Navigation: `useRouter()` from `next/navigation`; set `analyzeTargets`/`combineTargets` via `useApp()`

@@ -36,6 +36,9 @@ Open [http://localhost:3000](http://localhost:3000).
 | `npm run build` | Production build |
 | `npm run start` | Serve the production build |
 | `npm run lint` | ESLint |
+| `npm test` | Vitest, run once |
+| `npm run test:watch` | Vitest in watch mode |
+| `npm run test:coverage` | Vitest with coverage |
 
 ## Architecture
 
@@ -86,7 +89,9 @@ To keep MongoDB small enough for the Atlas free tier, a daily GitHub Actions cro
 ([`.github/workflows/cleanup.yml`](./.github/workflows/cleanup.yml)) calls `POST /api/cron/cleanup`, which
 enforces a retention window — `DATA_RETENTION_DAYS`, default five — for batches and their normalized
 records, jobs, cached aggregates and cached insights, and reclaims any superseded record revisions the
-ingestion worker did not (those are unreachable duplicates, so they are not on the retention clock). The endpoint is guarded by a Bearer
+ingestion worker did not — both the ones a clean publish retired and the ones a crash left with no
+retirement marker at all (those are unreachable duplicates, so they are not on the retention clock).
+The endpoint is guarded by a Bearer
 `CRON_SECRET` and no-ops (503) until both `MONGODB_URI` and `CRON_SECRET` are set. The workflow runs for the `production` and `dedicated` GitHub
 Environments. Configure the following under each environment's secrets and variables:
 
@@ -102,5 +107,6 @@ cluster has already filled up.
 
 - ✅ Full UI ported from the design handoff.
 - ✅ Backend V1 built (auth, ingestion worker, MongoDB layer, pluggable LLM, all BFF routes).
-- ⏳ Wiring the remaining screens (dashboard, combine, analytics insights + chat) through `lib/api.ts`
-  (Campaigns is wired as the reference), real Firebase login, and `.env.example` credentials.
+- ✅ All four screens wired through `lib/api.ts` (Campaigns, Dashboard, Combine, Analytics), real
+  Firebase login, and `.env.example` credentials. Unset env still falls back to the seeded demo data.
+- ⏳ Token refresh for long-running jobs, prettier batch ids, GridFS export retention (see `BACKEND.md`).

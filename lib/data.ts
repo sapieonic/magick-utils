@@ -23,6 +23,7 @@ import {
   getAppTimeParts,
   startOfAppDay,
 } from "./timezone";
+import { inDashboardRange, rangeDays, rangeStart, type DashboardRange } from "./date-range";
 
 // ---- seeded RNG so data is stable across reloads ----
 function mulberry32(a: number) {
@@ -283,78 +284,166 @@ export function messagingFunnel() {
   ];
 }
 
+/**
+ * Demo-mode period-over-period figures: the seeded campaigns in the window
+ * immediately before `range`, or null when there is nothing to compare against.
+ *
+ * Reads the seed directly rather than the screen's own campaign list, which is
+ * already narrowed to the current range — filtering that for dates *before* the
+ * range start can only ever return nothing, which silently removes every trend
+ * badge instead of making it move.
+ *
+ * Null for "All time" (no prior window exists) and for any window the seed does
+ * not reach back far enough to cover. Callers show no badge in that case rather
+ * than inventing a comparison.
+ */
+export function mockPreviousPeriod(range: DashboardRange, now = new Date()) {
+  const start = rangeStart(range, now);
+  if (!start) return null;
+  const prevStart = start.getTime() - rangeDays(range, now) * 86_400_000;
+  const prior = CAMPAIGNS.filter((c) => {
+    const at = new Date(c.date).getTime();
+    return Number.isFinite(at) && at >= prevStart && at < start.getTime();
+  });
+  return prior.length ? aggregate(prior) : null;
+}
+
+/** The seeded voice connect mix, as a shape rather than absolute counts. It is
+ *  scaled to whatever call volume the selected range actually contains, so the
+ *  donut always totals the "Total calls" card sitting beside it. */
+const VOICE_MIX_SHAPE: Array<{ key: string; value: number }> = [
+  { key: "completed", value: 8420 },
+  { key: "noanswer", value: 3910 },
+  { key: "busy", value: 1640 },
+  { key: "switchedoff", value: 980 },
+  { key: "voicemail", value: 410 },
+  { key: "failed", value: 240 },
+];
+const VOICE_MIX_TOTAL = VOICE_MIX_SHAPE.reduce((sum, s) => sum + s.value, 0);
+
+/** Scale a shape so it sums to exactly `total`, so a breakdown can never claim
+ *  more than the figure it breaks down. The rounding remainder goes to the
+ *  largest bucket, which leaves the shape's ordering intact. */
+function distribute(total: number, shape: number[]): number[] {
+  const shapeTotal = shape.reduce((a, b) => a + b, 0);
+  if (shapeTotal <= 0 || total <= 0) return shape.map(() => 0);
+  const scaled = shape.map((v) => Math.floor((v * total) / shapeTotal));
+  let largest = 0;
+  for (let i = 1; i < shape.length; i += 1) if (shape[i] > shape[largest]) largest = i;
+  scaled[largest] += total - scaled.reduce((a, b) => a + b, 0);
+  return scaled;
+}
+
 /** Demo-mode dashboard quality panels (backend off). Mirrors the live
- *  `DashboardVolume` quality fields so the home screen still looks complete. */
-export function mockDashboardQuality() {
+ *  `DashboardVolume` quality fields so the home screen still looks complete.
+ *
+ *  Scaled to the volume the selected range actually contains, because with the
+ *  backend off there are no records for the date filter to narrow and these
+ *  panels would otherwise be the only things on the screen that never move.
+ *
+ *  The scale comes from the seeded campaigns in range — the same figure the stat
+ *  cards above are computed from — and NOT from the width of the window. Scaling
+ *  by day count instead let the panels outgrow their own data: the seeds stop 55
+ *  days back, so a 180-day "All time" multiplier produced a connect-mix donut
+ *  claiming more calls than the "Total calls" card it breaks down, on the default
+ *  range. Tying both to one number makes that impossible, and makes the panels
+ *  move exactly when the rest of the screen moves.
+ *
+ *  Per-call characteristics (durations, thresholds, and the rates derived from
+ *  the shape) do not scale: they do not depend on how long you look. */
+export function mockDashboardQuality(range: DashboardRange = "Last 30 days", now = new Date()) {
+  const inRange = aggregate(CAMPAIGNS.filter((c) => inDashboardRange(c.date, range, now)));
+  const callScale = VOICE_MIX_TOTAL > 0 ? inRange.totalCalls / VOICE_MIX_TOTAL : 0;
+  /** Scale a call-derived volume. */
+  const n = (value: number) => Math.max(0, Math.round(value * callScale));
+  const rate = (part: number, whole: number) => (whole > 0 ? part / whole : 0);
+  const voiceMix = distribute(inRange.totalCalls, VOICE_MIX_SHAPE.map((s) => s.value));
+  const funnelShape = messagingFunnel();
+  const messageScale = funnelShape[0]?.value ? inRange.totalMessages / funnelShape[0].value : 0;
+
+  const connectedWithDuration = Math.min(inRange.totalCalls, n(8420));
+  const shortCount = Math.min(connectedWithDuration, n(1263));
+  const connectedWithTalk = Math.min(inRange.totalCalls, n(7980));
+  const hangupCount = Math.min(connectedWithTalk, n(958));
+  const ivrTotal = Math.min(inRange.totalCalls, n(3640));
+  const ivrWithPath = Math.min(ivrTotal, n(3410));
+  // Bounded by the total, not by the subset with a recorded path: a call can end
+  // on a hangup node without one. Matches how the live figure is counted.
+  const ivrHangupCount = Math.min(ivrTotal, n(620));
+
   return {
-    voiceConnectMix: [
-      { key: "completed", value: 8420 },
-      { key: "noanswer", value: 3910 },
-      { key: "busy", value: 1640 },
-      { key: "switchedoff", value: 980 },
-      { key: "voicemail", value: 410 },
-      { key: "failed", value: 240 },
-    ],
-    messageFunnel: messagingFunnel().map(({ stage, value }) => ({ stage, value })),
+    voiceConnectMix: VOICE_MIX_SHAPE.map(({ key }, i) => ({ key, value: voiceMix[i] })),
+    // "Sent" is the whole messaging volume for the range by definition, so it is
+    // pinned to the card rather than scaled into disagreement with it; the later
+    // stages keep their seeded proportions and so stay below it.
+    messageFunnel: funnelShape.map(({ stage, value }, i) => ({
+      stage,
+      value: i === 0 ? inRange.totalMessages : Math.max(0, Math.round(value * messageScale)),
+    })),
     outcomes: [
-      { key: "promise_to_pay", label: "Promise To Pay", value: 1840 },
-      { key: "callback", label: "Callback", value: 1120 },
-      { key: "already_paid", label: "Already Paid", value: 760 },
-      { key: "not_interested", label: "Not Interested", value: 540 },
-      { key: "wrong_number", label: "Wrong Number", value: 310 },
-      { key: "hardship", label: "Hardship", value: 220 },
+      { key: "promise_to_pay", label: "Promise To Pay", value: n(1840) },
+      { key: "callback", label: "Callback", value: n(1120) },
+      { key: "already_paid", label: "Already Paid", value: n(760) },
+      { key: "not_interested", label: "Not Interested", value: n(540) },
+      { key: "wrong_number", label: "Wrong Number", value: n(310) },
+      { key: "hardship", label: "Hardship", value: n(220) },
     ],
     shortCalls: {
-      connectedWithDuration: 8420,
-      shortCount: 1263,
-      shortRate: 1263 / 8420,
-      connectedWithTalk: 7980,
-      hangupCount: 958,
-      hangupRate: 958 / 7980,
+      connectedWithDuration,
+      shortCount,
+      shortRate: rate(shortCount, connectedWithDuration),
+      connectedWithTalk,
+      hangupCount,
+      hangupRate: rate(hangupCount, connectedWithTalk),
+      // Per-call characteristics, not volumes: how long a call runs does not
+      // depend on how wide a window you look at it through.
       avgDuration: 78.4,
       avgTalkTime: 51.2,
       talkRatio: 51.2 / 78.4,
       thresholdSeconds: 15,
       hangupTalkSeconds: 10,
       durationHistogram: [
-        { bucket: "0–30s", calls: 1680 },
-        { bucket: "30–60s", calls: 2210 },
-        { bucket: "1–2m", calls: 2480 },
-        { bucket: "2–3m", calls: 1120 },
-        { bucket: "3–5m", calls: 640 },
-        { bucket: "5m+", calls: 290 },
+        { bucket: "0–30s", calls: n(1680) },
+        { bucket: "30–60s", calls: n(2210) },
+        { bucket: "1–2m", calls: n(2480) },
+        { bucket: "2–3m", calls: n(1120) },
+        { bucket: "3–5m", calls: n(640) },
+        { bucket: "5m+", calls: n(290) },
       ],
     },
     ivrDropoff: {
-      totalIvr: 3640,
-      withPath: 3410,
-      hangupCount: 620,
-      hangupRate: 620 / 3180,
+      totalIvr: ivrTotal,
+      withPath: ivrWithPath,
+      hangupCount: ivrHangupCount,
+      // Over every IVR call, matching assembleDashboardQuality and the caption
+      // the card prints directly beneath it ("N hang-ups of {totalIvr} IVR
+      // calls"). It used to carry a denominator of its own that matched neither.
+      hangupRate: rate(ivrHangupCount, ivrTotal),
       depthFunnel: [
-        { stage: "Entered IVR", value: 3410 },
-        { stage: "2nd node", value: 2480 },
-        { stage: "3rd node", value: 1510 },
-        { stage: "4th node+", value: 420 },
+        { stage: "Entered IVR", value: ivrWithPath },
+        { stage: "2nd node", value: n(2480) },
+        { stage: "3rd node", value: n(1510) },
+        { stage: "4th node+", value: n(420) },
       ],
       completedNodes: [
-        { key: "agent_transfer", label: "Agent Transfer", value: 1280 },
-        { key: "hangup", label: "Hangup", value: 620 },
-        { key: "self_serve", label: "Self Serve", value: 540 },
-        { key: "callback", label: "Callback", value: 410 },
-        { key: "optout", label: "Optout", value: 330 },
+        { key: "agent_transfer", label: "Agent Transfer", value: n(1280) },
+        { key: "hangup", label: "Hangup", value: ivrHangupCount },
+        { key: "self_serve", label: "Self Serve", value: n(540) },
+        { key: "callback", label: "Callback", value: n(410) },
+        { key: "optout", label: "Optout", value: n(330) },
       ],
       topPaths: [
-        { path: "main › billing › agent", value: 820 },
-        { path: "main › optout", value: 410 },
-        { path: "main › repeat › end", value: 360 },
-        { path: "main › callback", value: 290 },
-        { path: "main › billing › self_serve", value: 210 },
+        { path: "main › billing › agent", value: n(820) },
+        { path: "main › optout", value: n(410) },
+        { path: "main › repeat › end", value: n(360) },
+        { path: "main › callback", value: n(290) },
+        { path: "main › billing › self_serve", value: n(210) },
       ],
       dtmf: [
-        { input: "1", value: 1420 },
-        { input: "2", value: 880 },
-        { input: "9", value: 310 },
-        { input: "3", value: 240 },
+        { input: "1", value: n(1420) },
+        { input: "2", value: n(880) },
+        { input: "9", value: n(310) },
+        { input: "3", value: n(240) },
       ],
     },
   };

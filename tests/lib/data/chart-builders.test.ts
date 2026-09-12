@@ -1,11 +1,15 @@
 import { describe, it, expect } from "vitest";
+import { DASHBOARD_RANGES, inDashboardRange } from "@/lib/date-range";
 import {
+  CAMPAIGNS,
+  aggregate,
   sparkline,
   callsOverTime,
   durationHistogram,
   sentimentData,
   messagingFunnel,
   mockDashboardQuality,
+  mockPreviousPeriod,
   costBreakdown,
   TOPICS,
 } from "@/lib/data";
@@ -127,6 +131,123 @@ describe("mockDashboardQuality", () => {
     expect(q.outcomes[0]?.key).toBe("promise_to_pay");
     expect(q.shortCalls?.connectedWithDuration).toBeGreaterThan(0);
     expect(q.ivrDropoff?.topPaths[0]?.path).toContain("›");
+  });
+
+  // The reported bug: with the backend off there are no records for the date
+  // filter to narrow, so these panels sat still while the stat cards, the volume
+  // chart and the campaign table all moved — which reads as a broken filter.
+  it("moves with the range when the range holds different data", () => {
+    const week = mockDashboardQuality("Last 7 days");
+    const month = mockDashboardQuality("Last 30 days");
+    const connected = (q: typeof week) => q.shortCalls.connectedWithDuration;
+    expect(connected(week)).toBeGreaterThan(0);
+    expect(connected(week)).toBeLessThan(connected(month));
+    expect(week.voiceConnectMix.reduce((a, s) => a + s.value, 0))
+      .toBeLessThan(month.voiceConnectMix.reduce((a, s) => a + s.value, 0));
+  });
+
+  // The regression that scaling by day count produced: the seeded campaigns stop
+  // 55 days back, so a 180-day "All time" multiplier grew the panels past their
+  // own data — the connect-mix donut claimed 93,600 calls under a "Total calls"
+  // card reading 77,165, on the DEFAULT range. A breakdown may never exceed the
+  // figure it breaks down.
+  it("never claims more than the stat cards it breaks down", () => {
+    for (const range of DASHBOARD_RANGES) {
+      const card = aggregate(CAMPAIGNS.filter((c) => inDashboardRange(c.date, range)));
+      const q = mockDashboardQuality(range);
+
+      const donut = q.voiceConnectMix.reduce((a, s) => a + s.value, 0);
+      expect(donut).toBe(card.totalCalls);
+      expect(q.messageFunnel[0].value).toBe(card.totalMessages);
+
+      for (const stage of q.messageFunnel) expect(stage.value).toBeLessThanOrEqual(card.totalMessages);
+      for (const v of [
+        q.shortCalls.connectedWithDuration,
+        q.shortCalls.connectedWithTalk,
+        q.ivrDropoff.totalIvr,
+      ]) {
+        expect(v).toBeLessThanOrEqual(card.totalCalls);
+      }
+    }
+  });
+
+  // Scaling off the same figure the cards use means the panels can only differ
+  // when the cards differ. Asserted against the cards themselves rather than
+  // against named ranges: which windows happen to hold identical seeds depends
+  // on today's date (early in a quarter, "This quarter" is far shorter than
+  // "Last 90 days"), so naming them would make this fail on a calendar.
+  it("stands still exactly when the rest of the screen does", () => {
+    const byCardTotals = new Map<string, ReturnType<typeof mockDashboardQuality>>();
+    for (const range of DASHBOARD_RANGES) {
+      const card = aggregate(CAMPAIGNS.filter((c) => inDashboardRange(c.date, range)));
+      const key = `${card.totalCalls}/${card.totalMessages}`;
+      const seen = byCardTotals.get(key);
+      const panels = mockDashboardQuality(range);
+      if (seen) expect(panels, `${range} has the same cards but different panels`).toEqual(seen);
+      else byCardTotals.set(key, panels);
+    }
+    // The seeds stop well inside the longest window, so at least two ranges do
+    // coincide — otherwise this would pass by never comparing anything.
+    expect(byCardTotals.size).toBeLessThan(DASHBOARD_RANGES.length);
+  });
+
+  it("finds a prior window to compare the trend badges against", () => {
+    // The screen's own campaign list is already narrowed to the current range,
+    // so deriving this from it returned nothing at every range and removed all
+    // five trend badges instead of making them move. It has to read the seed.
+    for (const range of ["Last 7 days", "Last 30 days"] as const) {
+      const prior = mockPreviousPeriod(range);
+      expect(prior, `${range} should have a comparable prior window`).not.toBeNull();
+      expect(prior!.totalCalls).toBeGreaterThan(0);
+    }
+  });
+
+  it("offers no comparison where there is honestly none to make", () => {
+    // "All time" has no window before it, and the seed does not reach back far
+    // enough to cover the 90 days before "Last 90 days".
+    expect(mockPreviousPeriod("All time")).toBeNull();
+    expect(mockPreviousPeriod("Last 90 days")).toBeNull();
+  });
+
+  it("keeps each panel internally consistent at every range", () => {
+    for (const range of DASHBOARD_RANGES) {
+      const q = mockDashboardQuality(range);
+      const short = q.shortCalls;
+      expect(short.shortCount).toBeLessThanOrEqual(short.connectedWithDuration);
+      expect(short.hangupCount).toBeLessThanOrEqual(short.connectedWithTalk);
+      expect(short.shortRate).toBeCloseTo(short.shortCount / short.connectedWithDuration, 6);
+      expect(short.hangupRate).toBeCloseTo(short.hangupCount / short.connectedWithTalk, 6);
+
+      const ivr = q.ivrDropoff;
+      expect(ivr.withPath).toBeLessThanOrEqual(ivr.totalIvr);
+      expect(ivr.hangupCount).toBeLessThanOrEqual(ivr.withPath);
+      // Over every IVR call, the same denominator assembleDashboardQuality uses
+      // for the live figure (hangupCount / totalIvr) and the same one the card
+      // prints in the caption under the percentage. It used to carry a third
+      // denominator that matched neither.
+      expect(ivr.hangupRate).toBeCloseTo(ivr.hangupCount / ivr.totalIvr, 6);
+      for (const r of [short.shortRate, short.hangupRate, ivr.hangupRate]) {
+        expect(r).toBeGreaterThanOrEqual(0);
+        expect(r).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  // Call length is a property of the calls, not of the window you view them
+  // through — scaling it with the range would be fabrication, not filtering.
+  it("leaves per-call characteristics alone", () => {
+    for (const range of DASHBOARD_RANGES) {
+      const { shortCalls } = mockDashboardQuality(range);
+      expect(shortCalls.avgDuration).toBe(78.4);
+      expect(shortCalls.avgTalkTime).toBe(51.2);
+      expect(shortCalls.thresholdSeconds).toBe(15);
+      expect(shortCalls.hangupTalkSeconds).toBe(10);
+    }
+  });
+
+  it("is stable across calls, so the demo never flickers", () => {
+    const now = new Date("2026-09-12T10:00:00Z");
+    expect(mockDashboardQuality("Last 7 days", now)).toEqual(mockDashboardQuality("Last 7 days", now));
   });
 });
 
