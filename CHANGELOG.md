@@ -1,3 +1,10 @@
+## [1.3.4](https://github.com/sapieonic/magick-utils/compare/v1.3.3...v1.3.4) (2026-09-11)
+
+
+### Bug Fixes
+
+* stop analytics showing seeded data and refreshes filling storage ([#34](https://github.com/sapieonic/magick-utils/issues/34)) ([8823703](https://github.com/sapieonic/magick-utils/commit/88237034a7af84c6a453ef40972596c4d85a5992))
+
 ## [1.3.3](https://github.com/sapieonic/magick-utils/compare/v1.3.2...v1.3.3) (2026-08-17)
 
 
