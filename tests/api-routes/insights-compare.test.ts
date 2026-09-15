@@ -271,4 +271,31 @@ describe("POST /api/insights/compare — call-analysis symmetry", () => {
 
     expect(promptBody()).not.toContain("billing");
   });
+
+  // Gating the persist matters more here than the prompt strip: compareKey is
+  // immovable, so a narrative generated with the shifts stripped would be served
+  // on every later request, including after the rollup recovers.
+  it("does not cache a comparison whose shifts were stripped", async () => {
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(enrichWithCallAnalysis)
+      .mockResolvedValueOnce({ aggregate: AGG, status: "ok", cacheable: true } as never)
+      .mockResolvedValueOnce({
+        aggregate: { ...AGG, analysisUnavailable: true },
+        status: "failed",
+        cacheable: false,
+      } as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    const res = await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(res.status).toBe(200); // still answered
+    expect(setInsight).not.toHaveBeenCalled();
+  });
+
+  it("caches a comparison when both sides had readable analysis", async () => {
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(setInsight).toHaveBeenCalled();
+  });
 });

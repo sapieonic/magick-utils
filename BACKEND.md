@@ -73,7 +73,24 @@ top-10s merged approximately here. Notes:
   one of them is a fact about the customer's data.
 - **Bump `AGGREGATES_VERSION` (`lib/server/fingerprint.ts`) whenever this changes.** `/api/analytics`
   serves a cache hit *before* enrichment runs, so without a bump every selection analysed before the
-  deploy keeps serving its old empty doc until someone clicks Refresh or retention prunes it.
+  deploy keeps serving its old empty doc until someone clicks Refresh or retention prunes it. The two
+  **insight** caches must react to that bump too, or their prose contradicts the chart beside it:
+  `/api/insights` stores the aggregates key as the Insight's `fingerprint` and rejects a hit that no
+  longer matches, and `compareKey` folds the version in directly (a comparison's `fingerprint` is its
+  own key, so it cannot carry the signal). Neither route persists a narrative built while the rollup
+  was unreadable.
+- **A settled refusal is an allow-list (`400`, `404`, `422`), not a 4xx range.** `408` is a 4xx about
+  *this moment* and must stay momentary. `404` qualifies only because `fetchRollup` runs first: master
+  404s the whole request when any one `job_id` is unknown and names them in `missing_job_ids`, so those
+  are dropped and the rest re-asked once — one deleted campaign no longer blanks the tab for the other
+  49 in a selection. A 404 that reaches the classifier therefore means the endpoint is absent or *no*
+  selected job still exists.
+- **A 2xx that contradicts its declared shape is momentary, not empty.** An absent or null field is a
+  legitimately empty rollup; a field present but not an array is upstream breaking contract, and the
+  mappers coerce it to `[]` — which must not be cached as a real "no analysis".
+- **Every batch must carry a `sourceId`.** The upstream ids are `sourceId`, not `batchId`. If any is
+  blank the enrichment refuses rather than silently asking about a subset and presenting it as the
+  whole selection.
 - **The call is the only timed-out one in `magick-client.ts`** (15s). It is the heaviest — master fans a
   whole selection's batches into one core request, answered with eleven parallel aggregate queries —
   and the only one whose caller holds a correct answer to fall back on.

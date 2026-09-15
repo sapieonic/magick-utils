@@ -106,11 +106,14 @@ describe("POST /api/insights", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(isLlmConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getInsight).mockResolvedValue({ narrative: "old" } as never);
+    // A real Insight doc always carries the aggregates key it was generated
+    // from; a hit is only served when that still matches (see the stale-shape
+    // cases below), so the fixture has to include it.
+    vi.mocked(getInsight).mockResolvedValue({ narrative: "old", fingerprint: "agg-key" } as never);
     const { POST } = await import("@/app/api/insights/route");
     const res = await POST(req({ batchIds: ["b1"], model: "client-model" }));
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ insight: { narrative: "old" }, cached: true });
+    await expect(res.json()).resolves.toEqual({ insight: { narrative: "old", fingerprint: "agg-key" }, cached: true });
     expect(getInsight).toHaveBeenCalledWith("t1", "a1", "set-key:dataset:backend-model");
   });
 
@@ -218,6 +221,37 @@ describe("POST /api/insights", () => {
 
     expect(res.status).toBe(200); // still answered — degraded, not broken
     expect(setInsight).not.toHaveBeenCalled();
+  });
+
+  // `insightKey` carries no AGGREGATES_VERSION, so a hit can predate a bump in
+  // how the aggregate it describes was computed. Without this the reporting
+  // customer keeps reading "no key topics" from pre-v7 prose beside a v7 chart
+  // that now shows them.
+  it("ignores a cached insight generated from a different aggregate shape", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getInsight).mockResolvedValue({ narrative: "stale", fingerprint: "agg-key-v6" } as never);
+    vi.mocked(getAggregates).mockResolvedValue(AGG as never);
+    structured.mockResolvedValue({ narrative: "fresh", anomalies: [], recommendations: [] });
+    const { POST } = await import("@/app/api/insights/route");
+    const res = await POST(req({ batchIds: ["b1"] }));
+
+    // aggregatesKey is mocked to "agg-key"; the cached doc says "agg-key-v6".
+    await expect(res.json()).resolves.toMatchObject({ cached: false, insight: { narrative: "fresh" } });
+    expect(structured).toHaveBeenCalled();
+  });
+
+  it("serves a cached insight whose fingerprint matches the current aggregate", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getInsight).mockResolvedValue({ narrative: "current", fingerprint: "agg-key" } as never);
+    const { POST } = await import("@/app/api/insights/route");
+    const res = await POST(req({ batchIds: ["b1"] }));
+
+    await expect(res.json()).resolves.toMatchObject({ cached: true, insight: { narrative: "current" } });
+    expect(structured).not.toHaveBeenCalled();
   });
 
   it("caches the insight normally when the rollup was readable", async () => {

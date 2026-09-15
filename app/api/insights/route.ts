@@ -85,9 +85,20 @@ export const POST = withLogging("insights", async (req: Request) => {
 
   if (!body.refresh) {
     const cached = await getInsight(ctx.tenantId, ctx.accountId, insightKey);
-    if (cached) {
+    // `insightKey` carries no AGGREGATES_VERSION, so a hit can predate a bump in
+    // how the aggregate it describes was computed. The stored `fingerprint` IS
+    // the aggregates key, so comparing it rejects exactly those — otherwise a
+    // customer reads "no key topics" from a pre-v7 narrative beside a chart that
+    // now shows them. Self-healing for every future bump, not just this one.
+    if (cached && cached.fingerprint === aggKey) {
       log().info({ batchCount: batchIds.length, model, cached: true }, "insight served from cache");
       return NextResponse.json({ insight: cached, cached: true });
+    }
+    if (cached) {
+      log().info(
+        { batchCount: batchIds.length, model, staleFingerprint: cached.fingerprint, aggKey },
+        "cached insight predates the current aggregate shape; regenerating",
+      );
     }
   }
 

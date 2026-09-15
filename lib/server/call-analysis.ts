@@ -63,16 +63,56 @@ export interface EnrichedAggregates {
   cacheable: boolean;
 }
 
-/** Whether asking again could produce a different answer.
+/** Statuses that are a statement about the SELECTION and will say the same
+ *  thing on every retry, so an empty result for them is a settled answer worth
+ *  caching.
  *
- *  A 4xx from master is a statement about the selection itself and will not
- *  change until the selection does. Everything else — 5xx, a timeout, a network
- *  error, an expired token (401), a rate limit (429) — is about this moment.
- *  Unknown errors are treated as momentary: re-asking costs one request, while
- *  wrongly caching a blank costs the customer the chart. */
+ *  An allow-list, not a 4xx range with holes. The range was wrong: `408 Request
+ *  Timeout` is a 4xx about *this moment*, and a proxy emitting one would have
+ *  pinned the cards blank under a key only Refresh can clear — the exact bug
+ *  this classification exists to prevent. Anything not listed here (5xx, 408,
+ *  429, 401/403, a network error, our own AbortSignal) is momentary.
+ *
+ *  404 qualifies only because `fetchRollup` runs first: a 404 naming jobs that
+ *  upstream has lost is narrowed and re-asked there, so one reaching here means
+ *  either the endpoint does not exist (a master predating it) or NO selected job
+ *  still exists. Both say the same thing on every retry. */
+const SETTLED_STATUSES: ReadonlySet<number> = new Set([400, 404, 422]);
+
 function isSettledRefusal(err: unknown): boolean {
-  return err instanceof MagickApiError && err.status >= 400 && err.status < 500
-    && err.status !== 401 && err.status !== 403 && err.status !== 429;
+  return err instanceof MagickApiError && SETTLED_STATUSES.has(err.status);
+}
+
+/** The job ids magick-master reports it could not find, or null when this is
+ *  not that kind of 404.
+ *
+ *  `POST /bulk-dispatch-jobs/analytics` answers 404 if ANY id is unknown, and
+ *  names them in `missing_job_ids`. A Fastify route-not-found 404 (a master
+ *  predating the endpoint) carries no such field, which is how the two are
+ *  told apart. */
+function missingJobIds(err: unknown): string[] | null {
+  if (!(err instanceof MagickApiError) || err.status !== 404) return null;
+  try {
+    const parsed = JSON.parse(err.body) as { missing_job_ids?: unknown };
+    const ids = parsed?.missing_job_ids;
+    if (!Array.isArray(ids)) return null;
+    const known = ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+    return known.length > 0 ? known : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether an otherwise-2xx payload contradicts its own declared shape.
+ *
+ *  An ABSENT or null field is a legitimately empty rollup. A field that is
+ *  present but not an array is upstream breaking its contract — the mappers
+ *  coerce that to `[]`, which would otherwise be cached as a real "no analysis"
+ *  under a key nothing can invalidate. Treated as momentary so it is retried. */
+function isMalformed(raw: RawBatchAnalytics | null): boolean {
+  if (raw == null) return false;
+  const badShape = (v: unknown) => v != null && !Array.isArray(v);
+  return badShape(raw.sentiment_distribution) || badShape(raw.key_topics);
 }
 
 /** Only `ai_voice_call` batches have post-call analysis: IVR and messaging runs
@@ -163,9 +203,21 @@ export async function enrichWithCallAnalysis(
   // analysis" and cache — silent and sticky, exactly the failure that is
   // hardest to notice.
   const jobIds = batches.map((b) => b.sourceId).filter(Boolean);
+  // A blank `sourceId` is a broken BatchDoc, not an empty campaign. Asking about
+  // the subset that does have one would answer a different question than the one
+  // the customer asked, and presenting it as the whole selection — cached, with
+  // no marker — is worse than admitting we could not answer.
+  if (jobIds.length !== batches.length) {
+    log().warn(
+      { key: agg.key, expected: batches.length, usable: jobIds.length },
+      "call-analysis enrichment skipped; some batches carry no sourceId",
+    );
+    return { aggregate: { ...agg, analysisUnavailable: true }, status: "failed", cacheable: false };
+  }
+
   let raw: RawBatchAnalytics | null;
   try {
-    raw = await MagickClient.fromContext(ctx).batchAnalytics(jobIds);
+    raw = await fetchRollup(ctx, jobIds, agg.key);
   } catch (err) {
     // Degraded, not broken: the caller still serves every other series. Either
     // way the two cards stay empty, so mark the doc so the UI says "could not
@@ -182,6 +234,14 @@ export async function enrichWithCallAnalysis(
     };
   }
 
+  if (isMalformed(raw)) {
+    log().warn(
+      { key: agg.key, batchCount: jobIds.length },
+      "call-analysis rollup did not match its declared shape; not caching",
+    );
+    return { aggregate: { ...agg, analysisUnavailable: true }, status: "failed", cacheable: false };
+  }
+
   const sentiment = hasSentiment ? agg.sentiment : toSentimentSeries(raw);
   const topics = hasTopics ? agg.topics : toTopicSeries(raw);
   log().info(
@@ -194,4 +254,43 @@ export async function enrichWithCallAnalysis(
     "call-analysis enrichment applied",
   );
   return { aggregate: { ...agg, sentiment, topics }, status: "ok", cacheable: true };
+}
+
+/** Fetch the rollup, surviving a selection that names a job upstream has lost.
+ *
+ *  Master 404s the WHOLE request when any one `job_id` is unknown, so without
+ *  this a single deleted campaign in a 50-batch selection blanks the Conversation
+ *  tab for the other 49 — and, being a settled answer, would stay blank. It names
+ *  the culprits in `missing_job_ids`, so drop those and ask again for the rest:
+ *  a job upstream no longer has contributes no analysis anyway, which makes the
+ *  narrowed answer the correct one rather than a partial one.
+ *
+ *  Retried at most once, and only for a 404 that actually names ids. Anything
+ *  else — including a route-not-found 404 from a master predating the endpoint —
+ *  is re-thrown for `isSettledRefusal` to classify. */
+async function fetchRollup(
+  ctx: TenantContext,
+  jobIds: string[],
+  key: string,
+): Promise<RawBatchAnalytics | null> {
+  const client = MagickClient.fromContext(ctx);
+  try {
+    return await client.batchAnalytics(jobIds);
+  } catch (err) {
+    const missing = missingJobIds(err);
+    if (!missing) throw err;
+    const remaining = jobIds.filter((id) => !missing.includes(id));
+    if (remaining.length === 0) {
+      // Every job in the selection is gone upstream. Settled, and `batchAnalytics`
+      // reads an empty list as "nothing to ask", so the empty rollup below is the
+      // honest answer rather than a swallowed error.
+      log().warn({ key, missing: missing.length }, "call-analysis: no selected job still exists upstream");
+      throw err;
+    }
+    log().warn(
+      { key, missing: missing.length, remaining: remaining.length },
+      "call-analysis: retrying rollup without jobs upstream no longer has",
+    );
+    return client.batchAnalytics(remaining);
+  }
 }

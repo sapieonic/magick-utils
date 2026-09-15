@@ -190,7 +190,10 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
       recommendations: payload.recommendations,
       createdAt: new Date().toISOString(),
     };
-    await setInsight(insight);
+    // Same rule as /api/insights: a narrative generated with the topic and
+    // sentiment shifts stripped must not be pinned under a key that cannot
+    // change back once the rollup is readable again.
+    if (analysisComparable) await setInsight(insight);
     return NextResponse.json({ insight, cached: false });
   } catch (err) {
     log().error({ err, batchCount: batchIds.length, baselineCount: baselineBatchIds.length, model }, "comparison generation failed");

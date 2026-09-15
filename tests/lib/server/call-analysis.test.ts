@@ -238,7 +238,7 @@ describe("enrichWithCallAnalysis", () => {
     });
   }
 
-  for (const status of [400, 404, 422]) {
+  for (const status of [400, 422]) {
     it(`treats ${status} as a settled answer about the selection and caches it`, async () => {
       // A 400 (dispatch type with no analysis) or 404 (job upstream no longer
       // has) says the same thing forever. Marking it uncacheable would stop the
@@ -266,6 +266,102 @@ describe("enrichWithCallAnalysis", () => {
     expect(cacheable).toBe(true);
     expect(aggregate.sentiment).toEqual([]);
     expect(aggregate.topics).toEqual([]);
+  });
+
+  // --- classification: allow-list, not a 4xx range with holes ---------------
+
+  it("treats 408 as momentary, not as a statement about the selection", async () => {
+    // A proxy timeout is a 4xx about this moment. The earlier range check made
+    // it settled, which would have pinned the cards blank under a key only
+    // Refresh can clear.
+    batchAnalytics.mockRejectedValue(new MagickApiError(408, "timeout", "http://mm.test/x"));
+    const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+    expect(out.status).toBe("failed");
+    expect(out.cacheable).toBe(false);
+  });
+
+  // --- 404: a selection naming a job upstream has lost -----------------------
+
+  it("retries without the jobs upstream reports missing, rather than blanking the selection", async () => {
+    // Master 404s the whole request if ANY job id is unknown. Without the retry
+    // one deleted campaign blanks the tab for every other batch in the selection.
+    batchAnalytics
+      .mockRejectedValueOnce(
+        new MagickApiError(404, JSON.stringify({ missing_job_ids: ["job-1"] }), "http://mm.test/x"),
+      )
+      .mockResolvedValueOnce({ key_topics: [{ topic: "billing", count: 5 }] });
+    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, docs(), agg());
+
+    expect(batchAnalytics).toHaveBeenNthCalledWith(1, ["job-1", "job-2"]);
+    expect(batchAnalytics).toHaveBeenNthCalledWith(2, ["job-2"]); // the survivor
+    expect(status).toBe("ok");
+    expect(cacheable).toBe(true);
+    expect(aggregate.topics).toEqual([{ topic: "billing", count: 5, sentiment: "neutral" }]);
+    expect(aggregate.analysisUnavailable).toBeUndefined();
+  });
+
+  it("does not retry a 404 that names no missing jobs", async () => {
+    // A Fastify route-not-found 404 (a master predating the endpoint) carries no
+    // `missing_job_ids`; it is settled, not something to narrow and re-ask.
+    batchAnalytics.mockRejectedValue(new MagickApiError(404, '{"message":"Route not found"}', "http://mm.test/x"));
+    const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+
+    expect(batchAnalytics).toHaveBeenCalledTimes(1);
+    expect(out.status).toBe("unavailable");
+    expect(out.cacheable).toBe(true);
+  });
+
+  it("gives up when every selected job is gone upstream", async () => {
+    batchAnalytics.mockRejectedValue(
+      new MagickApiError(404, JSON.stringify({ missing_job_ids: ["job-1", "job-2"] }), "http://mm.test/x"),
+    );
+    const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+
+    expect(batchAnalytics).toHaveBeenCalledTimes(1); // nothing left to narrow to
+    expect(out.status).toBe("unavailable");
+    expect(out.aggregate.analysisUnavailable).toBe(true);
+  });
+
+  // --- payload integrity -----------------------------------------------------
+
+  for (const [label, payload] of [
+    ["a non-array sentiment_distribution", { sentiment_distribution: {} }],
+    ["a non-array key_topics", { key_topics: "nope" }],
+  ] as const) {
+    it(`does not cache ${label} as a genuine empty analysis`, async () => {
+      // The mappers coerce a malformed field to [], which without this guard
+      // would be written to the cache as a real "no analysis" answer.
+      batchAnalytics.mockResolvedValue(payload);
+      const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+
+      expect(out.status).toBe("failed");
+      expect(out.cacheable).toBe(false);
+      expect(out.aggregate.analysisUnavailable).toBe(true);
+    });
+  }
+
+  it("still treats an absent field as a legitimately empty rollup", async () => {
+    // Absent/null is empty; present-but-wrong-type is upstream breaking contract.
+    batchAnalytics.mockResolvedValue({ sentiment_distribution: null });
+    const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+    expect(out.status).toBe("ok");
+    expect(out.cacheable).toBe(true);
+  });
+
+  it("refuses to answer for a selection whose batches lack a sourceId", async () => {
+    // Asking about only the batches that have one answers a different question
+    // than the customer asked, and caching that as the whole selection is worse
+    // than admitting we could not answer.
+    const broken = [
+      { batchId: "b1", sourceId: "job-1", selType: "ai" } as BatchDoc,
+      { batchId: "b2", sourceId: "", selType: "ai" } as BatchDoc,
+    ];
+    const out = await enrichWithCallAnalysis(ctx, broken, agg());
+
+    expect(batchAnalytics).not.toHaveBeenCalled();
+    expect(out.status).toBe("failed");
+    expect(out.cacheable).toBe(false);
+    expect(out.aggregate.analysisUnavailable).toBe(true);
   });
 
   it("can never exceed the job-id cap magick-master enforces", () => {
