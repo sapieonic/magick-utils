@@ -36,10 +36,10 @@ describe("POST /api/analytics", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: a selection whose batches are ready and non-empty.
-    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10, selType: "ai" }] as never);
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10, sourceId: "job-1", selType: "ai" }] as never);
     // Default: enrichment passes the aggregate through and is safe to cache.
     vi.mocked(enrichWithCallAnalysis).mockImplementation(
-      async (_ctx, _selType, aggregate) => ({ aggregate, status: "ok", cacheable: true }),
+      async (_ctx, _batches, aggregate) => ({ aggregate, status: "ok", cacheable: true }),
     );
   });
 
@@ -104,7 +104,7 @@ describe("POST /api/analytics", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getAggregates).mockResolvedValue(null as never);
-    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 0, selType: "ai" }] as never);
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 0, sourceId: "job-1", selType: "ai" }] as never);
     vi.mocked(getRecords).mockResolvedValue([] as never);
     vi.mocked(computeAggregates).mockReturnValue({ totalRecords: 0 } as never);
     const { POST } = await import("@/app/api/analytics/route");
@@ -166,8 +166,14 @@ describe("POST /api/analytics", () => {
     const res = await POST(req({ batchIds: ["b1"] }));
 
     expect(res.status).toBe(200);
-    // The selection's selType decides whether there is anything to ask for.
-    expect(enrichWithCallAnalysis).toHaveBeenCalledWith(ctx, "ai", { totalRecords: 1, sentiment: [], topics: [] });
+    // The route hands over the validated BatchDocs: their selType decides
+    // whether there is anything to ask for, and their sourceIds are what the
+    // upstream call is made with.
+    expect(enrichWithCallAnalysis).toHaveBeenCalledWith(
+      ctx,
+      [{ batchId: "b1", total: 10, sourceId: "job-1", selType: "ai" }],
+      { totalRecords: 1, sentiment: [], topics: [] },
+    );
     await expect(res.json()).resolves.toMatchObject({
       aggregates: { sentiment: [{ name: "Positive", value: 1 }] },
     });

@@ -2,19 +2,39 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const batchAnalytics = vi.fn();
 
-vi.mock("@/lib/server/magick-client", () => ({
+// `MagickApiError` stays real: the module under test branches on its `status`
+// to decide whether a failure is settled or momentary, which is the whole of
+// the caching policy. Stubbing it out would make every error look momentary.
+vi.mock("@/lib/server/magick-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/magick-client")>()),
   MagickClient: { fromContext: () => ({ batchAnalytics }) },
+}));
+vi.mock("@/lib/server/env", () => ({
+  env: { magickMasterBaseUrl: "https://mm.test" },
+  isAuthConfigured: () => true,
 }));
 vi.mock("@/lib/server/logger", () => ({
   log: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
 import { enrichWithCallAnalysis, toSentimentSeries, toTopicSeries } from "@/lib/server/call-analysis";
+import { MagickApiError } from "@/lib/server/magick-client";
 import { MAX_TOPICS } from "@/lib/server/aggregate";
 import { MAX_SELECTION_BATCHES } from "@/lib/server/selection";
-import type { AggregatesDoc } from "@/lib/server/types";
+import type { AggregatesDoc, BatchDoc } from "@/lib/server/types";
+import type { SelType } from "@/lib/types";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" } as never;
+
+/** BatchDocs for the selection in `agg()` below. `batchId` and `sourceId` are
+ *  deliberately DIFFERENT here: they happen to be equal in production today,
+ *  which would let a regression to `batchId` pass unnoticed. */
+function docs(selType: SelType = "ai"): BatchDoc[] {
+  return [
+    { batchId: "b1", sourceId: "job-1", selType } as BatchDoc,
+    { batchId: "b2", sourceId: "job-2", selType } as BatchDoc,
+  ];
+}
 
 /** A computed aggregate as the record path leaves it: everything else present,
  *  sentiment and topics empty because the calls list carries no `call_analysis`. */
@@ -127,11 +147,12 @@ describe("enrichWithCallAnalysis", () => {
       sentiment_distribution: [{ label: "positive", count: 80 }, { label: "negative", count: 40 }],
       key_topics: [{ topic: "delivery delay", count: 31 }],
     });
-    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, "ai", agg());
+    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, docs(), agg());
 
     expect(status).toBe("ok");
     expect(cacheable).toBe(true);
-    expect(batchAnalytics).toHaveBeenCalledWith(["b1", "b2"]);
+    // sourceId, not batchId — see the note in enrichWithCallAnalysis.
+    expect(batchAnalytics).toHaveBeenCalledWith(["job-1", "job-2"]);
     expect(aggregate.sentiment).toEqual([
       { name: "Positive", value: 80 },
       { name: "Negative", value: 40 },
@@ -142,7 +163,7 @@ describe("enrichWithCallAnalysis", () => {
   it("leaves the rest of the aggregate untouched", async () => {
     batchAnalytics.mockResolvedValue({ key_topics: [{ topic: "x", count: 1 }] });
     const input = agg({ successRate: 0.42, spendInr: 1234 });
-    const { aggregate } = await enrichWithCallAnalysis(ctx, "ai", input);
+    const { aggregate } = await enrichWithCallAnalysis(ctx, docs(), input);
 
     expect(aggregate.successRate).toBe(0.42);
     expect(aggregate.spendInr).toBe(1234);
@@ -154,7 +175,7 @@ describe("enrichWithCallAnalysis", () => {
     it(`asks nothing for a ${selType} selection`, async () => {
       // These have no conversation to analyse, and magick-master 400s a non-AI
       // job id on this endpoint rather than answering with an empty rollup.
-      const { status, cacheable } = await enrichWithCallAnalysis(ctx, selType, agg());
+      const { status, cacheable } = await enrichWithCallAnalysis(ctx, docs(selType), agg());
       expect(status).toBe("skipped");
       expect(cacheable).toBe(true);
       expect(batchAnalytics).not.toHaveBeenCalled();
@@ -162,7 +183,7 @@ describe("enrichWithCallAnalysis", () => {
   }
 
   it("asks nothing when the selection has no records", async () => {
-    const { status } = await enrichWithCallAnalysis(ctx, "ai", agg({ totalRecords: 0 }));
+    const { status } = await enrichWithCallAnalysis(ctx, docs(), agg({ totalRecords: 0 }));
     expect(status).toBe("skipped");
     expect(batchAnalytics).not.toHaveBeenCalled();
   });
@@ -174,7 +195,7 @@ describe("enrichWithCallAnalysis", () => {
       sentiment: [{ name: "Positive", value: 3 }],
       topics: [{ topic: "from records", count: 2, sentiment: "neutral" }],
     });
-    const { aggregate, status } = await enrichWithCallAnalysis(ctx, "ai", existing);
+    const { aggregate, status } = await enrichWithCallAnalysis(ctx, docs(), existing);
 
     expect(status).toBe("skipped");
     expect(batchAnalytics).not.toHaveBeenCalled();
@@ -187,15 +208,15 @@ describe("enrichWithCallAnalysis", () => {
       sentiment_distribution: [{ label: "neutral", count: 9 }],
       key_topics: [{ topic: "upstream", count: 4 }],
     });
-    const { aggregate } = await enrichWithCallAnalysis(ctx, "ai", agg({ sentiment: [{ name: "Positive", value: 3 }] }));
+    const { aggregate } = await enrichWithCallAnalysis(ctx, docs(), agg({ sentiment: [{ name: "Positive", value: 3 }] }));
 
     expect(aggregate.sentiment).toEqual([{ name: "Positive", value: 3 }]);
     expect(aggregate.topics).toEqual([{ topic: "upstream", count: 4, sentiment: "neutral" }]);
   });
 
   it("degrades rather than failing the request when upstream errors", async () => {
-    batchAnalytics.mockRejectedValue(new Error("upstream 502"));
-    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, "ai", agg());
+    batchAnalytics.mockRejectedValue(new Error("socket hang up"));
+    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, docs(), agg());
 
     expect(status).toBe("failed");
     expect(aggregate.totalRecords).toBe(120); // every other series still served
@@ -203,11 +224,43 @@ describe("enrichWithCallAnalysis", () => {
     // downstream failure moves neither — so caching this would pin the empty
     // cards to a key that nothing can invalidate.
     expect(cacheable).toBe(false);
+    // And the UI must not claim these records have no AI analysis.
+    expect(aggregate.analysisUnavailable).toBe(true);
+  });
+
+  // Cacheability tracks "would asking again help?", not "did the call succeed?".
+  for (const status of [500, 502, 503, 401, 403, 429]) {
+    it(`treats ${status} as momentary and refuses to cache it`, async () => {
+      batchAnalytics.mockRejectedValue(new MagickApiError(status, "nope", "http://mm.test/x"));
+      const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+      expect(out.status).toBe("failed");
+      expect(out.cacheable).toBe(false);
+    });
+  }
+
+  for (const status of [400, 404, 422]) {
+    it(`treats ${status} as a settled answer about the selection and caches it`, async () => {
+      // A 400 (dispatch type with no analysis) or 404 (job upstream no longer
+      // has) says the same thing forever. Marking it uncacheable would stop the
+      // WHOLE aggregates doc — every other series on the screen — from ever
+      // being cached for this selection, forcing a full recompute per request.
+      batchAnalytics.mockRejectedValue(new MagickApiError(status, "nope", "http://mm.test/x"));
+      const out = await enrichWithCallAnalysis(ctx, docs(), agg());
+      expect(out.status).toBe("unavailable");
+      expect(out.cacheable).toBe(true);
+      expect(out.aggregate.analysisUnavailable).toBe(true);
+    });
+  }
+
+  it("leaves analysisUnavailable unset when upstream answers, even emptily", async () => {
+    batchAnalytics.mockResolvedValue({ sentiment_distribution: [], key_topics: [] });
+    const { aggregate } = await enrichWithCallAnalysis(ctx, docs(), agg());
+    expect(aggregate.analysisUnavailable).toBeUndefined();
   });
 
   it("caches an empty upstream answer — that is a real answer, not a failure", async () => {
     batchAnalytics.mockResolvedValue({ sentiment_distribution: [], key_topics: [] });
-    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, "ai", agg());
+    const { aggregate, status, cacheable } = await enrichWithCallAnalysis(ctx, docs(), agg());
 
     expect(status).toBe("ok");
     expect(cacheable).toBe(true);

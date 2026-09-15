@@ -29,30 +29,50 @@
 // that is EMPTY, so once records carry their own analysis the record-derived
 // values win and this quietly becomes a no-op.
 
-import { MagickClient, type RawBatchAnalytics } from "./magick-client";
+import { MagickApiError, MagickClient, type RawBatchAnalytics } from "./magick-client";
 import { MAX_TOPICS, SENTIMENT_ORDER, sentimentDisplayName } from "./aggregate";
 import { log } from "./logger";
-import type { AggregatesDoc, TenantContext } from "./types";
+import type { AggregatesDoc, BatchDoc, TenantContext } from "./types";
 import type { SelType } from "@/lib/types";
 
 /** Outcome of an enrichment attempt.
- *  - `skipped`  — nothing to ask for (not an AI-call selection, or no records).
- *  - `ok`       — upstream answered; an empty answer is a real answer.
- *  - `failed`   — upstream could not be reached or refused. */
-export type EnrichmentStatus = "skipped" | "ok" | "failed";
+ *  - `skipped`      — nothing to ask for (not an AI-call selection, or no records).
+ *  - `ok`           — upstream answered; an empty answer is a real answer.
+ *  - `unavailable`  — upstream gave a settled "no" about this selection.
+ *  - `failed`       — upstream could not answer right now. */
+export type EnrichmentStatus = "skipped" | "ok" | "unavailable" | "failed";
 
 export interface EnrichedAggregates {
   aggregate: AggregatesDoc;
   status: EnrichmentStatus;
   /** Whether this result may be written to the aggregates cache.
    *
-   *  False only for `failed`. The cache key is a fingerprint of the batch set
-   *  and its dataset, and neither moves when a *downstream* call fails — so
-   *  caching a doc whose enrichment blew up would pin the empty cards in place
-   *  for a key that can never be invalidated, and only an explicit Refresh
-   *  would ever clear it. Recomputing on the next request is cheap; serving a
-   *  customer a permanently blank chart because of one transient 502 is not. */
+   *  The question this answers is "would asking again produce anything
+   *  different?", NOT "did the call succeed?". Those come apart in both
+   *  directions, and getting either backwards is expensive:
+   *
+   *  - A momentary failure must NOT be cached. The key is a fingerprint of the
+   *    batch set and its dataset, and neither moves because a downstream call
+   *    failed, so a cached blank would outlive the outage that caused it and
+   *    only an explicit Refresh could clear it.
+   *  - A settled refusal MUST be cached. A 400 (a dispatch type with no
+   *    analysis) or a 404 (a job upstream no longer has) says the same thing on
+   *    every retry. Treating it as a failure would mean the whole aggregates
+   *    doc — every other series on the screen — is never cached for that
+   *    selection again, and is recomputed from Mongo on every single request. */
   cacheable: boolean;
+}
+
+/** Whether asking again could produce a different answer.
+ *
+ *  A 4xx from master is a statement about the selection itself and will not
+ *  change until the selection does. Everything else — 5xx, a timeout, a network
+ *  error, an expired token (401), a rate limit (429) — is about this moment.
+ *  Unknown errors are treated as momentary: re-asking costs one request, while
+ *  wrongly caching a blank costs the customer the chart. */
+function isSettledRefusal(err: unknown): boolean {
+  return err instanceof MagickApiError && err.status >= 400 && err.status < 500
+    && err.status !== 401 && err.status !== 403 && err.status !== 429;
 }
 
 /** Only `ai_voice_call` batches have post-call analysis: IVR and messaging runs
@@ -72,7 +92,11 @@ function isAnalysable(selType: SelType | undefined): boolean {
  *  beside it. */
 export function toSentimentSeries(raw: RawBatchAnalytics | null): AggregatesDoc["sentiment"] {
   const counts = new Map<string, number>();
-  for (const row of raw?.sentiment_distribution ?? []) {
+  // `RawBatchAnalytics` is a declared shape, not a runtime guarantee. A truthy
+  // non-array here would throw out of a function whose whole contract is to
+  // degrade quietly — and take every other series on the tab down with it.
+  const rows = Array.isArray(raw?.sentiment_distribution) ? raw.sentiment_distribution : [];
+  for (const row of rows) {
     const label = (row?.label ?? "").trim().toLowerCase();
     const count = typeof row?.count === "number" && Number.isFinite(row.count) ? row.count : 0;
     if (!label || count <= 0) continue;
@@ -95,7 +119,7 @@ export function toSentimentSeries(raw: RawBatchAnalytics | null): AggregatesDoc[
  *  record-derived path sets it. Upstream already orders by count desc; we sort
  *  anyway so the cap takes the real top N regardless of what upstream sends. */
 export function toTopicSeries(raw: RawBatchAnalytics | null): AggregatesDoc["topics"] {
-  return (raw?.key_topics ?? [])
+  return (Array.isArray(raw?.key_topics) ? raw.key_topics : [])
     .map((row) => ({
       topic: (row?.topic ?? "").trim(),
       count: typeof row?.count === "number" && Number.isFinite(row.count) ? row.count : 0,
@@ -119,32 +143,50 @@ export function toTopicSeries(raw: RawBatchAnalytics | null): AggregatesDoc["top
  */
 export async function enrichWithCallAnalysis(
   ctx: TenantContext,
-  selType: SelType | undefined,
+  /** The BatchDocs for `agg.batchIds`, in any order. Taken whole rather than as
+   *  a selType because the upstream ids come from here too — see `sourceId`. */
+  batches: BatchDoc[],
   agg: AggregatesDoc,
 ): Promise<EnrichedAggregates> {
+  const selType: SelType | undefined = batches[0]?.selType;
   const hasSentiment = (agg.sentiment?.length ?? 0) > 0;
   const hasTopics = (agg.topics?.length ?? 0) > 0;
   if (!isAnalysable(selType) || agg.totalRecords === 0 || (hasSentiment && hasTopics)) {
     return { aggregate: agg, status: "skipped", cacheable: true };
   }
 
+  // `sourceId`, NOT `batchId`. They are the same string today (map.ts keys a
+  // BatchDoc by its upstream id), but `batchId` is documented as the human id
+  // this app still intends to prettify, and `sourceId` is the upstream job id
+  // every other call here already sends. If those ever diverge, master answers
+  // an unknown id with a 404 that this module would read as a settled "no
+  // analysis" and cache — silent and sticky, exactly the failure that is
+  // hardest to notice.
+  const jobIds = batches.map((b) => b.sourceId).filter(Boolean);
   let raw: RawBatchAnalytics | null;
   try {
-    raw = await MagickClient.fromContext(ctx).batchAnalytics(agg.batchIds);
+    raw = await MagickClient.fromContext(ctx).batchAnalytics(jobIds);
   } catch (err) {
-    // Degraded, not broken: the caller still serves every other series.
+    // Degraded, not broken: the caller still serves every other series. Either
+    // way the two cards stay empty, so mark the doc so the UI says "could not
+    // load" rather than asserting these records carry no AI analysis.
+    const settled = isSettledRefusal(err);
     log().warn(
-      { err, batchCount: agg.batchIds.length, key: agg.key },
-      "call-analysis enrichment failed; serving aggregates without sentiment/topics",
+      { err, batchCount: jobIds.length, key: agg.key, settled },
+      "call-analysis enrichment could not be applied; serving aggregates without sentiment/topics",
     );
-    return { aggregate: agg, status: "failed", cacheable: false };
+    return {
+      aggregate: { ...agg, analysisUnavailable: true },
+      status: settled ? "unavailable" : "failed",
+      cacheable: settled,
+    };
   }
 
   const sentiment = hasSentiment ? agg.sentiment : toSentimentSeries(raw);
   const topics = hasTopics ? agg.topics : toTopicSeries(raw);
   log().info(
     {
-      batchCount: agg.batchIds.length,
+      batchCount: jobIds.length,
       key: agg.key,
       sentimentLabels: sentiment?.length ?? 0,
       topicCount: topics?.length ?? 0,

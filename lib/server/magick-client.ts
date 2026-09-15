@@ -288,6 +288,11 @@ export interface StatsParams {
 
 const PAGE_SIZE = 100;
 
+/** Ceiling on the best-effort call-analytics rollup (see `batchAnalytics`).
+ *  Generous enough for a 50-batch selection on a warm upstream, short enough
+ *  that a stuck one does not hold the analytics response open. */
+const BATCH_ANALYTICS_TIMEOUT_MS = 15_000;
+
 /** Every `iterate*` generator below stops on ONE condition: a short page. That
  *  is the only signal the upstream gives that is always true when exhausted and
  *  never true before.
@@ -385,13 +390,25 @@ async function getJson<T>(url: string, headers: Record<string, string>): Promise
 }
 
 /** As `getJson`, for the tenant-scoped endpoints that take their arguments in a
- *  JSON body rather than the query string. */
-async function postJson<T>(url: string, headers: Record<string, string>, body: unknown): Promise<T> {
+ *  JSON body rather than the query string.
+ *
+ *  `timeoutMs` is opt-in and deliberately not the default for this file. Most
+ *  calls here are load-bearing — ingestion cannot substitute a result for a page
+ *  of calls it failed to fetch — so aborting them would turn a slow upstream into
+ *  a wrong dataset. It is right only for a caller that has a correct answer to
+ *  fall back on. */
+async function postJson<T>(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  timeoutMs?: number,
+): Promise<T> {
   const res = await loggedFetch(url, {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json", "x-mgkvc-originator": "magick-analytics" },
     body: JSON.stringify(body),
     cache: "no-store",
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   });
   if (!res.ok) {
     const responseBody = await res.text().catch(() => "");
@@ -573,20 +590,22 @@ export class MagickClient {
    *  `call-analysis.test.ts` pins the two together so raising ours alone turns
    *  into a failing test rather than a 400 in front of the customer.
    *
-   *  Every caller treats this as best-effort enrichment, so a 404 reads as
-   *  "nothing to add" rather than an error. Both of its causes are stable rather
-   *  than transient — a master that predates the route, or a selection naming a
-   *  job upstream no longer has — so an empty result for them is a real answer
-   *  and safe to cache. Other non-2xx responses still throw. */
+   *  Unlike `statusSummary`, this does NOT swallow a 404. Callers need the status
+   *  to tell a settled answer about the selection (400 wrong job type, 404 job
+   *  upstream no longer has — both permanent, both safe to cache) from a
+   *  momentary one (5xx, 401, timeout) that must not be. Collapsing either into
+   *  `null` here would erase the distinction; `enrichWithCallAnalysis` owns that
+   *  policy in one place.
+   *
+   *  Timed out rather than left to hang. This is the heaviest call in this file
+   *  — master fans a whole selection's batches into one core request, and core
+   *  answers it with eleven parallel aggregate queries — and it is the only one
+   *  whose caller holds a correct answer to fall back on, so a bounded wait
+   *  degrades to that instead of stalling the analytics request behind it. */
   async batchAnalytics(jobIds: string[]): Promise<RawBatchAnalytics | null> {
     if (jobIds.length === 0) return null;
     const url = buildUrl("/bulk-dispatch-jobs/analytics");
-    try {
-      return await postJson<RawBatchAnalytics>(url, this.headers(), { job_ids: jobIds });
-    } catch (err) {
-      if (err instanceof MagickApiError && err.status === 404) return null;
-      throw err;
-    }
+    return postJson<RawBatchAnalytics>(url, this.headers(), { job_ids: jobIds }, BATCH_ANALYTICS_TIMEOUT_MS);
   }
 
   // ---- Status summary (tolerate 404 → null) ----

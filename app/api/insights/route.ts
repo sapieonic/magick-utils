@@ -102,7 +102,7 @@ export const POST = withLogging("insights", async (req: Request) => {
     // Enrich on the same terms as /api/analytics: the insight prose reads
     // `agg.topics`/`agg.sentiment`, so an un-enriched doc here would have the AI
     // tell the customer there are no key topics on the very screen charting them.
-    const enriched = await enrichWithCallAnalysis(ctx, batches[0]?.selType, computeAggregates(records, batchIds, ctx, aggKey));
+    const enriched = await enrichWithCallAnalysis(ctx, batches, computeAggregates(records, batchIds, ctx, aggKey));
     agg = enriched.aggregate;
     if (enriched.cacheable) await setAggregates(agg);
   }
@@ -160,7 +160,11 @@ export const POST = withLogging("insights", async (req: Request) => {
       recommendations: payload.recommendations,
       createdAt: new Date().toISOString(),
     };
-    await setInsight(insight);
+    // Not cached when the two analysis series could not be read: the insight key
+    // is as immovable as the aggregate key, so one transient upstream failure
+    // would pin "this selection has no key topics" in Mongo and serve it on
+    // every later request — beside a chart that, by then, shows them.
+    if (!agg.analysisUnavailable) await setInsight(insight);
     return NextResponse.json({ insight, cached: false });
   } catch (err) {
     log().error({ err, batchCount: batchIds.length, model }, "insight generation failed");

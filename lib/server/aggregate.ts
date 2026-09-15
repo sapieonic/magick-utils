@@ -238,7 +238,14 @@ export function computeAggregates(
   for (const r of records) {
     if (r.sentiment) sentCounts.set(r.sentiment.toLowerCase(), (sentCounts.get(r.sentiment.toLowerCase()) ?? 0) + 1);
   }
-  const sentiment = SENTIMENT_ORDER
+  // Canonical three first, in the donut's colour order, then anything else the
+  // model emitted. Core treats `mixed` as a first-class label, and this path
+  // used to drop it — which silently understated the donut's centre total, the
+  // exact failure the rollup path is careful to avoid. Both paths now agree.
+  const extraSentiments = [...sentCounts.keys()]
+    .filter((name) => !SENTIMENT_ORDER.includes(name as (typeof SENTIMENT_ORDER)[number]))
+    .sort((a, b) => sentCounts.get(b)! - sentCounts.get(a)! || a.localeCompare(b));
+  const sentiment = [...SENTIMENT_ORDER, ...extraSentiments]
     .map((name) => ({ name: sentimentDisplayName(name), value: sentCounts.get(name) ?? 0 }))
     .filter((s) => s.value > 0);
 

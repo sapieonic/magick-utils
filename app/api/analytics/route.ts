@@ -69,7 +69,7 @@ export const POST = withLogging("analytics", async (req: Request) => {
   // enrichment would pin the two empty cards until someone hit Refresh.
   const { aggregate: agg, cacheable } = await enrichWithCallAnalysis(
     ctx,
-    batches[0]?.selType,
+    batches,
     computeAggregates(records, batchIds, ctx, key),
   );
   if (cacheable) await setAggregates(agg);

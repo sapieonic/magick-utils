@@ -101,7 +101,7 @@ export const POST = withLogging("chat", async (req: Request) => {
     // topics" about a selection whose Key topics card is populated. This path
     // has never persisted what it computes; that is left as it was.
     if (records.length > 0) {
-      agg = (await enrichWithCallAnalysis(ctx, batches[0]?.selType, computeAggregates(records, batchIds, ctx, key))).aggregate;
+      agg = (await enrichWithCallAnalysis(ctx, batches, computeAggregates(records, batchIds, ctx, key))).aggregate;
     }
   }
   if (!agg) {

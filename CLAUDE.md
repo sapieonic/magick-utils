@@ -59,8 +59,10 @@ older batches are deleted with every record they own.
 The Conversation tab's **Sentiment and Key topics cannot be computed from the records** — core's calls
 list omits the `call_analysis` JSONB from its projection and sends the key as `null`, so every record
 normalizes to "no analysis". They come from core's own rollup via `lib/server/call-analysis.ts`
-(AI selections only, best-effort, never cached on failure). Don't "fix" an empty `sentiment`/`topics`
-series by reaching for the records; see BACKEND.md → *Sentiment and key topics*.
+(AI selections only, best-effort). Don't "fix" an empty `sentiment`/`topics` series by reaching for
+the records. **Bump `AGGREGATES_VERSION` whenever how these are computed changes** — `/api/analytics`
+serves a cache hit before enrichment runs, so otherwise every pre-deploy selection keeps its old empty
+doc. See BACKEND.md → *Sentiment and key topics*.
 
 ## Status
 - ✅ Full UI ported from the design handoff. `npm run dev`, `npm run build`, `npx tsc --noEmit` pass.

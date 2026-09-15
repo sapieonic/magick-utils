@@ -22,8 +22,11 @@ vi.mock("@/lib/server/fingerprint", () => ({
 vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
 vi.mock("@/lib/server/selection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/server/selection")>()),
-  validateSelection: vi.fn().mockResolvedValue([]),
+  // A real selection, not `[]` — an empty one makes the call-analysis
+  // enrichment skip, which would silently hollow out every case below.
+  validateSelection: vi.fn().mockResolvedValue([{ batchId: "b1", sourceId: "job-1", selType: "ai" }]),
 }));
+vi.mock("@/lib/server/call-analysis", () => ({ enrichWithCallAnalysis: vi.fn() }));
 
 const structured = vi.fn();
 vi.mock("@/lib/server/llm", () => ({
@@ -35,6 +38,8 @@ import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getInsight, getRecords, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
+import { validateSelection } from "@/lib/server/selection";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 const AGG = {
@@ -50,7 +55,13 @@ function req(body?: unknown, badJson = false) {
 }
 
 describe("POST /api/insights", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", sourceId: "job-1", selType: "ai" }] as never);
+    vi.mocked(enrichWithCallAnalysis).mockImplementation(
+      async (_ctx, _batches, aggregate) => ({ aggregate, status: "ok", cacheable: true }),
+    );
+  });
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
@@ -177,6 +188,49 @@ describe("POST /api/insights", () => {
     const res = await POST(req({ batchIds: ["b1"] }));
     expect(res.status).toBe(200);
     expect(computeAggregates).toHaveBeenCalled();
+    // The prose reads agg.topics/agg.sentiment, so this path must enrich too —
+    // otherwise the AI says "no key topics" beside a chart showing them.
+    expect(enrichWithCallAnalysis).toHaveBeenCalledWith(
+      ctx,
+      [{ batchId: "b1", sourceId: "job-1", selType: "ai" }],
+      AGG,
+    );
+  });
+
+  // The insight key is as immovable as the aggregate key, so pinning prose
+  // generated from an unreadable rollup would serve "no key topics" forever.
+  it("does not cache an insight generated while the analysis rollup was unreadable", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getInsight).mockResolvedValue(null as never);
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(getRecords).mockResolvedValue([{ recordId: "r1" }] as never);
+    vi.mocked(computeAggregates).mockReturnValue(AGG as never);
+    vi.mocked(enrichWithCallAnalysis).mockResolvedValue({
+      aggregate: { ...AGG, analysisUnavailable: true },
+      status: "failed",
+      cacheable: false,
+    } as never);
+    structured.mockResolvedValue({ narrative: "ok", anomalies: [], recommendations: [] });
+    const { POST } = await import("@/app/api/insights/route");
+    const res = await POST(req({ batchIds: ["b1"] }));
+
+    expect(res.status).toBe(200); // still answered — degraded, not broken
+    expect(setInsight).not.toHaveBeenCalled();
+  });
+
+  it("caches the insight normally when the rollup was readable", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getInsight).mockResolvedValue(null as never);
+    vi.mocked(getAggregates).mockResolvedValue(AGG as never);
+    structured.mockResolvedValue({ narrative: "ok", anomalies: [], recommendations: [] });
+    const { POST } = await import("@/app/api/insights/route");
+    await POST(req({ batchIds: ["b1"] }));
+
+    expect(setInsight).toHaveBeenCalled();
   });
 
   it("502 llm_failed when the model throws", async () => {

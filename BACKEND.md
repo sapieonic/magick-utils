@@ -60,13 +60,30 @@ top-10s merged approximately here. Notes:
   the calls list — which it already does for the WebRTC dialer list (`analysis_sentiment_label` in
   `WEBRTC_LIST_COLUMNS`), just not for AI calls. The enrichment only ever fills an **empty** series, so
   when that lands the per-record numbers win and this becomes a no-op.
-- **Best-effort, but never cached when it fails.** The aggregates cache key is a fingerprint of the
-  batch set and its dataset, and neither moves because a downstream call failed — so persisting a
-  failed enrichment would pin the empty cards to a key nothing can invalidate. `cacheable: false`
-  means serve it and recompute next time.
+- **Best-effort. Cacheability tracks "would asking again help?", not "did the call succeed?".**
+  Those come apart both ways. A momentary failure (5xx, timeout, 401, 429) is `cacheable: false`:
+  the cache key is a fingerprint of the batch set and its dataset, neither of which moves because a
+  downstream call failed, so a cached blank would outlive the outage and only Refresh could clear it.
+  A *settled* refusal (400 for a dispatch type with no analysis, 404 for a job upstream no longer
+  has) is `cacheable: true`: it says the same thing on every retry, and marking it uncacheable would
+  stop the whole aggregates doc — every other series on the screen — from ever being cached for that
+  selection, forcing a full recompute from Mongo on every request.
+- **Either way the doc is marked `analysisUnavailable: true`**, so the Conversation tab says "couldn't
+  load" instead of asserting the records carry no AI analysis. The two look identical on screen; only
+  one of them is a fact about the customer's data.
+- **Bump `AGGREGATES_VERSION` (`lib/server/fingerprint.ts`) whenever this changes.** `/api/analytics`
+  serves a cache hit *before* enrichment runs, so without a bump every selection analysed before the
+  deploy keeps serving its old empty doc until someone clicks Refresh or retention prunes it.
+- **The call is the only timed-out one in `magick-client.ts`** (15s). It is the heaviest — master fans a
+  whole selection's batches into one core request, answered with eleven parallel aggregate queries —
+  and the only one whose caller holds a correct answer to fall back on.
 - Applied at all four aggregate-computing routes (`analytics`, `insights`, `insights/compare`, `chat`)
   so the AI prose can never contradict the chart beside it.
 - Upstream caps the request at 50 job ids, which is exactly `MAX_SELECTION_BATCHES`.
+- **Known gap:** `normalizeCall` reads only the modern `call_analysis.common.*` shape, while core's
+  rollup SQL also COALESCEs a legacy top-level shape. Moot while the list carries no blob, but it
+  means the "record values win once core projects them" plan above would be correct by accident on
+  legacy-shaped rows. Fix `normalize.ts` alongside that core change, not before.
 
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as

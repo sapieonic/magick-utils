@@ -184,13 +184,22 @@ describe("MagickClient.batchAnalytics", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("reads a 404 as 'this master has no such route' rather than an error", async () => {
+  // Unlike `statusSummary`, a 404 is NOT swallowed here: the caller needs the
+  // status to tell a settled refusal about the selection from a momentary
+  // outage, and deciding that is its job, not this method's.
+  it("surfaces a 404 as an error carrying the status", async () => {
     stubAnalytics({ ok: false, status: 404 });
-    await expect(new MagickClient(ctx).batchAnalytics(["j1"])).resolves.toBeNull();
+    await expect(new MagickClient(ctx).batchAnalytics(["j1"])).rejects.toMatchObject({ status: 404 });
   });
 
-  it("still throws on any other non-2xx", async () => {
+  it("throws on any other non-2xx", async () => {
     stubAnalytics({ ok: false, status: 502 });
     await expect(new MagickClient(ctx).batchAnalytics(["j1"])).rejects.toThrow(/502/);
+  });
+
+  it("bounds the request with an abort signal so a stuck upstream cannot stall analytics", async () => {
+    const calls = stubAnalytics({ ok: true, status: 200, body: {} });
+    await new MagickClient(ctx).batchAnalytics(["j1"]);
+    expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
   });
 });

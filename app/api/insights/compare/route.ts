@@ -13,7 +13,6 @@ import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
 import { parseBatchIds, selectionErrorResponse, validateSelection } from "@/lib/server/selection";
-import type { SelType } from "@/lib/types";
 import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
 
 export const runtime = "nodejs";
@@ -28,7 +27,7 @@ export const dynamic = "force-dynamic";
 async function ensureAggregates(
   ctx: TenantContext,
   batchIds: string[],
-  selType: SelType | undefined,
+  batches: BatchDoc[],
 ): Promise<{ aggregate: AggregatesDoc; dataset: string } | null> {
   const dataset = await datasetFingerprint(ctx, batchIds);
   const key = aggregatesKey(batchIds, dataset);
@@ -36,7 +35,13 @@ async function ensureAggregates(
   if (cached) return { aggregate: cached, dataset };
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
   if (records.length === 0) return null;
-  const { aggregate, cacheable } = await enrichWithCallAnalysis(ctx, selType, computeAggregates(records, batchIds, ctx, key));
+  const wanted = new Set(batchIds);
+  const { aggregate, cacheable } = await enrichWithCallAnalysis(
+    ctx,
+    // Only this side's batches — `batches` is the validated union of both.
+    batches.filter((b) => wanted.has(b.batchId)),
+    computeAggregates(records, batchIds, ctx, key),
+  );
   if (cacheable) await setAggregates(aggregate);
   return { aggregate, dataset };
 }
@@ -103,10 +108,9 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   }
   const model = env.llm.model;
 
-  const selType = batches[0]?.selType;
   const [current, baseline] = await Promise.all([
-    ensureAggregates(ctx, batchIds, selType),
-    ensureAggregates(ctx, baselineBatchIds, selType),
+    ensureAggregates(ctx, batchIds, batches),
+    ensureAggregates(ctx, baselineBatchIds, batches),
   ]);
   if (!current || !baseline) {
     log().warn({ hasCurrent: Boolean(current), hasBaseline: Boolean(baseline) }, "comparison requested for un-ingested batches");
@@ -122,7 +126,25 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
     }
   }
 
-  const diff = diffAggregates(current.aggregate, baseline.aggregate);
+  // `topicShifts` and `sentimentShift` are share-of-total deltas computed from
+  // exactly the two series the call-analysis rollup fills. If either side could
+  // not be enriched, that side's series is empty for a reason that has nothing
+  // to do with the campaign — and `shareShifts` would report every topic on the
+  // healthy side as a full-magnitude swing, which then goes into the prompt as
+  // ground truth and gets explained as a real change. Drop both rather than
+  // narrate an artefact; every other delta in the diff is still sound.
+  // The flag rides on the doc, so this holds for a cached side too.
+  const analysisComparable = !current.aggregate.analysisUnavailable && !baseline.aggregate.analysisUnavailable;
+  const fullDiff = diffAggregates(current.aggregate, baseline.aggregate);
+  const diff: AggregatesDiff = analysisComparable
+    ? fullDiff
+    : { ...fullDiff, topicShifts: [], sentimentShift: [] };
+  if (!analysisComparable) {
+    log().warn(
+      { batchCount: batchIds.length, baselineCount: baselineBatchIds.length },
+      "comparison omitting topic/sentiment shifts — one side has no readable call analysis",
+    );
+  }
 
   if (!(await consumeAiQuota(ctx.tenantId, ctx.accountId, "comparison", 20))) {
     return NextResponse.json(
