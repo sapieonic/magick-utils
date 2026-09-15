@@ -3,11 +3,12 @@ import { env, isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { consumeAiQuota, getAggregates, getInsight, getRecords, setAggregates, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 import { aggregatesKey, batchSetKey } from "@/lib/server/fingerprint";
 import { datasetFingerprint } from "@/lib/server/dataset";
 import { bestReachWindow } from "@/lib/reach";
 import { getLLM, INSIGHT_SCHEMA, type ChatMessage } from "@/lib/server/llm";
-import type { AggregatesDoc, Insight } from "@/lib/server/types";
+import type { AggregatesDoc, BatchDoc, Insight } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
@@ -68,9 +69,10 @@ export const POST = withLogging("insights", async (req: Request) => {
     return NextResponse.json({ error: "invalid_refresh" }, { status: 400 });
   }
   let batchIds: string[];
+  let batches: BatchDoc[];
   try {
     batchIds = parseBatchIds(body?.batchIds);
-    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    batches = await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -83,9 +85,20 @@ export const POST = withLogging("insights", async (req: Request) => {
 
   if (!body.refresh) {
     const cached = await getInsight(ctx.tenantId, ctx.accountId, insightKey);
-    if (cached) {
+    // `insightKey` carries no AGGREGATES_VERSION, so a hit can predate a bump in
+    // how the aggregate it describes was computed. The stored `fingerprint` IS
+    // the aggregates key, so comparing it rejects exactly those — otherwise a
+    // customer reads "no key topics" from a pre-v7 narrative beside a chart that
+    // now shows them. Self-healing for every future bump, not just this one.
+    if (cached && cached.fingerprint === aggKey) {
       log().info({ batchCount: batchIds.length, model, cached: true }, "insight served from cache");
       return NextResponse.json({ insight: cached, cached: true });
+    }
+    if (cached) {
+      log().info(
+        { batchCount: batchIds.length, model, staleFingerprint: cached.fingerprint, aggKey },
+        "cached insight predates the current aggregate shape; regenerating",
+      );
     }
   }
 
@@ -97,8 +110,12 @@ export const POST = withLogging("insights", async (req: Request) => {
       log().warn({ batchCount: batchIds.length }, "insight requested for un-ingested batches");
       return NextResponse.json({ error: "not_ingested", message: "Run ingestion first." }, { status: 409 });
     }
-    agg = computeAggregates(records, batchIds, ctx, aggKey);
-    await setAggregates(agg);
+    // Enrich on the same terms as /api/analytics: the insight prose reads
+    // `agg.topics`/`agg.sentiment`, so an un-enriched doc here would have the AI
+    // tell the customer there are no key topics on the very screen charting them.
+    const enriched = await enrichWithCallAnalysis(ctx, batches, computeAggregates(records, batchIds, ctx, aggKey));
+    agg = enriched.aggregate;
+    if (enriched.cacheable) await setAggregates(agg);
   }
 
   if (!(await consumeAiQuota(ctx.tenantId, ctx.accountId, "insight", 20))) {
@@ -154,7 +171,11 @@ export const POST = withLogging("insights", async (req: Request) => {
       recommendations: payload.recommendations,
       createdAt: new Date().toISOString(),
     };
-    await setInsight(insight);
+    // Not cached when the two analysis series could not be read: the insight key
+    // is as immovable as the aggregate key, so one transient upstream failure
+    // would pin "this selection has no key topics" in Mongo and serve it on
+    // every later request — beside a chart that, by then, shows them.
+    if (!agg.analysisUnavailable) await setInsight(insight);
     return NextResponse.json({ insight, cached: false });
   } catch (err) {
     log().error({ err, batchCount: batchIds.length, model }, "insight generation failed");

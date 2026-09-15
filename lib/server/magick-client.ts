@@ -219,6 +219,30 @@ export interface StatusSummaryResponse {
   [batchId: string]: Record<string, number>;
 }
 
+/** The two post-call-analysis rollups we read out of magick-master's merged
+ *  bulk-dispatch analytics (`POST /bulk-dispatch-jobs/analytics`, which fans out
+ *  to core's `/calls/batch-analytics`).
+ *
+ *  This endpoint exists because the per-record read path cannot carry them:
+ *  core's calls LIST projects a column subset that deliberately excludes the
+ *  heavy `call_analysis` JSONB, and its formatter sends `call_analysis: null`
+ *  rather than omitting the key — so every listed call looks like a call with no
+ *  analysis. Core aggregates these in SQL straight off the blob instead.
+ *
+ *  The response carries far more (totals, duration, cost, outcome and error
+ *  distributions); we type only what we consume and stay defensive about the
+ *  rest, like every other Raw* shape here. */
+export interface RawBatchAnalytics {
+  /** Per-sentiment call counts. Labels are whatever the analysis model wrote —
+   *  normally positive/neutral/negative, but not guaranteed to be either that
+   *  set or that casing. */
+  sentiment_distribution?: { label?: string | null; count?: number | null }[] | null;
+  /** Most frequent detected intents, already ordered by count desc and capped
+   *  upstream (core takes the top 10). */
+  key_topics?: { topic?: string | null; count?: number | null }[] | null;
+  [key: string]: unknown;
+}
+
 // ---------------------------------------------------------------------------
 // Request params
 // ---------------------------------------------------------------------------
@@ -263,6 +287,11 @@ export interface StatsParams {
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE = 100;
+
+/** Ceiling on the best-effort call-analytics rollup (see `batchAnalytics`).
+ *  Generous enough for a 50-batch selection on a warm upstream, short enough
+ *  that a stuck one does not hold the analytics response open. */
+const BATCH_ANALYTICS_TIMEOUT_MS = 15_000;
 
 /** Every `iterate*` generator below stops on ONE condition: a short page. That
  *  is the only signal the upstream gives that is always true when exhausted and
@@ -357,6 +386,34 @@ async function raw(url: string, headers: Record<string, string>): Promise<Respon
 
 async function getJson<T>(url: string, headers: Record<string, string>): Promise<T> {
   const res = await raw(url, headers);
+  return (await res.json()) as T;
+}
+
+/** As `getJson`, for the tenant-scoped endpoints that take their arguments in a
+ *  JSON body rather than the query string.
+ *
+ *  `timeoutMs` is opt-in and deliberately not the default for this file. Most
+ *  calls here are load-bearing — ingestion cannot substitute a result for a page
+ *  of calls it failed to fetch — so aborting them would turn a slow upstream into
+ *  a wrong dataset. It is right only for a caller that has a correct answer to
+ *  fall back on. */
+async function postJson<T>(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  timeoutMs?: number,
+): Promise<T> {
+  const res = await loggedFetch(url, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json", "x-mgkvc-originator": "magick-analytics" },
+    body: JSON.stringify(body),
+    cache: "no-store",
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+  });
+  if (!res.ok) {
+    const responseBody = await res.text().catch(() => "");
+    throw new MagickApiError(res.status, responseBody, url, res.headers.get("retry-after"));
+  }
   return (await res.json()) as T;
 }
 
@@ -521,6 +578,34 @@ export class MagickClient {
   async getBulkJob(id: string): Promise<RawBulkJob> {
     const url = buildUrl(`/bulk-dispatch-jobs/${encodeURIComponent(id)}`);
     return getJson<RawBulkJob>(url, this.headers());
+  }
+
+  /** Merged post-call-analysis rollups across a set of `ai_voice_call` jobs,
+   *  computed by core over the union of their dispatched batches — so the caller
+   *  gets one exact answer for the whole selection rather than N per-batch
+   *  top-10s it would have to merge approximately.
+   *
+   *  Upstream caps this at 50 job ids, which is exactly `MAX_SELECTION_BATCHES`
+   *  (lib/server/selection.ts) — a selection can never exceed it, and
+   *  `call-analysis.test.ts` pins the two together so raising ours alone turns
+   *  into a failing test rather than a 400 in front of the customer.
+   *
+   *  Unlike `statusSummary`, this does NOT swallow a 404. Callers need the status
+   *  to tell a settled answer about the selection (400 wrong job type, 404 job
+   *  upstream no longer has — both permanent, both safe to cache) from a
+   *  momentary one (5xx, 401, timeout) that must not be. Collapsing either into
+   *  `null` here would erase the distinction; `enrichWithCallAnalysis` owns that
+   *  policy in one place.
+   *
+   *  Timed out rather than left to hang. This is the heaviest call in this file
+   *  — master fans a whole selection's batches into one core request, and core
+   *  answers it with eleven parallel aggregate queries — and it is the only one
+   *  whose caller holds a correct answer to fall back on, so a bounded wait
+   *  degrades to that instead of stalling the analytics request behind it. */
+  async batchAnalytics(jobIds: string[]): Promise<RawBatchAnalytics | null> {
+    if (jobIds.length === 0) return null;
+    const url = buildUrl("/bulk-dispatch-jobs/analytics");
+    return postJson<RawBatchAnalytics>(url, this.headers(), { job_ids: jobIds }, BATCH_ANALYTICS_TIMEOUT_MS);
   }
 
   // ---- Status summary (tolerate 404 → null) ----

@@ -278,6 +278,12 @@ export interface AggregatesDoc {
   durationHistogram?: { bucket: string; calls: number; talk: number }[];
   sentiment?: { name: string; value: number }[];
   topics?: { topic: string; count: number; sentiment: string }[];
+  /** True when the post-call-analysis rollup these two series come from could
+   *  not be read (see `call-analysis.ts`). Both series are then empty for a
+   *  reason that has nothing to do with the data, so the UI must say "could not
+   *  load" instead of asserting these records carry no AI analysis. Absent on
+   *  every normal doc, including one where upstream genuinely had nothing. */
+  analysisUnavailable?: boolean;
   funnel?: { stage: string; value: number }[];
   volumeOverTime?: { date: string; calls: number; messages: number }[];
   costOverTime?: { date: string; telephony: number; ai: number }[];

@@ -233,3 +233,86 @@ describe("ConversationTab — duration histogram", () => {
     expect(screen.queryByText("No call durations yet")).not.toBeInTheDocument();
   });
 });
+
+// The production shape for the bug this was built for: an AI-voice selection,
+// hasVoice && !hasMsg, both series filled from core's rollup. The pre-existing
+// populated-topics test uses a messaging selection, which is precisely the
+// selType the enrichment never fills — so it could not have caught a regression
+// on the path the customer actually uses.
+describe("ConversationTab — populated AI-voice selection", () => {
+  const filled: AggregatesDoc = {
+    ...base,
+    totalRecords: 120,
+    sentiment: [
+      { name: "Positive", value: 60 },
+      { name: "Neutral", value: 30 },
+      { name: "Negative", value: 20 },
+      { name: "Mixed", value: 10 },
+    ],
+    topics: [
+      { topic: "delivery delay", count: 31, sentiment: "neutral" },
+      { topic: "billing query", count: 12, sentiment: "neutral" },
+    ],
+  };
+
+  it("renders both cards with real values and no empty state", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={filled} />);
+
+    expect(screen.getByText("delivery delay")).toBeTruthy();
+    expect(screen.getByText("billing query")).toBeTruthy();
+    expect(screen.queryByText(/don't include per-call AI analysis/)).toBeNull();
+    expect(screen.queryByText(/No key topics yet/)).toBeNull();
+    expect(screen.queryByText(/No sentiment yet/)).toBeNull();
+  });
+
+  it("counts an unrecognised sentiment label in the donut total", () => {
+    // Core emits `mixed` as a first-class label. Dropping it would make the
+    // centre total disagree with the calls the card claims to describe.
+    render(<ConversationTab hasVoice hasMsg={false} analytics={filled} />);
+    expect(screen.getByText("120")).toBeTruthy(); // 60 + 30 + 20 + 10
+  });
+
+  it("gives an unrecognised label its own colour rather than reusing Neutral's grey", () => {
+    // Two adjacent identically-grey slices read as one value, and produce two
+    // indistinguishable legend dots. Scoped to the donut's legend swatches —
+    // the topic bars are legitimately all grey.
+    const { container } = render(<ConversationTab hasVoice hasMsg={false} analytics={filled} />);
+    const swatches = Array.from(container.querySelectorAll<HTMLElement>("span.rounded-full[style]"))
+      .map((el) => el.style.background || el.style.backgroundColor)
+      .filter(Boolean);
+
+    expect(swatches).toHaveLength(filled.sentiment!.length);
+    expect(new Set(swatches).size).toBe(filled.sentiment!.length);
+  });
+
+  it("keeps a truncated topic recoverable via its title attribute", () => {
+    const longTopic = "customer asking about the replacement policy for damaged items delivered late";
+    render(
+      <ConversationTab
+        hasVoice
+        hasMsg={false}
+        analytics={{ ...filled, topics: [{ topic: longTopic, count: 3, sentiment: "neutral" }] }}
+      />,
+    );
+    expect(screen.getByTitle(longTopic)).toBeTruthy();
+  });
+});
+
+describe("ConversationTab — analysisUnavailable", () => {
+  it("says the analysis could not be loaded instead of claiming the records lack it", () => {
+    // Both cards are empty either way, but only one of those is a fact about
+    // the customer's data — asserting the wrong one sends someone hunting for
+    // analysis that is actually there.
+    render(<ConversationTab hasVoice hasMsg={false} analytics={{ ...base, totalRecords: 120, analysisUnavailable: true }} />);
+
+    expect(screen.getAllByText(/couldn't load the AI analysis/i).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/don't include per-call AI analysis/)).toBeNull();
+  });
+
+  it("still states the honest empty case when upstream simply had nothing", () => {
+    render(<ConversationTab hasVoice hasMsg={false} analytics={{ ...base, totalRecords: 120 }} />);
+
+    expect(screen.getAllByText(/don't include per-call AI analysis/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/couldn't load the AI analysis/i)).toBeNull();
+  });
+});

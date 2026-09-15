@@ -35,12 +35,25 @@ import { Legend } from "./Legend";
 import { StatusDonut } from "./StatusDonut";
 
 const SENTIMENT_COLORS: Record<string, string> = { Positive: "#16a34a", Neutral: "#94a3b8", Negative: "#dc2626" };
+/** Colours for labels outside the canonical three — core treats `mixed` as a
+ *  first-class sentiment and the model may emit others. They used to fall back
+ *  to Neutral's grey, which drew two adjacent identical slices separated only by
+ *  the donut's 2° padding: unreadable as two values, and two indistinguishable
+ *  legend dots. Cycled by position among the unknowns, which is stable because
+ *  the aggregate orders them by count. */
+const EXTRA_SENTIMENT_COLORS = ["#f59e0b", "#8b5cf6", "#0891b2", "#db2777"];
 const FUNNEL_COLORS = ["#94a3b8", "#3b82f6", "#16a34a", "#6366f1"];
 
 /** Shown wherever the upstream records carry no per-call AI analysis. It is the
  *  real state for plenty of selections, so say it plainly rather than filling
  *  the card with seeded intents. */
 const NO_AI_ANALYSIS = "These records don't include per-call AI analysis, so nothing can be charted here.";
+
+/** Shown instead of NO_AI_ANALYSIS when the aggregate says the rollup could not
+ *  be read. The two look identical on screen — both cards empty — but only one
+ *  of them is a fact about the customer's data, and stating the wrong one sends
+ *  someone hunting for missing analysis that is actually there. */
+const ANALYSIS_UNAVAILABLE = "We couldn't load the AI analysis for this selection just now. Use Refresh data to try again.";
 
 /** `demo` is true only when the backend is off (`lib/data.ts` seeds the whole
  *  screen). On a live backend a missing series renders an honest empty state —
@@ -74,7 +87,7 @@ export function ConversationTab({
     () =>
       nonEmpty(
         analytics?.sentiment
-          ? analytics.sentiment.map((s) => ({ name: s.name, value: s.value, color: SENTIMENT_COLORS[s.name] ?? "#94a3b8" }))
+          ? withSentimentColors(analytics.sentiment)
           : demo
             ? sentimentData()
             : null,
@@ -82,6 +95,8 @@ export function ConversationTab({
     [analytics, demo],
   );
   const topics = useMemo(() => nonEmpty(analytics?.topics ?? (demo ? TOPICS : null)), [analytics, demo]);
+  // Both cards are empty for the same reason, so they say the same thing.
+  const emptyBody = analytics?.analysisUnavailable ? ANALYSIS_UNAVAILABLE : NO_AI_ANALYSIS;
   const funnel = useMemo(
     () =>
       nonEmpty(
@@ -122,7 +137,7 @@ export function ConversationTab({
                 // record counts, so the donut's centre total is meaningful here.
                 <StatusDonut data={sent} />
               ) : (
-                <ChartPlaceholder loading={loading} icon="Smile" title="No sentiment yet" body={NO_AI_ANALYSIS} height={220} />
+                <ChartPlaceholder loading={loading} icon="Smile" title="No sentiment yet" body={emptyBody} height={220} />
               )}
             </div>
           </ChartCard>
@@ -137,7 +152,7 @@ export function ConversationTab({
           {topics ? (
             <TopicList topics={topics} />
           ) : (
-            <ChartPlaceholder loading={loading} icon="MessagesSquare" title="No key topics yet" body={NO_AI_ANALYSIS} variant="rows" />
+            <ChartPlaceholder loading={loading} icon="MessagesSquare" title="No key topics yet" body={emptyBody} variant="rows" />
           )}
         </ChartCard>
         {hasMsg ? (
@@ -173,6 +188,18 @@ export function ConversationTab({
  *  would otherwise render an axis with no bars. Collapse both holes to null. */
 function nonEmpty<T>(rows: T[] | null | undefined): T[] | null {
   return rows && rows.length ? rows : null;
+}
+
+/** Give every sentiment row a colour, so no two slices share one. Unknown labels
+ *  are counted separately from the canonical three, so the first unknown always
+ *  gets the first extra colour regardless of which known labels are present. */
+function withSentimentColors(rows: { name: string; value: number }[]) {
+  let extra = 0;
+  return rows.map((s) => ({
+    name: s.name,
+    value: s.value,
+    color: SENTIMENT_COLORS[s.name] ?? EXTRA_SENTIMENT_COLORS[extra++ % EXTRA_SENTIMENT_COLORS.length],
+  }));
 }
 
 /** As `nonEmpty`, for a series whose rows exist regardless of whether anything
@@ -255,7 +282,7 @@ function TopicList({ topics }: { topics: { topic: string; count: number; sentime
           <span className="text-[13px] text-slate-400 w-5 tabnum">{i + 1}</span>
           <div className="flex-1 min-w-0">
             <div className="flex items-center justify-between mb-1">
-              <span className="text-[13px] font-semibold text-slate-700 truncate">{t.topic}</span>
+              <span className="text-[13px] font-semibold text-slate-700 truncate" title={t.topic}>{t.topic}</span>
               <span className="text-[12px] tabnum text-slate-400 ml-2">{fmtNum(t.count)}</span>
             </div>
             <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">

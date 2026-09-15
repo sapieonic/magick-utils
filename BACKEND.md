@@ -22,16 +22,85 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
 - `types.ts` — contracts: `TenantContext`, `BatchDoc`, `NormalizedRecord`, `Job`, `AggregatesDoc`, `Insight`.
 - `session.ts` — iron-session cookie; `getTenantContext()` (null when not logged in / unconfigured).
 - `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` with
-  `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `exportCallsCsv`).
+  `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `batchAnalytics`,
+  `exportCallsCsv`).
 - `normalize.ts` — core call/message → `NormalizedRecord`; `buildBatchDoc`; dispatch-type mapping.
 - `map.ts` — `BatchDoc` ↔ frontend `Batch`; bulk-job → `BatchDoc`. **Batch is keyed by the upstream source id.**
 - `db.ts` / `repositories.ts` — cached Mongo client, collections, indexes, tenant-scoped repo functions.
 - `aggregate.ts` — compute analytics aggregates from records.
+- `call-analysis.ts` — fills the Conversation tab's Sentiment and Key topics from core's rollup,
+  because the records cannot carry them (see *Sentiment and key topics* below).
 - `fingerprint.ts` — stable hashes for cache keys / change detection.
 - `llm/` — `getLLM()` factory + `OpenAICompatibleProvider` (DeepSeek/Kimi/OpenRouter/vLLM/Ollama) and
   `AnthropicProvider`; `complete`/`stream`/`structured` (Zod-validated, retry-on-parse-fail). `INSIGHT_SCHEMA`.
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
   records, rebuild the `BatchDoc`. Resumable progress via `Job.done`/`cursor`.
+
+### Sentiment and key topics
+
+**These two series do not come from the ingested records, and cannot.** Everything else on the
+Analytics → Conversation tab is derived from `NormalizedRecord`s pulled from magick-master's
+`/proxy/calls` → core's calls LIST. That list projects a column subset which deliberately excludes the
+heavy `call_analysis` JSONB, and core's formatter emits `call_analysis: null` rather than omitting the
+key — so from here every call in the fleet is indistinguishable from a call whose analysis never ran.
+`normalizeCall` writes `sentiment: null` / `keyTopics: null` on every record and both cards render
+their empty state, while duration and talk-time (ordinary list columns) render fine. The analysis
+itself completes normally upstream; this is purely a read-path projection gap.
+
+`call-analysis.ts` therefore asks the one endpoint that can see the blob:
+`POST /bulk-dispatch-jobs/analytics` on magick-master, which fans out to core's
+`/calls/batch-analytics` and aggregates both series in SQL straight off `call_analysis`. Core computes
+over the union of the selection's batches in one query, so the result is exact rather than N per-batch
+top-10s merged approximately here. Notes:
+
+- **AI selections only.** IVR and messaging runs have no conversation to analyse, and magick-master
+  rejects a non-`ai_voice_call` job id with a 400 rather than an empty rollup.
+- **Selection-scoped rollups, not per-record fields.** They cannot reach the CSV export or anything
+  else reading a `NormalizedRecord`. Closing that needs core to project the two values as scalars onto
+  the calls list — which it already does for the WebRTC dialer list (`analysis_sentiment_label` in
+  `WEBRTC_LIST_COLUMNS`), just not for AI calls. The enrichment only ever fills an **empty** series, so
+  when that lands the per-record numbers win and this becomes a no-op.
+- **Best-effort. Cacheability tracks "would asking again help?", not "did the call succeed?".**
+  Those come apart both ways. A momentary failure (5xx, timeout, 401, 429) is `cacheable: false`:
+  the cache key is a fingerprint of the batch set and its dataset, neither of which moves because a
+  downstream call failed, so a cached blank would outlive the outage and only Refresh could clear it.
+  A *settled* refusal (400 for a dispatch type with no analysis, 404 for a job upstream no longer
+  has) is `cacheable: true`: it says the same thing on every retry, and marking it uncacheable would
+  stop the whole aggregates doc — every other series on the screen — from ever being cached for that
+  selection, forcing a full recompute from Mongo on every request.
+- **Either way the doc is marked `analysisUnavailable: true`**, so the Conversation tab says "couldn't
+  load" instead of asserting the records carry no AI analysis. The two look identical on screen; only
+  one of them is a fact about the customer's data.
+- **Bump `AGGREGATES_VERSION` (`lib/server/fingerprint.ts`) whenever this changes.** `/api/analytics`
+  serves a cache hit *before* enrichment runs, so without a bump every selection analysed before the
+  deploy keeps serving its old empty doc until someone clicks Refresh or retention prunes it. The two
+  **insight** caches must react to that bump too, or their prose contradicts the chart beside it:
+  `/api/insights` stores the aggregates key as the Insight's `fingerprint` and rejects a hit that no
+  longer matches, and `compareKey` folds the version in directly (a comparison's `fingerprint` is its
+  own key, so it cannot carry the signal). Neither route persists a narrative built while the rollup
+  was unreadable.
+- **A settled refusal is an allow-list (`400`, `404`, `422`), not a 4xx range.** `408` is a 4xx about
+  *this moment* and must stay momentary. `404` qualifies only because `fetchRollup` runs first: master
+  404s the whole request when any one `job_id` is unknown and names them in `missing_job_ids`, so those
+  are dropped and the rest re-asked once — one deleted campaign no longer blanks the tab for the other
+  49 in a selection. A 404 that reaches the classifier therefore means the endpoint is absent or *no*
+  selected job still exists.
+- **A 2xx that contradicts its declared shape is momentary, not empty.** An absent or null field is a
+  legitimately empty rollup; a field present but not an array is upstream breaking contract, and the
+  mappers coerce it to `[]` — which must not be cached as a real "no analysis".
+- **Every batch must carry a `sourceId`.** The upstream ids are `sourceId`, not `batchId`. If any is
+  blank the enrichment refuses rather than silently asking about a subset and presenting it as the
+  whole selection.
+- **The call is the only timed-out one in `magick-client.ts`** (15s). It is the heaviest — master fans a
+  whole selection's batches into one core request, answered with eleven parallel aggregate queries —
+  and the only one whose caller holds a correct answer to fall back on.
+- Applied at all four aggregate-computing routes (`analytics`, `insights`, `insights/compare`, `chat`)
+  so the AI prose can never contradict the chart beside it.
+- Upstream caps the request at 50 job ids, which is exactly `MAX_SELECTION_BATCHES`.
+- **Known gap:** `normalizeCall` reads only the modern `call_analysis.common.*` shape, while core's
+  rollup SQL also COALESCEs a legacy top-level shape. Moot while the list carries no blob, but it
+  means the "record values win once core projects them" plan above would be correct by accident on
+  legacy-shaped rows. Fix `normalize.ts` alongside that core change, not before.
 
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as

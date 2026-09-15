@@ -23,7 +23,11 @@ vi.mock("@/lib/server/fingerprint", () => ({
 vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
 vi.mock("@/lib/server/selection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/server/selection")>()),
-  validateSelection: vi.fn().mockResolvedValue([]),
+  // A real union of BOTH selections, not `[]`.
+  validateSelection: vi.fn().mockResolvedValue([
+    { batchId: "b1", sourceId: "job-1", selType: "ai" },
+    { batchId: "b2", sourceId: "job-2", selType: "ai" },
+  ]),
 }));
 // diffAggregates is exercised by its own unit tests; stub a fully-shaped diff
 // so the route's diffContext serialization runs without coupling to its math.
@@ -37,12 +41,14 @@ vi.mock("@/lib/diff", () => ({
     aiInr: { current: 40, baseline: 35, delta: 5, relative: 0.14 },
     costSplit: { currentTelephonyShare: 0.6, baselineTelephonyShare: 0.61, deltaShare: -0.01 },
     volume: { current: 100, baseline: 80, delta: 20, relative: 0.25 },
-    topicShifts: [],
+    topicShifts: [{ key: "billing", currentShare: 0.4, baselineShare: 0, deltaShare: 0.4 }],
     statusMixShift: [],
-    sentimentShift: [],
+    sentimentShift: [{ key: "Positive", currentShare: 0.6, baselineShare: 0, deltaShare: 0.6 }],
     funnelShifts: undefined,
   })),
 }));
+
+vi.mock("@/lib/server/call-analysis", () => ({ enrichWithCallAnalysis: vi.fn() }));
 
 const structured = vi.fn();
 vi.mock("@/lib/server/llm", () => ({ getLLM: () => ({ structured }), INSIGHT_SCHEMA: {} }));
@@ -52,6 +58,8 @@ import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getBatch, getInsight, getRecords, setInsight } from "@/lib/server/repositories";
 import { compareKey } from "@/lib/server/fingerprint";
 import { SelectionError, validateSelection } from "@/lib/server/selection";
+import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 const AGG = { totalRecords: 100, successRate: 0.5, statusMix: [], spendInr: 100, telephonyInr: 60, aiInr: 40, batchIds: ["b"] };
@@ -70,7 +78,16 @@ function authed() {
 const body = { batchIds: ["cur"], baselineBatchIds: ["base"] };
 
 describe("POST /api/insights/compare", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(validateSelection).mockResolvedValue([
+      { batchId: "b1", sourceId: "job-1", selType: "ai" },
+      { batchId: "b2", sourceId: "job-2", selType: "ai" },
+    ] as never);
+    vi.mocked(enrichWithCallAnalysis).mockImplementation(
+      async (_ctx, _batches, aggregate) => ({ aggregate, status: "ok", cacheable: true }),
+    );
+  });
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
@@ -178,5 +195,107 @@ describe("POST /api/insights/compare", () => {
     const res = await POST(req(body));
     expect(res.status).toBe(502);
     await expect(res.json()).resolves.toMatchObject({ error: "llm_failed" });
+  });
+});
+
+describe("POST /api/insights/compare — call-analysis symmetry", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(validateSelection).mockResolvedValue([
+      { batchId: "b1", sourceId: "job-1", selType: "ai" },
+      { batchId: "b2", sourceId: "job-2", selType: "ai" },
+    ] as never);
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getInsight).mockResolvedValue(null as never);
+    vi.mocked(getRecords).mockResolvedValue([{ recordId: "r1" }] as never);
+    vi.mocked(computeAggregates).mockReturnValue(AGG as never);
+    structured.mockResolvedValue({ narrative: "n", anomalies: [], recommendations: [] });
+  });
+
+  /** The prompt the model was actually handed. */
+  function promptBody(): string {
+    return (structured.mock.calls[0][0] as { role: string; content: string }[])[1].content;
+  }
+
+  it("hands each side only its own batches, not the validated union", async () => {
+    // Passing the union would compute the baseline's rollup over the current
+    // selection's jobs as well — a silently wrong comparison.
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    const perSide = vi.mocked(enrichWithCallAnalysis).mock.calls.map((c) => c[1]);
+    expect(perSide).toHaveLength(2);
+    expect(perSide.map((b) => b.map((d) => d.batchId))).toEqual([["b1"], ["b2"]]);
+  });
+
+  it("keeps topic and sentiment shifts when both sides have readable analysis", async () => {
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(promptBody()).toContain("billing");
+  });
+
+  // shareShifts reports a key missing from one side as a full-magnitude swing.
+  // If that side is empty only because its rollup could not be read, the model
+  // is handed a change that never happened and explains it as real.
+  it("drops topic and sentiment shifts when one side's analysis is unreadable", async () => {
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(enrichWithCallAnalysis)
+      .mockResolvedValueOnce({ aggregate: AGG, status: "ok", cacheable: true } as never)
+      .mockResolvedValueOnce({
+        aggregate: { ...AGG, analysisUnavailable: true },
+        status: "failed",
+        cacheable: false,
+      } as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    const res = await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(res.status).toBe(200); // every other delta is still sound
+    const body = promptBody();
+    expect(body).not.toContain("billing");
+    expect(body).toContain("successRate"); // the rest of the diff survives
+  });
+
+  it("also drops them when an unreadable side came from cache", async () => {
+    // analysisUnavailable rides on the doc, so a cached settled-refusal is
+    // caught too — the enrichment status of this request is not enough.
+    vi.mocked(getAggregates)
+      .mockResolvedValueOnce(AGG as never)
+      .mockResolvedValueOnce({ ...AGG, analysisUnavailable: true } as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(promptBody()).not.toContain("billing");
+  });
+
+  // Gating the persist matters more here than the prompt strip: compareKey is
+  // immovable, so a narrative generated with the shifts stripped would be served
+  // on every later request, including after the rollup recovers.
+  it("does not cache a comparison whose shifts were stripped", async () => {
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(enrichWithCallAnalysis)
+      .mockResolvedValueOnce({ aggregate: AGG, status: "ok", cacheable: true } as never)
+      .mockResolvedValueOnce({
+        aggregate: { ...AGG, analysisUnavailable: true },
+        status: "failed",
+        cacheable: false,
+      } as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    const res = await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(res.status).toBe(200); // still answered
+    expect(setInsight).not.toHaveBeenCalled();
+  });
+
+  it("caches a comparison when both sides had readable analysis", async () => {
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    const { POST } = await import("@/app/api/insights/compare/route");
+    await POST(req({ batchIds: ["b1"], baselineBatchIds: ["b2"] }));
+
+    expect(setInsight).toHaveBeenCalled();
   });
 });

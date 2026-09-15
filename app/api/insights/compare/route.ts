@@ -3,11 +3,12 @@ import { env, isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { consumeAiQuota, getAggregates, getInsight, getRecords, setAggregates, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 import { diffAggregates } from "@/lib/diff";
 import { aggregatesKey, compareKey } from "@/lib/server/fingerprint";
 import { datasetFingerprint } from "@/lib/server/dataset";
 import { getLLM, INSIGHT_SCHEMA, type ChatMessage } from "@/lib/server/llm";
-import type { AggregatesDiff, AggregatesDoc, Insight, TenantContext } from "@/lib/server/types";
+import type { AggregatesDiff, AggregatesDoc, BatchDoc, Insight, TenantContext } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
@@ -18,18 +19,31 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /** Ensure aggregates exist for a batch set, computing-on-miss from ingested
- *  records (parity with /api/analytics). Returns null when nothing is ingested
- *  so the caller can surface a 409. */
-async function ensureAggregates(ctx: TenantContext, batchIds: string[]): Promise<{ aggregate: AggregatesDoc; dataset: string } | null> {
+ *  records (parity with /api/analytics, call-analysis enrichment included —
+ *  `topicShifts` and `sentimentShift` in the diff are computed from exactly
+ *  those two series, so an un-enriched side would report every topic as a
+ *  100% swing against a side that had them). Returns null when nothing is
+ *  ingested so the caller can surface a 409. */
+async function ensureAggregates(
+  ctx: TenantContext,
+  batchIds: string[],
+  batches: BatchDoc[],
+): Promise<{ aggregate: AggregatesDoc; dataset: string } | null> {
   const dataset = await datasetFingerprint(ctx, batchIds);
   const key = aggregatesKey(batchIds, dataset);
   const cached = await getAggregates(ctx.tenantId, ctx.accountId, key);
   if (cached) return { aggregate: cached, dataset };
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
   if (records.length === 0) return null;
-  const agg = computeAggregates(records, batchIds, ctx, key);
-  await setAggregates(agg);
-  return { aggregate: agg, dataset };
+  const wanted = new Set(batchIds);
+  const { aggregate, cacheable } = await enrichWithCallAnalysis(
+    ctx,
+    // Only this side's batches — `batches` is the validated union of both.
+    batches.filter((b) => wanted.has(b.batchId)),
+    computeAggregates(records, batchIds, ctx, key),
+  );
+  if (cacheable) await setAggregates(aggregate);
+  return { aggregate, dataset };
 }
 
 /** Compacted diff for the prompt — rounds money/percentages and keeps only the
@@ -78,13 +92,15 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   }
   let batchIds: string[];
   let baselineBatchIds: string[];
+  let batches: BatchDoc[];
   try {
     batchIds = parseBatchIds(body?.batchIds);
     if (body?.baselineBatchIds == null || (Array.isArray(body.baselineBatchIds) && body.baselineBatchIds.length === 0)) {
       return NextResponse.json({ error: "no_baseline", message: "Select a baseline." }, { status: 400 });
     }
     baselineBatchIds = parseBatchIds(body?.baselineBatchIds);
-    await validateSelection(ctx, [...new Set([...batchIds, ...baselineBatchIds])], { requireReady: true, verifyCounts: true });
+    // Validated as one set, so both selections are proven to share a selType.
+    batches = await validateSelection(ctx, [...new Set([...batchIds, ...baselineBatchIds])], { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -92,7 +108,10 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   }
   const model = env.llm.model;
 
-  const [current, baseline] = await Promise.all([ensureAggregates(ctx, batchIds), ensureAggregates(ctx, baselineBatchIds)]);
+  const [current, baseline] = await Promise.all([
+    ensureAggregates(ctx, batchIds, batches),
+    ensureAggregates(ctx, baselineBatchIds, batches),
+  ]);
   if (!current || !baseline) {
     log().warn({ hasCurrent: Boolean(current), hasBaseline: Boolean(baseline) }, "comparison requested for un-ingested batches");
     return NextResponse.json({ error: "not_ingested", message: "Run ingestion on both selections first." }, { status: 409 });
@@ -107,7 +126,25 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
     }
   }
 
-  const diff = diffAggregates(current.aggregate, baseline.aggregate);
+  // `topicShifts` and `sentimentShift` are share-of-total deltas computed from
+  // exactly the two series the call-analysis rollup fills. If either side could
+  // not be enriched, that side's series is empty for a reason that has nothing
+  // to do with the campaign — and `shareShifts` would report every topic on the
+  // healthy side as a full-magnitude swing, which then goes into the prompt as
+  // ground truth and gets explained as a real change. Drop both rather than
+  // narrate an artefact; every other delta in the diff is still sound.
+  // The flag rides on the doc, so this holds for a cached side too.
+  const analysisComparable = !current.aggregate.analysisUnavailable && !baseline.aggregate.analysisUnavailable;
+  const fullDiff = diffAggregates(current.aggregate, baseline.aggregate);
+  const diff: AggregatesDiff = analysisComparable
+    ? fullDiff
+    : { ...fullDiff, topicShifts: [], sentimentShift: [] };
+  if (!analysisComparable) {
+    log().warn(
+      { batchCount: batchIds.length, baselineCount: baselineBatchIds.length },
+      "comparison omitting topic/sentiment shifts — one side has no readable call analysis",
+    );
+  }
 
   if (!(await consumeAiQuota(ctx.tenantId, ctx.accountId, "comparison", 20))) {
     return NextResponse.json(
@@ -153,7 +190,10 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
       recommendations: payload.recommendations,
       createdAt: new Date().toISOString(),
     };
-    await setInsight(insight);
+    // Same rule as /api/insights: a narrative generated with the topic and
+    // sentiment shifts stripped must not be pinned under a key that cannot
+    // change back once the rollup is readable again.
+    if (analysisComparable) await setInsight(insight);
     return NextResponse.json({ insight, cached: false });
   } catch (err) {
     log().error({ err, batchCount: batchIds.length, baselineCount: baselineBatchIds.length, model }, "comparison generation failed");

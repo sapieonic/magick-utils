@@ -15,8 +15,12 @@ vi.mock("@/lib/server/fingerprint", () => ({ aggregatesKey: vi.fn(() => "agg-key
 vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
 vi.mock("@/lib/server/selection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/server/selection")>()),
-  validateSelection: vi.fn().mockResolvedValue([]),
+  // A real selection, not `[]` — an empty one makes the call-analysis
+  // enrichment skip, hollowing out the compute path below.
+  validateSelection: vi.fn().mockResolvedValue([{ batchId: "b1", sourceId: "job-1", selType: "ai" }]),
 }));
+
+vi.mock("@/lib/server/call-analysis", () => ({ enrichWithCallAnalysis: vi.fn() }));
 
 const stream = vi.fn();
 vi.mock("@/lib/server/llm", () => ({ getLLM: () => ({ stream }) }));
@@ -24,6 +28,8 @@ vi.mock("@/lib/server/llm", () => ({ getLLM: () => ({ stream }) }));
 import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { consumeAiQuota, getAggregates, getRecords } from "@/lib/server/repositories";
+import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 
@@ -163,5 +169,36 @@ describe("POST /api/chat", () => {
     const body = await readAll(res);
     expect(body).toContain("event: error");
     expect(body).toContain("chat_stream_failed");
+  });
+
+  // On a cache miss the chat box computes its own aggregate. Without the same
+  // enrichment the chart uses, it would answer "no key topics" about the very
+  // selection whose Key topics card is populated.
+  it("enriches the aggregate it computes on a cache miss", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(isLlmConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(getRecords).mockResolvedValue([{ recordId: "r1" }] as never);
+    const computed = { totalRecords: 1, successRate: 1, statusMix: [] };
+    vi.mocked(computeAggregates).mockReturnValue(computed as never);
+    vi.mocked(enrichWithCallAnalysis).mockResolvedValue({
+      aggregate: { ...computed, topics: [{ topic: "billing", count: 4, sentiment: "neutral" }] },
+      status: "ok",
+      cacheable: true,
+    } as never);
+    stream.mockReturnValue(gen("hi"));
+    const { POST } = await import("@/app/api/chat/route");
+    const res = await POST(req({ batchIds: ["b1"], message: "what came up?" }));
+
+    expect(res.status).toBe(200);
+    expect(enrichWithCallAnalysis).toHaveBeenCalledWith(
+      ctx,
+      [{ batchId: "b1", sourceId: "job-1", selType: "ai" }],
+      computed,
+    );
+    // The enriched doc is what grounds the answer.
+    const messages = stream.mock.calls[0][0] as { role: string; content: string }[];
+    expect(JSON.stringify(messages)).toContain("billing");
   });
 });
