@@ -56,6 +56,12 @@ refresh publish in between and the two disagree.
 `DATA_RETENTION_DAYS` (default 5) is the ceiling on how far back Dashboard and Analytics can see —
 older batches are deleted with every record they own.
 
+The Conversation tab's **Sentiment and Key topics cannot be computed from the records** — core's calls
+list omits the `call_analysis` JSONB from its projection and sends the key as `null`, so every record
+normalizes to "no analysis". They come from core's own rollup via `lib/server/call-analysis.ts`
+(AI selections only, best-effort, never cached on failure). Don't "fix" an empty `sentiment`/`topics`
+series by reaching for the records; see BACKEND.md → *Sentiment and key topics*.
+
 ## Status
 - ✅ Full UI ported from the design handoff. `npm run dev`, `npm run build`, `npx tsc --noEmit` pass.
 - ✅ Backend V1 built (see `BACKEND.md`): magick-master client, iron-session auth, MongoDB layer,

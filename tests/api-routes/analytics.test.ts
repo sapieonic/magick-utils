@@ -8,6 +8,7 @@ vi.mock("@/lib/server/repositories", () => ({
   setAggregates: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/lib/server/aggregate", () => ({ computeAggregates: vi.fn() }));
+vi.mock("@/lib/server/call-analysis", () => ({ enrichWithCallAnalysis: vi.fn() }));
 vi.mock("@/lib/server/fingerprint", () => ({ aggregatesKey: vi.fn(() => "agg-key") }));
 vi.mock("@/lib/server/dataset", () => ({ datasetFingerprint: vi.fn().mockResolvedValue("dataset") }));
 vi.mock("@/lib/server/selection", async (importOriginal) => ({
@@ -20,6 +21,7 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getRecords, setAggregates } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 
@@ -34,7 +36,11 @@ describe("POST /api/analytics", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: a selection whose batches are ready and non-empty.
-    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10 }] as never);
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 10, selType: "ai" }] as never);
+    // Default: enrichment passes the aggregate through and is safe to cache.
+    vi.mocked(enrichWithCallAnalysis).mockImplementation(
+      async (_ctx, _selType, aggregate) => ({ aggregate, status: "ok", cacheable: true }),
+    );
   });
 
   it("503 when backend not configured", async () => {
@@ -98,7 +104,7 @@ describe("POST /api/analytics", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getAggregates).mockResolvedValue(null as never);
-    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 0 }] as never);
+    vi.mocked(validateSelection).mockResolvedValue([{ batchId: "b1", total: 0, selType: "ai" }] as never);
     vi.mocked(getRecords).mockResolvedValue([] as never);
     vi.mocked(computeAggregates).mockReturnValue({ totalRecords: 0 } as never);
     const { POST } = await import("@/app/api/analytics/route");
@@ -135,5 +141,58 @@ describe("POST /api/analytics", () => {
     expect(res.status).toBe(200);
     expect(getAggregates).not.toHaveBeenCalled();
     await expect(res.json()).resolves.toMatchObject({ cached: false });
+  });
+
+  // Sentiment and key topics cannot come from the ingested records: core's calls
+  // list projects a column subset that excludes `call_analysis` and sends the key
+  // as null, so every record normalizes to no analysis. They are filled here from
+  // core's own rollup instead.
+  it("serves sentiment and topics from the call-analysis enrichment", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(getRecords).mockResolvedValue([{ recordId: "r1" }] as never);
+    vi.mocked(computeAggregates).mockReturnValue({ totalRecords: 1, sentiment: [], topics: [] } as never);
+    vi.mocked(enrichWithCallAnalysis).mockResolvedValue({
+      aggregate: {
+        totalRecords: 1,
+        sentiment: [{ name: "Positive", value: 1 }],
+        topics: [{ topic: "billing", count: 1, sentiment: "neutral" }],
+      },
+      status: "ok",
+      cacheable: true,
+    } as never);
+    const { POST } = await import("@/app/api/analytics/route");
+    const res = await POST(req({ batchIds: ["b1"] }));
+
+    expect(res.status).toBe(200);
+    // The selection's selType decides whether there is anything to ask for.
+    expect(enrichWithCallAnalysis).toHaveBeenCalledWith(ctx, "ai", { totalRecords: 1, sentiment: [], topics: [] });
+    await expect(res.json()).resolves.toMatchObject({
+      aggregates: { sentiment: [{ name: "Positive", value: 1 }] },
+    });
+    expect(setAggregates).toHaveBeenCalled();
+  });
+
+  // The cache key is a fingerprint of the batch set and its dataset, and neither
+  // moves because an upstream call failed — so persisting a failed enrichment
+  // would pin the two empty cards until someone hit Refresh.
+  it("serves but does not cache aggregates whose enrichment failed", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getAggregates).mockResolvedValue(null as never);
+    vi.mocked(getRecords).mockResolvedValue([{ recordId: "r1" }] as never);
+    vi.mocked(computeAggregates).mockReturnValue({ totalRecords: 1 } as never);
+    vi.mocked(enrichWithCallAnalysis).mockResolvedValue({
+      aggregate: { totalRecords: 1 },
+      status: "failed",
+      cacheable: false,
+    } as never);
+    const { POST } = await import("@/app/api/analytics/route");
+    const res = await POST(req({ batchIds: ["b1"] }));
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ aggregates: { totalRecords: 1 } });
+    expect(setAggregates).not.toHaveBeenCalled();
   });
 });

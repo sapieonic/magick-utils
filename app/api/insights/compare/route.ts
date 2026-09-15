@@ -3,33 +3,42 @@ import { env, isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { consumeAiQuota, getAggregates, getInsight, getRecords, setAggregates, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 import { diffAggregates } from "@/lib/diff";
 import { aggregatesKey, compareKey } from "@/lib/server/fingerprint";
 import { datasetFingerprint } from "@/lib/server/dataset";
 import { getLLM, INSIGHT_SCHEMA, type ChatMessage } from "@/lib/server/llm";
-import type { AggregatesDiff, AggregatesDoc, Insight, TenantContext } from "@/lib/server/types";
+import type { AggregatesDiff, AggregatesDoc, BatchDoc, Insight, TenantContext } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
 import { parseBatchIds, selectionErrorResponse, validateSelection } from "@/lib/server/selection";
+import type { SelType } from "@/lib/types";
 import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /** Ensure aggregates exist for a batch set, computing-on-miss from ingested
- *  records (parity with /api/analytics). Returns null when nothing is ingested
- *  so the caller can surface a 409. */
-async function ensureAggregates(ctx: TenantContext, batchIds: string[]): Promise<{ aggregate: AggregatesDoc; dataset: string } | null> {
+ *  records (parity with /api/analytics, call-analysis enrichment included —
+ *  `topicShifts` and `sentimentShift` in the diff are computed from exactly
+ *  those two series, so an un-enriched side would report every topic as a
+ *  100% swing against a side that had them). Returns null when nothing is
+ *  ingested so the caller can surface a 409. */
+async function ensureAggregates(
+  ctx: TenantContext,
+  batchIds: string[],
+  selType: SelType | undefined,
+): Promise<{ aggregate: AggregatesDoc; dataset: string } | null> {
   const dataset = await datasetFingerprint(ctx, batchIds);
   const key = aggregatesKey(batchIds, dataset);
   const cached = await getAggregates(ctx.tenantId, ctx.accountId, key);
   if (cached) return { aggregate: cached, dataset };
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
   if (records.length === 0) return null;
-  const agg = computeAggregates(records, batchIds, ctx, key);
-  await setAggregates(agg);
-  return { aggregate: agg, dataset };
+  const { aggregate, cacheable } = await enrichWithCallAnalysis(ctx, selType, computeAggregates(records, batchIds, ctx, key));
+  if (cacheable) await setAggregates(aggregate);
+  return { aggregate, dataset };
 }
 
 /** Compacted diff for the prompt — rounds money/percentages and keeps only the
@@ -78,13 +87,15 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   }
   let batchIds: string[];
   let baselineBatchIds: string[];
+  let batches: BatchDoc[];
   try {
     batchIds = parseBatchIds(body?.batchIds);
     if (body?.baselineBatchIds == null || (Array.isArray(body.baselineBatchIds) && body.baselineBatchIds.length === 0)) {
       return NextResponse.json({ error: "no_baseline", message: "Select a baseline." }, { status: 400 });
     }
     baselineBatchIds = parseBatchIds(body?.baselineBatchIds);
-    await validateSelection(ctx, [...new Set([...batchIds, ...baselineBatchIds])], { requireReady: true, verifyCounts: true });
+    // Validated as one set, so both selections are proven to share a selType.
+    batches = await validateSelection(ctx, [...new Set([...batchIds, ...baselineBatchIds])], { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -92,7 +103,11 @@ export const POST = withLogging("insights-compare", async (req: Request) => {
   }
   const model = env.llm.model;
 
-  const [current, baseline] = await Promise.all([ensureAggregates(ctx, batchIds), ensureAggregates(ctx, baselineBatchIds)]);
+  const selType = batches[0]?.selType;
+  const [current, baseline] = await Promise.all([
+    ensureAggregates(ctx, batchIds, selType),
+    ensureAggregates(ctx, baselineBatchIds, selType),
+  ]);
   if (!current || !baseline) {
     log().warn({ hasCurrent: Boolean(current), hasBaseline: Boolean(baseline) }, "comparison requested for un-ingested batches");
     return NextResponse.json({ error: "not_ingested", message: "Run ingestion on both selections first." }, { status: 409 });

@@ -3,11 +3,12 @@ import { env, isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { consumeAiQuota, getAggregates, getInsight, getRecords, setAggregates, setInsight } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 import { aggregatesKey, batchSetKey } from "@/lib/server/fingerprint";
 import { datasetFingerprint } from "@/lib/server/dataset";
 import { bestReachWindow } from "@/lib/reach";
 import { getLLM, INSIGHT_SCHEMA, type ChatMessage } from "@/lib/server/llm";
-import type { AggregatesDoc, Insight } from "@/lib/server/types";
+import type { AggregatesDoc, BatchDoc, Insight } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
@@ -68,9 +69,10 @@ export const POST = withLogging("insights", async (req: Request) => {
     return NextResponse.json({ error: "invalid_refresh" }, { status: 400 });
   }
   let batchIds: string[];
+  let batches: BatchDoc[];
   try {
     batchIds = parseBatchIds(body?.batchIds);
-    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    batches = await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -97,8 +99,12 @@ export const POST = withLogging("insights", async (req: Request) => {
       log().warn({ batchCount: batchIds.length }, "insight requested for un-ingested batches");
       return NextResponse.json({ error: "not_ingested", message: "Run ingestion first." }, { status: 409 });
     }
-    agg = computeAggregates(records, batchIds, ctx, aggKey);
-    await setAggregates(agg);
+    // Enrich on the same terms as /api/analytics: the insight prose reads
+    // `agg.topics`/`agg.sentiment`, so an un-enriched doc here would have the AI
+    // tell the customer there are no key topics on the very screen charting them.
+    const enriched = await enrichWithCallAnalysis(ctx, batches[0]?.selType, computeAggregates(records, batchIds, ctx, aggKey));
+    agg = enriched.aggregate;
+    if (enriched.cacheable) await setAggregates(agg);
   }
 
   if (!(await consumeAiQuota(ctx.tenantId, ctx.accountId, "insight", 20))) {

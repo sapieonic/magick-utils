@@ -2,11 +2,12 @@ import { isBackendConfigured, isLlmConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { consumeAiQuota, getAggregates, getRecords } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 import { aggregatesKey } from "@/lib/server/fingerprint";
 import { datasetFingerprint } from "@/lib/server/dataset";
 import { bestReachWindow } from "@/lib/reach";
 import { getLLM, type ChatMessage } from "@/lib/server/llm";
-import type { AggregatesDoc } from "@/lib/server/types";
+import type { AggregatesDoc, BatchDoc } from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
@@ -78,9 +79,10 @@ export const POST = withLogging("chat", async (req: Request) => {
   }
   if (historyBytes > 20_000) return Response.json({ error: "history_too_long" }, { status: 400 });
   let batchIds: string[];
+  let batches: BatchDoc[];
   try {
     batchIds = parseBatchIds(body?.batchIds);
-    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    batches = await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -95,7 +97,12 @@ export const POST = withLogging("chat", async (req: Request) => {
   let agg = await getAggregates(ctx.tenantId, ctx.accountId, key);
   if (!agg) {
     const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
-    if (records.length > 0) agg = computeAggregates(records, batchIds, ctx, key);
+    // Same enrichment as the chart, so the chat box cannot answer "no key
+    // topics" about a selection whose Key topics card is populated. This path
+    // has never persisted what it computes; that is left as it was.
+    if (records.length > 0) {
+      agg = (await enrichWithCallAnalysis(ctx, batches[0]?.selType, computeAggregates(records, batchIds, ctx, key))).aggregate;
+    }
   }
   if (!agg) {
     return Response.json({ error: "not_ingested", message: "Ingest the selected batches before asking AI." }, { status: 409 });

@@ -3,6 +3,7 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext } from "@/lib/server/session";
 import { getAggregates, getRecords, setAggregates } from "@/lib/server/repositories";
 import { computeAggregates } from "@/lib/server/aggregate";
+import { enrichWithCallAnalysis } from "@/lib/server/call-analysis";
 import { aggregatesKey } from "@/lib/server/fingerprint";
 import { datasetFingerprint } from "@/lib/server/dataset";
 import { withLogging } from "@/lib/server/http-log";
@@ -10,6 +11,7 @@ import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
 import { parseBatchIds, selectionErrorResponse, validateSelection } from "@/lib/server/selection";
 import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
+import type { BatchDoc } from "@/lib/server/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,9 +36,10 @@ export const POST = withLogging("analytics", async (req: Request) => {
     return NextResponse.json({ error: "invalid_refresh" }, { status: 400 });
   }
   let batchIds: string[];
+  let batches: BatchDoc[];
   try {
     batchIds = parseBatchIds(body?.batchIds);
-    await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
+    batches = await validateSelection(ctx, batchIds, { requireReady: true, verifyCounts: true });
   } catch (error) {
     const response = selectionErrorResponse(error);
     if (response) return response;
@@ -59,8 +62,17 @@ export const POST = withLogging("analytics", async (req: Request) => {
   // That is a valid answer: 409-ing it surfaced as a hard error on screen and
   // pushed the client into a pointless re-ingest.
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
-  const agg = computeAggregates(records, batchIds, ctx, key);
-  await setAggregates(agg);
+  // Sentiment and key topics cannot come from the records — core's calls list
+  // does not carry `call_analysis` — so they are filled from core's own rollup
+  // here. `cacheable` is false only when that upstream call failed: the cache
+  // key cannot change in response to a downstream error, so persisting a failed
+  // enrichment would pin the two empty cards until someone hit Refresh.
+  const { aggregate: agg, cacheable } = await enrichWithCallAnalysis(
+    ctx,
+    batches[0]?.selType,
+    computeAggregates(records, batchIds, ctx, key),
+  );
+  if (cacheable) await setAggregates(agg);
   log().info(
     { batchCount: batchIds.length, recordCount: records.length, key, refresh: Boolean(body.refresh) },
     "analytics aggregates computed",

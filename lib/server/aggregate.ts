@@ -14,6 +14,24 @@ import {
 import type { AggregatesDoc, NormalizedRecord, TenantContext } from "./types";
 import { normalizeStatus } from "./normalize";
 
+/** How many "Key topics" rows the Conversation tab shows. Exported because the
+ *  same cap has to apply to the record-derived topics below and to the ones
+ *  `call-analysis.ts` reads from core — two different sources feeding one card
+ *  that must not change length depending on which one answered. */
+export const MAX_TOPICS = 9;
+
+/** Sentiment labels the Conversation donut has colours for, in the order it
+ *  draws them. Anything else the analysis model emits is still charted (grey),
+ *  just after these — dropping a real label would understate the total. */
+export const SENTIMENT_ORDER = ["positive", "neutral", "negative"] as const;
+
+/** Title-case a sentiment label for display: the aggregate stores the labels the
+ *  UI renders, and the two sources spell them differently (our record-derived
+ *  path lowercases; core returns whatever the model wrote). */
+export function sentimentDisplayName(label: string): string {
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 /** Status bucket for aggregation. Re-derived from the record's original upstream
  *  status (`raw.status`) rather than the persisted `status`, so changes to the
  *  status vocabulary apply to already-ingested records without re-pulling from
@@ -220,8 +238,8 @@ export function computeAggregates(
   for (const r of records) {
     if (r.sentiment) sentCounts.set(r.sentiment.toLowerCase(), (sentCounts.get(r.sentiment.toLowerCase()) ?? 0) + 1);
   }
-  const sentiment = ["positive", "neutral", "negative"]
-    .map((name) => ({ name: name[0].toUpperCase() + name.slice(1), value: sentCounts.get(name) ?? 0 }))
+  const sentiment = SENTIMENT_ORDER
+    .map((name) => ({ name: sentimentDisplayName(name), value: sentCounts.get(name) ?? 0 }))
     .filter((s) => s.value > 0);
 
   // topics
@@ -231,7 +249,7 @@ export function computeAggregates(
   }
   const topics = [...topicCounts.entries()]
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 9)
+    .slice(0, MAX_TOPICS)
     .map(([topic, count]) => ({ topic, count, sentiment: "neutral" }));
 
   // messaging funnel

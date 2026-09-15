@@ -219,6 +219,30 @@ export interface StatusSummaryResponse {
   [batchId: string]: Record<string, number>;
 }
 
+/** The two post-call-analysis rollups we read out of magick-master's merged
+ *  bulk-dispatch analytics (`POST /bulk-dispatch-jobs/analytics`, which fans out
+ *  to core's `/calls/batch-analytics`).
+ *
+ *  This endpoint exists because the per-record read path cannot carry them:
+ *  core's calls LIST projects a column subset that deliberately excludes the
+ *  heavy `call_analysis` JSONB, and its formatter sends `call_analysis: null`
+ *  rather than omitting the key — so every listed call looks like a call with no
+ *  analysis. Core aggregates these in SQL straight off the blob instead.
+ *
+ *  The response carries far more (totals, duration, cost, outcome and error
+ *  distributions); we type only what we consume and stay defensive about the
+ *  rest, like every other Raw* shape here. */
+export interface RawBatchAnalytics {
+  /** Per-sentiment call counts. Labels are whatever the analysis model wrote —
+   *  normally positive/neutral/negative, but not guaranteed to be either that
+   *  set or that casing. */
+  sentiment_distribution?: { label?: string | null; count?: number | null }[] | null;
+  /** Most frequent detected intents, already ordered by count desc and capped
+   *  upstream (core takes the top 10). */
+  key_topics?: { topic?: string | null; count?: number | null }[] | null;
+  [key: string]: unknown;
+}
+
 // ---------------------------------------------------------------------------
 // Request params
 // ---------------------------------------------------------------------------
@@ -357,6 +381,22 @@ async function raw(url: string, headers: Record<string, string>): Promise<Respon
 
 async function getJson<T>(url: string, headers: Record<string, string>): Promise<T> {
   const res = await raw(url, headers);
+  return (await res.json()) as T;
+}
+
+/** As `getJson`, for the tenant-scoped endpoints that take their arguments in a
+ *  JSON body rather than the query string. */
+async function postJson<T>(url: string, headers: Record<string, string>, body: unknown): Promise<T> {
+  const res = await loggedFetch(url, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json", "x-mgkvc-originator": "magick-analytics" },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const responseBody = await res.text().catch(() => "");
+    throw new MagickApiError(res.status, responseBody, url, res.headers.get("retry-after"));
+  }
   return (await res.json()) as T;
 }
 
@@ -521,6 +561,32 @@ export class MagickClient {
   async getBulkJob(id: string): Promise<RawBulkJob> {
     const url = buildUrl(`/bulk-dispatch-jobs/${encodeURIComponent(id)}`);
     return getJson<RawBulkJob>(url, this.headers());
+  }
+
+  /** Merged post-call-analysis rollups across a set of `ai_voice_call` jobs,
+   *  computed by core over the union of their dispatched batches — so the caller
+   *  gets one exact answer for the whole selection rather than N per-batch
+   *  top-10s it would have to merge approximately.
+   *
+   *  Upstream caps this at 50 job ids, which is exactly `MAX_SELECTION_BATCHES`
+   *  (lib/server/selection.ts) — a selection can never exceed it, and
+   *  `call-analysis.test.ts` pins the two together so raising ours alone turns
+   *  into a failing test rather than a 400 in front of the customer.
+   *
+   *  Every caller treats this as best-effort enrichment, so a 404 reads as
+   *  "nothing to add" rather than an error. Both of its causes are stable rather
+   *  than transient — a master that predates the route, or a selection naming a
+   *  job upstream no longer has — so an empty result for them is a real answer
+   *  and safe to cache. Other non-2xx responses still throw. */
+  async batchAnalytics(jobIds: string[]): Promise<RawBatchAnalytics | null> {
+    if (jobIds.length === 0) return null;
+    const url = buildUrl("/bulk-dispatch-jobs/analytics");
+    try {
+      return await postJson<RawBatchAnalytics>(url, this.headers(), { job_ids: jobIds });
+    } catch (err) {
+      if (err instanceof MagickApiError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   // ---- Status summary (tolerate 404 → null) ----

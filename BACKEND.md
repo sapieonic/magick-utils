@@ -22,16 +22,51 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
 - `types.ts` — contracts: `TenantContext`, `BatchDoc`, `NormalizedRecord`, `Job`, `AggregatesDoc`, `Insight`.
 - `session.ts` — iron-session cookie; `getTenantContext()` (null when not logged in / unconfigured).
 - `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` with
-  `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `exportCallsCsv`).
+  `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `batchAnalytics`,
+  `exportCallsCsv`).
 - `normalize.ts` — core call/message → `NormalizedRecord`; `buildBatchDoc`; dispatch-type mapping.
 - `map.ts` — `BatchDoc` ↔ frontend `Batch`; bulk-job → `BatchDoc`. **Batch is keyed by the upstream source id.**
 - `db.ts` / `repositories.ts` — cached Mongo client, collections, indexes, tenant-scoped repo functions.
 - `aggregate.ts` — compute analytics aggregates from records.
+- `call-analysis.ts` — fills the Conversation tab's Sentiment and Key topics from core's rollup,
+  because the records cannot carry them (see *Sentiment and key topics* below).
 - `fingerprint.ts` — stable hashes for cache keys / change detection.
 - `llm/` — `getLLM()` factory + `OpenAICompatibleProvider` (DeepSeek/Kimi/OpenRouter/vLLM/Ollama) and
   `AnthropicProvider`; `complete`/`stream`/`structured` (Zod-validated, retry-on-parse-fail). `INSIGHT_SCHEMA`.
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
   records, rebuild the `BatchDoc`. Resumable progress via `Job.done`/`cursor`.
+
+### Sentiment and key topics
+
+**These two series do not come from the ingested records, and cannot.** Everything else on the
+Analytics → Conversation tab is derived from `NormalizedRecord`s pulled from magick-master's
+`/proxy/calls` → core's calls LIST. That list projects a column subset which deliberately excludes the
+heavy `call_analysis` JSONB, and core's formatter emits `call_analysis: null` rather than omitting the
+key — so from here every call in the fleet is indistinguishable from a call whose analysis never ran.
+`normalizeCall` writes `sentiment: null` / `keyTopics: null` on every record and both cards render
+their empty state, while duration and talk-time (ordinary list columns) render fine. The analysis
+itself completes normally upstream; this is purely a read-path projection gap.
+
+`call-analysis.ts` therefore asks the one endpoint that can see the blob:
+`POST /bulk-dispatch-jobs/analytics` on magick-master, which fans out to core's
+`/calls/batch-analytics` and aggregates both series in SQL straight off `call_analysis`. Core computes
+over the union of the selection's batches in one query, so the result is exact rather than N per-batch
+top-10s merged approximately here. Notes:
+
+- **AI selections only.** IVR and messaging runs have no conversation to analyse, and magick-master
+  rejects a non-`ai_voice_call` job id with a 400 rather than an empty rollup.
+- **Selection-scoped rollups, not per-record fields.** They cannot reach the CSV export or anything
+  else reading a `NormalizedRecord`. Closing that needs core to project the two values as scalars onto
+  the calls list — which it already does for the WebRTC dialer list (`analysis_sentiment_label` in
+  `WEBRTC_LIST_COLUMNS`), just not for AI calls. The enrichment only ever fills an **empty** series, so
+  when that lands the per-record numbers win and this becomes a no-op.
+- **Best-effort, but never cached when it fails.** The aggregates cache key is a fingerprint of the
+  batch set and its dataset, and neither moves because a downstream call failed — so persisting a
+  failed enrichment would pin the empty cards to a key nothing can invalidate. `cacheable: false`
+  means serve it and recompute next time.
+- Applied at all four aggregate-computing routes (`analytics`, `insights`, `insights/compare`, `chat`)
+  so the AI prose can never contradict the chart beside it.
+- Upstream caps the request at 50 job ids, which is exactly `MAX_SELECTION_BATCHES`.
 
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as

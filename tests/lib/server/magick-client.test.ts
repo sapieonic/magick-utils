@@ -135,3 +135,62 @@ describe("MagickClient.iterateBulkJobs", () => {
     expect(q.get("dispatch_type")).toBe("ivr_call");
   });
 });
+
+// ---------------------------------------------------------------------------
+// batchAnalytics
+// ---------------------------------------------------------------------------
+
+describe("MagickClient.batchAnalytics", () => {
+  /** Capture the single request this method makes. */
+  function stubAnalytics(response: { ok: boolean; status: number; body?: unknown }) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        calls.push({ url, init });
+        return {
+          ok: response.ok,
+          status: response.status,
+          headers: { get: () => null },
+          json: async () => response.body ?? {},
+          text: async () => JSON.stringify(response.body ?? {}),
+        } as unknown as Response;
+      }),
+    );
+    return calls;
+  }
+
+  it("POSTs the job ids as a body and returns the rollups", async () => {
+    const calls = stubAnalytics({
+      ok: true,
+      status: 200,
+      body: { sentiment_distribution: [{ label: "positive", count: 4 }], key_topics: [{ topic: "billing", count: 9 }] },
+    });
+    const out = await new MagickClient(ctx).batchAnalytics(["j1", "j2"]);
+
+    expect(out?.key_topics).toEqual([{ topic: "billing", count: 9 }]);
+    expect(calls).toHaveLength(1);
+    expect(new URL(calls[0].url).pathname).toBe("/bulk-dispatch-jobs/analytics");
+    expect(calls[0].init.method).toBe("POST");
+    // The ids go in the body, not the query string: a selection of 50 batch ids
+    // would otherwise be a URL long enough for an upstream proxy to reject.
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({ job_ids: ["j1", "j2"] });
+    expect((calls[0].init.headers as Record<string, string>)["X-Tenant-Id"]).toBe("t1");
+  });
+
+  it("makes no request for an empty selection", async () => {
+    const calls = stubAnalytics({ ok: true, status: 200 });
+    await expect(new MagickClient(ctx).batchAnalytics([])).resolves.toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("reads a 404 as 'this master has no such route' rather than an error", async () => {
+    stubAnalytics({ ok: false, status: 404 });
+    await expect(new MagickClient(ctx).batchAnalytics(["j1"])).resolves.toBeNull();
+  });
+
+  it("still throws on any other non-2xx", async () => {
+    stubAnalytics({ ok: false, status: 502 });
+    await expect(new MagickClient(ctx).batchAnalytics(["j1"])).rejects.toThrow(/502/);
+  });
+});
