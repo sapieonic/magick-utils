@@ -1,3 +1,10 @@
+## [1.3.6](https://github.com/sapieonic/magick-utils/compare/v1.3.5...v1.3.6) (2026-09-15)
+
+
+### Bug Fixes
+
+* serve Conversation sentiment and key topics from core's analysis rollup ([#36](https://github.com/sapieonic/magick-utils/issues/36)) ([9843cdb](https://github.com/sapieonic/magick-utils/commit/9843cdb972da1f938130df5ce3e8212ca1d54c03))
+
 ## [1.3.5](https://github.com/sapieonic/magick-utils/compare/v1.3.4...v1.3.5) (2026-09-12)
 
 
