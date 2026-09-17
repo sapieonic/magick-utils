@@ -14,13 +14,18 @@ Flags (`lib/server/env.ts`): `isAuthConfigured` (magick-master + SESSION_SECRET)
 
 ## Configure
 Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESSION_SECRET`,
-`MONGODB_URI`, the `LLM_*` set, and the `NEXT_PUBLIC_FIREBASE_*` web config. On boot,
-`instrumentation.ts` ensures Mongo indexes and starts the worker when the backend is configured.
+`MONGODB_URI`, the `LLM_*` set, the `NEXT_PUBLIC_FIREBASE_*` web config, and `FIREBASE_API_KEY`
+(the same key, readable server-side at runtime — see *Token refresh* below; without it sessions
+still work but die after an hour). On boot, `instrumentation.ts` ensures Mongo indexes and starts
+the worker when the backend is configured.
 
 ## Server modules (`lib/server/`)
 - `env.ts` — typed config + the `*Configured` flags.
 - `types.ts` — contracts: `TenantContext`, `BatchDoc`, `NormalizedRecord`, `Job`, `AggregatesDoc`, `Insight`.
-- `session.ts` — iron-session cookie; `getTenantContext()` (null when not logged in / unconfigured).
+- `session.ts` — iron-session cookie; `getTenantContext()` (null when not logged in / unconfigured, and
+  the one place a stored ID token is refreshed before use — see *Token refresh*).
+- `firebase-token.ts` — exchanges a Firebase refresh token for a fresh ID token via Google's
+  secure-token endpoint; classifies a failure as permanent (re-login) or transient (retry).
 - `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` with
   `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `batchAnalytics`,
   `exportCallsCsv`).
@@ -35,6 +40,47 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
   `AnthropicProvider`; `complete`/`stream`/`structured` (Zod-validated, retry-on-parse-fail). `INSIGHT_SCHEMA`.
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
   records, rebuild the `BatchDoc`. Resumable progress via `Job.done`/`cursor`.
+
+### Token refresh
+
+A Firebase ID token lives **one hour**; the session cookie lives eight. That gap was a live bug, not a
+theoretical one: for seven of every eight hours the cookie carried a credential magick-master had
+already stopped accepting, so `/campaigns` 401'd and bounced the user to `/login` mid-session, and any
+ingest still running an hour after login died and **discarded its staged revision**.
+
+The credential is now refreshed instead of being allowed to expire under a longer-lived cookie. Three
+places cooperate, and they are deliberately independent so that losing one degrades rather than breaks:
+
+1. **The browser** (`components/SessionRefresher.tsx`, mounted in `app/(app)/layout.tsx`) keeps a
+   Firebase `onIdTokenChanged` subscription alive and re-posts each new token to `POST /api/auth/refresh`.
+   This matters more than it looks: `lib/firebase.ts` used to be imported *only* by `app/login/page.tsx`,
+   so outside `/login` no `Auth` object existed and the SDK's own refresh scheduler never ran at all.
+   A `visibilitychange` check covers the sleeping-laptop case, where no timer fires for hours.
+2. **Every route handler**, via `getTenantContext()`. It re-mints a near-expired token from the stored
+   refresh token before handing it to any caller. This is why campaigns, ingest, export and analytics
+   all inherit the fix with no per-route logic — and why reaching into `session.idToken` directly is a
+   bug that reintroduces the one-hour cliff.
+3. **The ingestion worker**, which carries the refresh token on the job so a long run can re-mint
+   mid-flight rather than dying at the hour mark.
+
+`firebase-token.ts` splits failures the same way `call-analysis.ts` splits settled from momentary, and
+for the same reason: a **transient** failure (5xx, network, timeout) must keep the session and retry —
+Google being briefly unreachable must not sign everyone out — while a **permanent** one (`TOKEN_EXPIRED`,
+`USER_DISABLED`, `USER_NOT_FOUND`, `INVALID_REFRESH_TOKEN`) clears the session, because retrying a
+revoked credential forever is worse than asking for a login. An *unrecognised* 400 is treated as
+transient on purpose: guessing "permanent" wrongly signs a working user out.
+
+Notes for anyone changing this:
+- **The refresh token is a long-lived credential at rest.** Unlike the ID token it does not expire. Two
+  things keep storing it on a job acceptable and both are load-bearing: `deleteJobsOlderThan` sweeps
+  jobs within `DATA_RETENTION_DAYS`, and `REDACT_PATHS` (`logger.ts`) keeps it out of log storage.
+- **Cookie budget.** iron-session *throws* above 4096 bytes. The session already holds an ID token
+  (~1KB), the refresh token, and a `tenants[]` array with nested accounts. `getTenantContext()`
+  therefore tolerates a failed save rather than letting one oversized cookie 500 every screen.
+- **`ttl`, not `cookieOptions.maxAge`.** Setting `maxAge` yourself takes an iron-session branch that
+  leaves `ttl` at its 14-day default and derives neither value from the other — which left the seal
+  replayable for ~13 days after the browser dropped the cookie. Passing `ttl` alone derives
+  `maxAge = ttl - 60`.
 
 ### Sentiment and key topics
 
@@ -240,8 +286,10 @@ mock/canned output when the backend/LLM is off.
    (Everything is read-only against magick-master; only our own Mongo is written.)
 
 ## Known V1 tradeoffs (iterate later)
-- The caller's Firebase ID token is stored on ingest jobs so the worker can act on their behalf — fine
-  for an internal tool; revisit with refresh tokens / a service credential for long-running jobs.
+- ~~The caller's Firebase ID token is stored on ingest jobs — revisit with refresh tokens.~~ **Done**:
+  jobs now carry a refresh token and re-mint mid-run (see *Token refresh*). What remains deferred is a
+  **service credential** for background jobs, which would decouple ingestion from any user's session
+  entirely; it needs a magick-master-side change, so it is tracked separately.
 - Batch id = upstream source id (a UUID) for key consistency; `humanBatchId()` exists for a prettier
   display id later.
 - `statusSummary` proxy path is best-effort (tolerates 404). Fingerprints currently recompute from

@@ -54,7 +54,14 @@ revisions once with `resolvePublishedRecordsFilter` and pass that to both; resol
 refresh publish in between and the two disagree.
 
 `DATA_RETENTION_DAYS` (default 5) is the ceiling on how far back Dashboard and Analytics can see —
-older batches are deleted with every record they own.
+older batches are deleted with every record they own. It is also what bounds how long a job's stored
+Firebase **refresh token** sits at rest, so `deleteJobsOlderThan` is a security control, not just
+housekeeping.
+
+The Firebase ID token in the session cookie is **perishable — one hour, under an eight-hour cookie**.
+Never read `session.idToken` directly for an upstream call; go through `getTenantContext()`, which is
+the single place a near-expired token is re-minted. Reaching past it reintroduces the 1-hour cliff that
+bounced customers to `/login` mid-session. See BACKEND.md → *Token refresh*.
 
 The Conversation tab's **Sentiment and Key topics cannot be computed from the records** — core's calls
 list omits the `call_analysis` JSONB from its projection and sends the key as `null`, so every record
@@ -78,7 +85,11 @@ doc. See BACKEND.md → *Sentiment and key topics*.
   backend/LLM is off, so the UI still runs with no env.
 - ✅ Firebase login wired (`lib/firebase.ts`: Google + email sign-in → ID token exchanged by the BFF).
   No-ops cleanly when `NEXT_PUBLIC_FIREBASE_*` is unset (mock mode / token-paste testing).
-- ⏳ Deferred (noted in `BACKEND.md`): token refresh for long jobs, prettier batch ids, GridFS export retention.
+- ✅ Token refresh (see `BACKEND.md` → *Token refresh*). A Firebase ID token lives 1h under an 8h
+  cookie; it is now re-minted from a stored refresh token by the browser, by `getTenantContext()` on
+  every route, and by the worker mid-job. Set `FIREBASE_API_KEY` server-side to enable it.
+- ⏳ Deferred (noted in `BACKEND.md`): a service credential for background jobs (needs a magick-master
+  change), prettier batch ids, GridFS export retention.
 
 ## Conventions
 - Demo mode (backend off) has to answer the same controls as live mode. Seeded data has no records for
