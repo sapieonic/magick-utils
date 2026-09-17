@@ -2,11 +2,18 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/server/env", () => ({
   isAuthConfigured: vi.fn(),
+  // The real `sessionIsLive` consults this to decide whether an expired ID token
+  // can still be re-minted, so the double has to answer it or the me-route throws.
+  isTokenRefreshConfigured: vi.fn(() => true),
 }));
 
-vi.mock("@/lib/server/session", () => ({
-  getSession: vi.fn(),
-}));
+// Only `getSession` is faked: `stampCredential` and `sessionIsLive` are the real
+// implementations, so these tests assert on what the routes actually write to
+// (and read back from) a session rather than on a double that agrees with them.
+vi.mock("@/lib/server/session", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/server/session")>("@/lib/server/session");
+  return { ...actual, getSession: vi.fn() };
+});
 
 // magick-client exports authSession + MagickApiError; the session route imports both.
 vi.mock("@/lib/server/magick-client", async () => {
@@ -21,7 +28,7 @@ vi.mock("@/lib/server/magick-client", async () => {
   return { authSession: vi.fn(), MagickApiError };
 });
 
-import { isAuthConfigured } from "@/lib/server/env";
+import { isAuthConfigured, isTokenRefreshConfigured } from "@/lib/server/env";
 import { getSession } from "@/lib/server/session";
 import { authSession, MagickApiError } from "@/lib/server/magick-client";
 
@@ -38,6 +45,14 @@ function fakeSession(initial: Record<string, unknown> = {}) {
     save: vi.fn().mockResolvedValue(undefined),
     destroy: vi.fn(),
   } as Record<string, unknown> & { save: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> };
+}
+
+/** A structurally valid (unsigned) Firebase-shaped ID token with a chosen `exp`.
+ *  Nothing under test verifies signatures — only the `exp` claim is read — so
+ *  this is enough to drive the real expiry logic instead of stubbing it. */
+function jwt(expiresAtMs: number): string {
+  const payload = Buffer.from(JSON.stringify({ exp: Math.floor(expiresAtMs / 1000) })).toString("base64url");
+  return `header.${payload}.signature`;
 }
 
 describe("POST /api/auth/session", () => {
@@ -87,6 +102,21 @@ describe("POST /api/auth/session", () => {
     ]);
     expect(session.idToken).toBe("good-token");
     expect(session.save).toHaveBeenCalled();
+  });
+
+  it("stores the refresh token and the token's expiry alongside the id token", async () => {
+    vi.mocked(isAuthConfigured).mockReturnValue(true);
+    vi.mocked(authSession).mockResolvedValue({ user: { id: "u1" }, tenants: [] } as never);
+    const session = fakeSession();
+    vi.mocked(getSession).mockResolvedValue(session as never);
+
+    const { POST } = await import("@/app/api/auth/session/route");
+    const res = await POST(req({ idToken: jwt(Date.now() + 3_600_000), refreshToken: "refresh-1" }));
+    expect(res.status).toBe(200);
+    // Without these the cookie outlives its credential by seven hours: nothing
+    // can re-mint the ID token and nothing can tell that it has died.
+    expect(session.refreshToken).toBe("refresh-1");
+    expect(typeof session.idTokenExp).toBe("number");
   });
 
   it("coerces nested accounts (incl. account_id / memberships variants)", async () => {
@@ -272,6 +302,51 @@ describe("GET /api/auth/me", () => {
       tenants: [{ id: "t1" }],
       context: { tenantId: "t1", accountId: "a1" },
     });
+  });
+
+  it("401s and clears the cookie for an expired token with no way to re-mint it", async () => {
+    vi.mocked(isAuthConfigured).mockReturnValue(true);
+    // No refresh token: the ID token's own hour is all this session ever had, and
+    // it is gone. Answering "authenticated" here is what let the app shell admit
+    // the user and leave the first campaigns fetch to eject them mid-screen.
+    const session = fakeSession({ idToken: jwt(Date.now() - 60_000), user: { id: "u1" } });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    const { GET } = await import("@/app/api/auth/me/route");
+    const res = await GET(new Request("http://localhost/api/auth/me"));
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({ authenticated: false });
+    expect(session.destroy).toHaveBeenCalled();
+  });
+
+  it("stays authenticated on an expired token when a refresh token can re-mint it", async () => {
+    vi.mocked(isAuthConfigured).mockReturnValue(true);
+    vi.mocked(isTokenRefreshConfigured).mockReturnValue(true);
+    // An expired ID token is not an expired session when the server can mint a
+    // new one — getTenantContext() does exactly that on the next upstream call.
+    const session = fakeSession({
+      idToken: jwt(Date.now() - 60_000),
+      refreshToken: "refresh-1",
+      tenantId: "t1",
+      accountId: "a1",
+    });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    const { GET } = await import("@/app/api/auth/me/route");
+    const res = await GET(new Request("http://localhost/api/auth/me"));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ authenticated: true });
+    expect(session.destroy).not.toHaveBeenCalled();
+  });
+
+  it("401s an expired token when the deployment cannot refresh at all", async () => {
+    vi.mocked(isAuthConfigured).mockReturnValue(true);
+    // No Firebase Web API key server-side ⇒ the stored refresh token is unusable.
+    vi.mocked(isTokenRefreshConfigured).mockReturnValue(false);
+    const session = fakeSession({ idToken: jwt(Date.now() - 60_000), refreshToken: "refresh-1" });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    const { GET } = await import("@/app/api/auth/me/route");
+    const res = await GET(new Request("http://localhost/api/auth/me"));
+    expect(res.status).toBe(401);
+    expect(session.destroy).toHaveBeenCalled();
   });
 
   it("context is null when workspace not selected", async () => {

@@ -52,16 +52,23 @@ export default function LoginPage() {
         setTimeout(() => router.push("/workspace"), 950);
         return;
       }
+      // A real Firebase sign-in also hands over the refresh token, which is what
+      // lets the server re-mint the hour-long ID token for the cookie's full 8h.
+      // The paste flow has an ID token and nothing else; that stays supported and
+      // simply expires with the token it was given, as it always did.
       let token = "";
+      let refreshToken: string | undefined;
       if (via === "token") {
         token = idToken.trim();
         if (!token) throw new Error("Paste a Firebase ID token first.");
       } else if (!isFirebaseConfigured()) {
         throw new Error("Firebase isn't configured. Use the ID-token option below for local testing.");
       } else {
-        token = via === "google" ? await googleSignIn() : await emailSignIn(email, pwd);
+        const cred = via === "google" ? await googleSignIn() : await emailSignIn(email, pwd);
+        token = cred.idToken;
+        refreshToken = cred.refreshToken;
       }
-      await postSession(token);
+      await postSession(token, refreshToken);
       router.push("/workspace");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

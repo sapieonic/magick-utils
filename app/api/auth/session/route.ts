@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { isAuthConfigured } from "@/lib/server/env";
 import { authSession, MagickApiError, type RawTenant } from "@/lib/server/magick-client";
-import { getSession, type SessionTenant } from "@/lib/server/session";
+import { getSession, stampCredential, type SessionTenant } from "@/lib/server/session";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 
@@ -31,7 +31,7 @@ export const POST = withLogging("auth/session", async (req: Request) => {
   if (!isAuthConfigured()) {
     return NextResponse.json({ error: "auth_not_configured" }, { status: 503 });
   }
-  let body: { idToken?: string };
+  let body: { idToken?: string; refreshToken?: string };
   try {
     body = await req.json();
   } catch {
@@ -50,7 +50,11 @@ export const POST = withLogging("auth/session", async (req: Request) => {
       accounts: coerceAccounts(t),
     }));
     const session = await getSession();
-    session.idToken = body.idToken;
+    // Stamp the credential rather than assigning `idToken`, so the session also
+    // caches the token's expiry and keeps the refresh token that lets the server
+    // re-mint it. A login that recorded only the ID token left the cookie holding
+    // a credential that died an hour into its eight-hour life.
+    stampCredential(session, body.idToken, body.refreshToken);
     session.user = {
       email: (res.user?.email as string | undefined) ?? undefined,
       name: (res.user?.name as string | undefined) ?? undefined,

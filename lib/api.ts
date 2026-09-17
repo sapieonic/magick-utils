@@ -332,12 +332,19 @@ export interface SessionTenantInfo {
 }
 
 /** Exchange a Firebase ID token for a BFF session. Returns the tenants the user
- *  belongs to (for the workspace picker), or throws with a readable message. */
-export async function postSession(idToken: string): Promise<{ tenants: SessionTenantInfo[] }> {
+ *  belongs to (for the workspace picker), or throws with a readable message.
+ *
+ *  Pass `refreshToken` whenever the sign-in produced one: the ID token dies after
+ *  an hour and the session cookie lives eight, so it is the refresh token that
+ *  lets the server keep the cookie's credential alive for the rest of them. */
+export async function postSession(
+  idToken: string,
+  refreshToken?: string,
+): Promise<{ tenants: SessionTenantInfo[] }> {
   const res = await fetch("/api/auth/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ idToken }),
+    body: JSON.stringify(refreshToken ? { idToken, refreshToken } : { idToken }),
   });
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
@@ -377,6 +384,27 @@ export async function postContext(tenantId: string, accountId: string): Promise<
     const j = await res.json().catch(() => ({}));
     throw new Error(j.error ? `${j.error}` : `context ${res.status}`);
   }
+}
+
+/** Hand a freshly minted Firebase ID token to the BFF so the session cookie
+ *  stops carrying a dead one. Called by `SessionRefresher` on every
+ *  `onIdTokenChanged` and on every tab wake — never by a screen.
+ *
+ *  Deliberately NOT `postSession`: that route re-runs the login exchange, resets
+ *  `tenants` and writes a "login" log line, so routing an hourly refresh through
+ *  it would invent a login event every hour. Returns false when the hand-off
+ *  didn't stick (the 401 case has already redirected to /login, because the
+ *  server destroys a session whose credential upstream refuses) so the caller
+ *  knows not to record the token as delivered.
+ */
+export async function postRefresh(idToken: string, refreshToken?: string): Promise<boolean> {
+  const res = await fetch("/api/auth/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(refreshToken ? { idToken, refreshToken } : { idToken }),
+  });
+  if (handleSessionExpiry(res)) return false;
+  return res.ok;
 }
 
 export interface SessionUserInfo {
