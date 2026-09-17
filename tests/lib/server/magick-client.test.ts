@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/server/env", () => ({
   env: { magickMasterBaseUrl: "https://mm.test" },
   isAuthConfigured: () => true,
+  isTokenRefreshConfigured: () => true,
 }));
 vi.mock("@/lib/server/logger", () => ({
   log: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),

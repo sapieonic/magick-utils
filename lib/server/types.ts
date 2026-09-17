@@ -163,6 +163,13 @@ export interface Job {
   batchIndex?: number;
   retryAt?: string | null;
   retryCount?: number;
+  /** Deferrals caused by a CREDENTIAL problem, counted separately from
+   *  `retryCount`. The two backoffs are independent: a large ingest legitimately
+   *  hits rate limits many times, and sharing one counter would spend a long
+   *  job's entire auth grace on throttling it already survived — landing the
+   *  penalty on exactly the jobs most likely to outlive their token and most
+   *  worth rescuing. */
+  authRetryCount?: number;
   leaseUntil?: string | null;
   leaseId?: string | null;
   fingerprint?: string;

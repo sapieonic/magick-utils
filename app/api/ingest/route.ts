@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isBackendConfigured } from "@/lib/server/env";
-import { getSession, getTenantContext } from "@/lib/server/session";
+import { getTenantContext } from "@/lib/server/session";
 import { MagickClient } from "@/lib/server/magick-client";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
 import {
@@ -10,6 +10,7 @@ import {
   createJob,
   findActiveJobForBatches,
   IngestionConflictError,
+  refreshJobCredential,
   releaseIngestionLocks,
 } from "@/lib/server/repositories";
 import { isBatchReadable, type BatchDoc, type Job, type JobType, type TenantContext } from "@/lib/server/types";
@@ -157,6 +158,20 @@ export const POST = withLogging("ingest", async (req: Request) => {
         { status: 409 },
       );
     }
+    // Hand the running job this request's credential. `getTenantContext()` has
+    // already re-minted it if it was near expiry, so it is good for another
+    // hour, whereas the job may still be carrying the one it was enqueued with —
+    // which is exactly the token that expires mid-ingestion and used to take the
+    // whole staged revision down with it. A reattach after signing back in is
+    // therefore what un-sticks a job the worker has been deferring.
+    await refreshJobCredential(ctx.tenantId, ctx.accountId, activeJob.jobId, {
+      idToken: ctx.idToken,
+      refreshToken: ctx.refreshToken,
+    }).catch((error) => {
+      // Best-effort: the job is still running on its own token and the reattach
+      // itself must not fail over this.
+      log().warn({ error, jobId: activeJob.jobId }, "could not refresh the running job's credential");
+    });
     // Let a reloaded screen/modal reattach to the existing compatible work
     // instead of remaining blocked until it finishes in the background.
     return NextResponse.json({
@@ -172,7 +187,6 @@ export const POST = withLogging("ingest", async (req: Request) => {
   let total = 0;
   for (const id of batchIds) total += batchDocs[requestedBatchIds.indexOf(id)].total;
 
-  const session = await getSession();
   const now = new Date().toISOString();
   const jobId = randomUUID();
   const job: Job = {
@@ -180,7 +194,13 @@ export const POST = withLogging("ingest", async (req: Request) => {
     type,
     tenantId: ctx.tenantId,
     accountId: ctx.accountId,
-    idToken: session.idToken,
+    // Both credentials come from `ctx`, never from a second read of the raw
+    // session: `getTenantContext()` has already replaced a near-expired ID token,
+    // while `session.idToken` can hand the worker one with minutes left on it —
+    // a job that starts by 401ing on its own first page. The refresh token is
+    // what lets the worker mint its own replacements for the rest of the run.
+    idToken: ctx.idToken,
+    refreshToken: ctx.refreshToken,
     batchIds,
     status: "queued",
     total,

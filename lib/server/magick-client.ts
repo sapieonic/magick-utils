@@ -7,7 +7,8 @@
 // described with lightweight `Raw*` interfaces; we stay defensive because upstream
 // fields may be absent. Non-2xx responses throw a typed MagickApiError.
 
-import { env, isAuthConfigured } from "@/lib/server/env";
+import { env, isAuthConfigured, isTokenRefreshConfigured } from "@/lib/server/env";
+import { mintIdToken, type MintedToken } from "@/lib/server/firebase-token";
 import type { TenantContext } from "@/lib/server/types";
 import { log } from "@/lib/server/logger";
 
@@ -468,15 +469,44 @@ export async function listTenantAccounts(
 // Data client (Bearer + X-Tenant-Id + X-Account-Id)
 // ---------------------------------------------------------------------------
 
-export class MagickClient {
-  private readonly ctx: TenantContext;
+export interface MagickClientOptions {
+  /** Called once per successful mid-flight re-mint, with the credential this
+   *  client switched to.
+   *
+   *  Exists for the ingestion worker, which must write the new pair back onto
+   *  its job document. Google MAY rotate the refresh token on exchange, and a
+   *  rotated value dropped here leaves the stored job holding a credential that
+   *  is refused the next time it is used — the failure this whole path exists to
+   *  remove, reintroduced an hour later. Persisting the ID token too means a
+   *  crash/lease recovery resumes with a token that still has most of its hour
+   *  left instead of re-minting immediately.
+   *
+   *  Awaited but never allowed to fail a request: the client already holds a
+   *  working token whether or not the caller managed to store it. */
+  onCredentialRefresh?: (credential: MintedToken) => void | Promise<void>;
+}
 
-  constructor(ctx: TenantContext) {
-    this.ctx = ctx;
+export class MagickClient {
+  private ctx: TenantContext;
+  private readonly onCredentialRefresh?: (credential: MintedToken) => void | Promise<void>;
+
+  constructor(ctx: TenantContext, options: MagickClientOptions = {}) {
+    // Copied, not aliased: a re-mint rewrites this client's own credential, and
+    // mutating the caller's context object would hand a silently different token
+    // to everything else that still holds a reference to it.
+    this.ctx = { ...ctx };
+    this.onCredentialRefresh = options.onCredentialRefresh;
   }
 
-  static fromContext(ctx: TenantContext): MagickClient {
-    return new MagickClient(ctx);
+  static fromContext(ctx: TenantContext, options: MagickClientOptions = {}): MagickClient {
+    return new MagickClient(ctx, options);
+  }
+
+  /** The credential this client is currently using — the one it was built with,
+   *  or the replacement it minted mid-run. Read it rather than the context that
+   *  was passed in, which is a snapshot from construction time. */
+  get credential(): { idToken: string; refreshToken?: string } {
+    return { idToken: this.ctx.idToken, refreshToken: this.ctx.refreshToken };
   }
 
   private headers(): Record<string, string> {
@@ -486,6 +516,53 @@ export class MagickClient {
       "X-Account-Id": this.ctx.accountId,
       Accept: "application/json",
     };
+  }
+
+  /** Run an upstream call, and if it comes back 401, mint a fresh ID token and
+   *  run it EXACTLY once more.
+   *
+   *  A Firebase ID token lives one hour. An ingestion that outlives that hour —
+   *  routine for a large campaign — used to start collecting 401s partway
+   *  through and take the job's whole staged revision down with it. Re-minting
+   *  here fixes every caller at once, because `headers()` is the single place a
+   *  token reaches a request.
+   *
+   *  `send` must build its headers from `this.headers()` on each invocation, or
+   *  the retry re-sends the token that was just refused.
+   *
+   *  Once, not "until it works": a refresh token that Google still honours can
+   *  perfectly well mint tokens magick-master keeps rejecting (membership
+   *  revoked, tenant disabled), and looping on that hammers two upstreams with a
+   *  credential that will never be accepted. One retry converts an expired token
+   *  into a live one; a second would only repeat the answer.
+   *
+   *  A mint failure is deliberately NOT swallowed. `TokenRefreshPermanentError`
+   *  and `TokenRefreshTransientError` mean opposite things to the worker (fail
+   *  the job vs. put it back), and collapsing them into the original 401 erases
+   *  the distinction that decides whether a staged revision survives. */
+  private async withFreshToken<T>(send: () => Promise<T>): Promise<T> {
+    try {
+      return await send();
+    } catch (err) {
+      if (!(err instanceof MagickApiError) || err.status !== 401) throw err;
+      // Nothing to mint from — a token-paste test session, or a deployment
+      // without a Firebase Web API key — so the 401 stands. Checking here rather
+      // than letting the exchange fail keeps that case out of the worker's
+      // credential-retry path, where it would defer a job for twenty minutes
+      // over a configuration that cannot change while it waits.
+      if (!this.ctx.refreshToken || !isTokenRefreshConfigured()) throw err;
+      log().warn({ path: logPath(err.url) }, "magick-master rejected the id token; minting a replacement");
+      const minted = await mintIdToken(this.ctx.refreshToken);
+      this.ctx = { ...this.ctx, idToken: minted.idToken, refreshToken: minted.refreshToken };
+      if (this.onCredentialRefresh) {
+        try {
+          await this.onCredentialRefresh(minted);
+        } catch (persistErr) {
+          log().warn({ err: persistErr }, "could not persist the re-minted credential; continuing with it in memory");
+        }
+      }
+      return await send();
+    }
   }
 
   // ---- Calls ----
@@ -498,7 +575,7 @@ export class MagickClient {
       batch_id: params.batchId,
       job_id: params.jobId,
     });
-    return getJson<CallsListResponse>(url, this.headers());
+    return this.withFreshToken(() => getJson<CallsListResponse>(url, this.headers()));
   }
 
   /** Page through all calls (page size 100) until exhausted. */
@@ -525,7 +602,7 @@ export class MagickClient {
       limit: params.limit,
       offset: params.offset,
     });
-    return getJson<MessagesListResponse>(url, this.headers());
+    return this.withFreshToken(() => getJson<MessagesListResponse>(url, this.headers()));
   }
 
   /** Page through all messages (page size 100) until exhausted. */
@@ -552,7 +629,7 @@ export class MagickClient {
       status: params.status,
       dispatch_type: params.dispatchType,
     });
-    return getJson<BulkJobsListResponse>(url, this.headers());
+    return this.withFreshToken(() => getJson<BulkJobsListResponse>(url, this.headers()));
   }
 
   /** Page through all bulk-dispatch jobs (page size 100) until exhausted. The
@@ -577,7 +654,7 @@ export class MagickClient {
 
   async getBulkJob(id: string): Promise<RawBulkJob> {
     const url = buildUrl(`/bulk-dispatch-jobs/${encodeURIComponent(id)}`);
-    return getJson<RawBulkJob>(url, this.headers());
+    return this.withFreshToken(() => getJson<RawBulkJob>(url, this.headers()));
   }
 
   /** Merged post-call-analysis rollups across a set of `ai_voice_call` jobs,
@@ -605,7 +682,9 @@ export class MagickClient {
   async batchAnalytics(jobIds: string[]): Promise<RawBatchAnalytics | null> {
     if (jobIds.length === 0) return null;
     const url = buildUrl("/bulk-dispatch-jobs/analytics");
-    return postJson<RawBatchAnalytics>(url, this.headers(), { job_ids: jobIds }, BATCH_ANALYTICS_TIMEOUT_MS);
+    return this.withFreshToken(() =>
+      postJson<RawBatchAnalytics>(url, this.headers(), { job_ids: jobIds }, BATCH_ANALYTICS_TIMEOUT_MS),
+    );
   }
 
   // ---- Status summary (tolerate 404 → null) ----
@@ -616,7 +695,7 @@ export class MagickClient {
     if (batchIds.length === 0) return {};
     const url = buildUrl("/proxy/calls/status-summary", { batch_ids: batchIds.join(",") });
     try {
-      return await getJson<StatusSummaryResponse>(url, this.headers());
+      return await this.withFreshToken(() => getJson<StatusSummaryResponse>(url, this.headers()));
     } catch (err) {
       if (err instanceof MagickApiError && err.status === 404) return null;
       throw err;
@@ -630,19 +709,26 @@ export class MagickClient {
       start_date: params.startDate,
       end_date: params.endDate,
     });
-    return getJson<StatsResponse>(url, this.headers());
+    return this.withFreshToken(() => getJson<StatsResponse>(url, this.headers()));
   }
 
   // ---- CSV export (returns the raw Response for streaming/piping) ----
 
   /** Returns the raw fetch Response (text/csv) so callers can pipe the body
-   *  stream directly to the client. Throws MagickApiError on non-2xx. */
+   *  stream directly to the client. Throws MagickApiError on non-2xx.
+   *
+   *  Safe to retry despite handing back an unread stream, because the two bodies
+   *  are never the same one: `raw()` drains the REJECTED response with `.text()`
+   *  to build the MagickApiError before it throws, and the retry issues a fresh
+   *  request whose body this client never touches. Nothing here reads the
+   *  successful stream, so the caller still receives it intact — retrying after
+   *  a body had been consumed is what would hand the browser a truncated CSV. */
   async exportCallsCsv(params: ExportCallsParams): Promise<Response> {
     const url = buildUrl("/proxy/calls/export", {
       job_id: params.jobId,
       batch_id: params.batchId,
       fields: params.fields && params.fields.length > 0 ? params.fields.join(",") : undefined,
     });
-    return raw(url, { ...this.headers(), Accept: "text/csv" });
+    return this.withFreshToken(() => raw(url, { ...this.headers(), Accept: "text/csv" }));
   }
 }

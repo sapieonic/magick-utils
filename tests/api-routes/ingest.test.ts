@@ -11,6 +11,7 @@ vi.mock("@/lib/server/repositories", () => ({
   getBatch: vi.fn(),
   countRecords: vi.fn(),
   findActiveJobForBatches: vi.fn().mockResolvedValue(null),
+  refreshJobCredential: vi.fn().mockResolvedValue(true),
   releaseIngestionLocks: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/lib/server/magick-client", () => ({
@@ -22,7 +23,13 @@ const { getBulkJob } = vi.hoisted(() => ({ getBulkJob: vi.fn() }));
 
 import { isBackendConfigured } from "@/lib/server/env";
 import { getTenantContext, getSession } from "@/lib/server/session";
-import { countRecords, createJob, findActiveJobForBatches, getBatch } from "@/lib/server/repositories";
+import {
+  countRecords,
+  createJob,
+  findActiveJobForBatches,
+  getBatch,
+  refreshJobCredential,
+} from "@/lib/server/repositories";
 
 const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" };
 
@@ -134,6 +141,50 @@ describe("POST /api/ingest", () => {
     const res = await POST(req({ batchIds: ["b1"] }));
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ jobId: "active", total: 10, done: 4, ready: false, existing: true });
+  });
+
+  it("hands a reattached job this request's credential", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    // A user who signed back in is the only thing that can rescue a job whose
+    // stamped token has expired; the reattach is when that new token arrives.
+    vi.mocked(getTenantContext).mockResolvedValue({ ...ctx, idToken: "fresh", refreshToken: "r1" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, done: 4, batchIds: ["b1"] } as never);
+    const { POST } = await import("@/app/api/ingest/route");
+    await POST(req({ batchIds: ["b1"] }));
+    expect(refreshJobCredential).toHaveBeenCalledWith("t1", "a1", "active", { idToken: "fresh", refreshToken: "r1" });
+  });
+
+  it("still reattaches when the credential write fails", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue({ ...ctx, refreshToken: "r1" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, done: 4, batchIds: ["b1"] } as never);
+    vi.mocked(refreshJobCredential).mockRejectedValueOnce(new Error("mongo down"));
+    const { POST } = await import("@/app/api/ingest/route");
+    // The job is still running on its own token; the reattach must not 500.
+    const res = await POST(req({ batchIds: ["b1"] }));
+    expect(res.status).toBe(200);
+  });
+
+  it("stamps a new job from the context, not from a second session read", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    // getTenantContext() has already re-minted a near-expired token; reading the
+    // raw session again hands the worker the old one, which is the whole
+    // one-hour cliff this path exists to avoid.
+    vi.mocked(getTenantContext).mockResolvedValue({ ...ctx, idToken: "freshly-minted", refreshToken: "r1" } as never);
+    vi.mocked(getSession).mockResolvedValue({ idToken: "stale-token" } as never);
+    vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    vi.mocked(countRecords).mockResolvedValue(0);
+    const { POST } = await import("@/app/api/ingest/route");
+    await POST(req({ batchIds: ["b1"] }));
+    expect(vi.mocked(createJob).mock.calls[0][0]).toMatchObject({
+      idToken: "freshly-minted",
+      // Without this the worker has no way to mint its own replacement and dies
+      // at the one-hour mark mid-ingestion.
+      refreshToken: "r1",
+    });
   });
 
   it("rejects reattachment when an overlapping job does not cover the full selection", async () => {
