@@ -42,7 +42,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(isFirebaseConfigured).mockReturnValue(true);
   vi.mocked(backendStatus).mockResolvedValue({ backend: true, llm: false });
-  vi.mocked(postRefresh).mockResolvedValue(true);
+  vi.mocked(postRefresh).mockResolvedValue("delivered");
   vi.mocked(currentIdToken).mockResolvedValue(null);
 });
 
@@ -79,7 +79,9 @@ describe("SessionRefresher", () => {
     const watcher = captureWatcher();
     render(<SessionRefresher />);
     await watcher.emit(CRED);
-    await waitFor(() => expect(postRefresh).toHaveBeenCalledWith("id-1", "refresh-1"));
+    // The ID token alone: the refresh token is set once at login and the route
+    // refuses to read one from the page.
+    await waitFor(() => expect(postRefresh).toHaveBeenCalledWith("id-1"));
   });
 
   it("ignores a signed-out notification", async () => {
@@ -105,7 +107,7 @@ describe("SessionRefresher", () => {
 
   it("retries a token whose hand-off failed", async () => {
     const watcher = captureWatcher();
-    vi.mocked(postRefresh).mockResolvedValueOnce(false);
+    vi.mocked(postRefresh).mockResolvedValueOnce("retry");
     render(<SessionRefresher />);
     await watcher.emit(CRED);
     await waitFor(() => expect(postRefresh).toHaveBeenCalledTimes(1));
@@ -113,6 +115,24 @@ describe("SessionRefresher", () => {
     // dead credential until the user was bounced to /login.
     await watcher.emit(CRED);
     await waitFor(() => expect(postRefresh).toHaveBeenCalledTimes(2));
+  });
+
+  it("stops offering a token the route refused", async () => {
+    const watcher = captureWatcher();
+    vi.mocked(postRefresh).mockResolvedValue("refused");
+    render(<SessionRefresher />);
+    await watcher.emit(CRED);
+    await waitFor(() => expect(postRefresh).toHaveBeenCalledTimes(1));
+
+    // A refusal is the server saying it will not take this credential, and it
+    // will say the same next time. Treating that like a transient failure turned
+    // the refresher into an unbounded retry loop — one attempt per token change,
+    // per tab focus, per wake, forever, with no backoff and nothing the user
+    // could see. Re-emitting the same credential must NOT ask again.
+    await watcher.emit(CRED);
+    document.dispatchEvent(new Event("visibilitychange"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(postRefresh).toHaveBeenCalledTimes(1);
   });
 
   it("checks the token when a slept tab comes back", async () => {
@@ -124,7 +144,7 @@ describe("SessionRefresher", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     // A sleeping laptop fires no timers, so the wake path is the only thing that
     // makes the ">1h idle tab" case deterministic.
-    await waitFor(() => expect(postRefresh).toHaveBeenCalledWith("id-wake", "refresh-1"));
+    await waitFor(() => expect(postRefresh).toHaveBeenCalledWith("id-wake"));
   });
 
   it("also checks on window focus", async () => {
@@ -133,7 +153,7 @@ describe("SessionRefresher", () => {
     render(<SessionRefresher />);
     await waitFor(() => expect(watchIdToken).toHaveBeenCalled());
     window.dispatchEvent(new Event("focus"));
-    await waitFor(() => expect(postRefresh).toHaveBeenCalledWith("id-focus", "refresh-1"));
+    await waitFor(() => expect(postRefresh).toHaveBeenCalledWith("id-focus"));
   });
 
   it("unsubscribes and detaches its listeners on unmount", async () => {

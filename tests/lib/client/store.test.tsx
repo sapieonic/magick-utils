@@ -2,7 +2,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
+
+// Signing out now reaches outside this tab — the server session cookie and the
+// Firebase SDK's stored refresh token. Both are stubbed so the store's own
+// behaviour is what these tests observe, and so neither hangs the awaited
+// sign-out.
+vi.mock("@/lib/api", () => ({ postLogout: vi.fn(async () => {}) }));
+vi.mock("@/lib/firebase", () => ({ firebaseSignOut: vi.fn(async () => {}) }));
+
 import { AppProvider, useApp } from "@/lib/store";
+import { postLogout } from "@/lib/api";
+import { firebaseSignOut } from "@/lib/firebase";
 import type { Workspace } from "@/lib/types";
 
 const KEY = "mu_app_state_v1";
@@ -11,6 +21,8 @@ const wrapper = ({ children }: { children: ReactNode }) => <AppProvider>{childre
 
 beforeEach(() => {
   sessionStorage.clear();
+  vi.mocked(postLogout).mockClear();
+  vi.mocked(firebaseSignOut).mockClear();
 });
 
 afterEach(() => {
@@ -83,7 +95,11 @@ describe("signOut", () => {
     // wait until persisted
     await waitFor(() => expect(sessionStorage.getItem(KEY)).not.toBeNull());
 
-    act(() => result.current.signOut());
+    // Awaited: `signOut` is async now, and leaving the act() scope open with an
+    // unsettled promise leaves React's test environment mid-update.
+    await act(async () => {
+      await result.current.signOut();
+    });
     expect(result.current.workspace).toBeNull();
     expect(result.current.combineTargets).toEqual([]);
     expect(result.current.analyzeTargets).toEqual([]);
@@ -100,6 +116,44 @@ describe("signOut", () => {
       expect(parsed.combineTargets).toEqual([]);
       expect(parsed.analyzeTargets).toEqual([]);
     });
+  });
+
+  it("ends the session on the server, not just in this tab", async () => {
+    // It used to clear React state and sessionStorage only. The cookie survived
+    // — and now that the session can renew itself for its whole 8h life, the
+    // next person at a shared machine was silently handed the previous user's
+    // workspace.
+    const { result } = renderHook(() => useApp(), { wrapper });
+
+    await act(async () => {
+      await result.current.signOut();
+    });
+
+    expect(postLogout).toHaveBeenCalledTimes(1);
+    // The SDK keeps a refresh token in IndexedDB that can mint new ID tokens
+    // indefinitely; leaving it behind hands the next visitor a live credential.
+    expect(firebaseSignOut).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resolve until the server session is actually gone", async () => {
+    // Callers navigate to /login the moment this resolves, and /login asks the
+    // server whether this browser is still authenticated. Resolving early races
+    // the Set-Cookie that clears it.
+    let releaseLogout = () => {};
+    vi.mocked(postLogout).mockImplementationOnce(
+      () => new Promise<void>((resolve) => { releaseLogout = resolve; }),
+    );
+    const { result } = renderHook(() => useApp(), { wrapper });
+
+    let settled = false;
+    await act(async () => {
+      const pending = result.current.signOut().then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      releaseLogout();
+      await pending;
+    });
+    expect(settled).toBe(true);
   });
 });
 

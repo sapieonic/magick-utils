@@ -25,9 +25,16 @@ vi.mock("firebase/auth", () => ({
     h.listeners.push(cb);
     return h.unsubscribe;
   }),
+  signOut: vi.fn(async () => {}),
 }));
 
-import { getAuth, onIdTokenChanged, signInWithPopup, signInWithEmailAndPassword } from "firebase/auth";
+import {
+  getAuth,
+  onIdTokenChanged,
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  signOut,
+} from "firebase/auth";
 
 /** A `User` double: `getIdToken(force)` plus the rotating `refreshToken` field. */
 function fakeUser(idToken = "id-1", refreshToken = "refresh-1") {
@@ -69,8 +76,35 @@ describe("lib/firebase with no NEXT_PUBLIC_FIREBASE_* config", () => {
     });
     expect(() => unwatch()).not.toThrow();
     await expect(fb.currentIdToken()).resolves.toBeNull();
+    await expect(fb.firebaseSignOut()).resolves.toBeUndefined();
     expect(getAuth).not.toHaveBeenCalled();
     expect(onIdTokenChanged).not.toHaveBeenCalled();
+    expect(signOut).not.toHaveBeenCalled();
+  });
+});
+
+describe("firebaseSignOut", () => {
+  it("signs the SDK out, clearing the refresh token it keeps in IndexedDB", async () => {
+    // Without this, "Sign out" left the browser holding a credential that can
+    // mint new ID tokens indefinitely — so the refresher could hand the next
+    // person at a shared machine a working session.
+    configure();
+    const fb = await load();
+
+    await fb.firebaseSignOut();
+
+    expect(signOut).toHaveBeenCalledTimes(1);
+    expect(signOut).toHaveBeenCalledWith(h.auth);
+  });
+
+  it("never throws, so the server session is still destroyed", async () => {
+    configure();
+    const fb = await load();
+    vi.mocked(signOut).mockRejectedValueOnce(new Error("already signed out"));
+
+    // Destroying the server cookie is the part that actually matters; failing
+    // here must not abort it.
+    await expect(fb.firebaseSignOut()).resolves.toBeUndefined();
   });
 });
 

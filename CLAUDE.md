@@ -59,9 +59,12 @@ Firebase **refresh token** sits at rest, so `deleteJobsOlderThan` is a security 
 housekeeping.
 
 The Firebase ID token in the session cookie is **perishable — one hour, under an eight-hour cookie**.
-Never read `session.idToken` directly for an upstream call; go through `getTenantContext()`, which is
-the single place a near-expired token is re-minted. Reaching past it reintroduces the 1-hour cliff that
-bounced customers to `/login` mid-session. See BACKEND.md → *Token refresh*.
+Never read `session.idToken` directly for an upstream call; go through `getTenantContext()`, which
+re-mints a near-expired token. The only exception is a route that runs *before* a workspace is chosen
+(`/api/accounts`), which has no tenant/account for `getTenantContext()` to return and uses
+`getFreshIdToken()` instead. Reaching past both reintroduces the 1-hour cliff that bounced customers to
+`/login` mid-session — `/api/accounts` was the last route still doing it, and it bounced anyone who
+clicked "Switch workspace" after idling. See BACKEND.md → *Token refresh*.
 
 The Conversation tab's **Sentiment and Key topics cannot be computed from the records** — core's calls
 list omits the `call_analysis` JSONB from its projection and sends the key as `null`, so every record
@@ -88,8 +91,8 @@ doc. See BACKEND.md → *Sentiment and key topics*.
 - ✅ Token refresh (see `BACKEND.md` → *Token refresh*). A Firebase ID token lives 1h under an 8h
   cookie; it is now re-minted from a stored refresh token by the browser, by `getTenantContext()` on
   every route, and by the worker mid-job. Set `FIREBASE_API_KEY` server-side to enable it.
-- ⏳ Deferred (noted in `BACKEND.md`): a service credential for background jobs (needs a magick-master
-  change), prettier batch ids, GridFS export retention.
+- ⏳ Deferred: a service credential for background jobs (needs a magick-master change) and prettier
+  batch ids, both in `BACKEND.md` → *Known V1 tradeoffs*; GridFS export retention is tracked here only.
 
 ## Conventions
 - Demo mode (backend off) has to answer the same controls as live mode. Seeded data has no records for

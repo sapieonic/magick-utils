@@ -72,10 +72,42 @@ describe("GET /api/jobs/[id]", () => {
       done: 3,
       retryAt: null,
       retryCount: 0,
+      deferReason: null,
       error: null,
       result: null,
       createdAt: "2026-08-12T12:00:00.000Z",
       updatedAt: "2026-08-12T12:01:00.000Z",
     });
+  });
+
+  it("projects why a paused job is paused, without leaking the credential", async () => {
+    // `rate_limited` means "alive, paused, resume at retryAt" for both upstream
+    // throttling and an expired sign-in. Only `deferReason` separates them, and
+    // the Combine screen needs it to tell the customer whether waiting helps.
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getJob).mockResolvedValue({
+      jobId: "j1",
+      type: "merge",
+      tenantId: "t1",
+      accountId: "a1",
+      idToken: "secret",
+      refreshToken: "secret-refresh",
+      status: "rate_limited",
+      total: 10,
+      done: 3,
+      retryAt: "2026-08-12T12:05:00.000Z",
+      retryCount: 0,
+      credentialRetryCount: 2,
+      deferReason: "credential",
+      createdAt: "2026-08-12T12:00:00.000Z",
+      updatedAt: "2026-08-12T12:01:00.000Z",
+    } as never);
+    const { GET } = await import("@/app/api/jobs/[id]/route");
+    const res = await GET(dynReq, params("j1"));
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({ status: "rate_limited", deferReason: "credential" });
+    expect(json).not.toHaveProperty("idToken");
+    expect(json).not.toHaveProperty("refreshToken");
   });
 });

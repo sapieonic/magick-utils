@@ -59,7 +59,7 @@ A BFF over **magick-master**, with state in MongoDB, an in-process ingestion wor
 (`instrumentation.ts` → `lib/server/worker.ts`), a pluggable LLM layer (`lib/server/llm/`), and routes under
 `app/api/*` (auth, campaigns, ingest, jobs, export [streamed CSV], analytics, insights, chat [SSE]).
 
-Everything is gated on env config and degrades gracefully — `GET /api/health` reports `{ ok, backend, llm }`.
+Everything is gated on env config and degrades gracefully — `GET /api/health` reports `{ ok, backend, llm, tokenRefresh }`.
 See [`BACKEND.md`](./BACKEND.md) for module-by-module and route-by-route detail.
 
 ### Domain model
@@ -74,7 +74,10 @@ Copy `.env.example` → `.env.local` and fill in:
 - `MAGICK_MASTER_BASE_URL`, `SESSION_SECRET` (≥32 chars) — auth
 - `MONGODB_URI` — durable state
 - `LLM_API_KEY`, `LLM_MODEL`, (optional) `LLM_BASE_URL`, `LLM_PROJECT_ID` — insights / chat
-- `NEXT_PUBLIC_FIREBASE_*` — web login config
+- `NEXT_PUBLIC_FIREBASE_*` — web login config (**build-time**: inlined into the client bundle)
+- `FIREBASE_API_KEY` — the same Firebase Web API key, read by the server at runtime to re-mint expiring
+  ID tokens. Falls back to `NEXT_PUBLIC_FIREBASE_API_KEY` when that value is in the server's environment
+  too, which is the usual case — see `.env.example`
 - `CRON_SECRET` — shared secret guarding the scheduled cleanup endpoint (see below)
 - `DATA_RETENTION_DAYS` — how long campaign data is kept (default `5`). **This is the limit on how far
   back the Dashboard and Analytics can look**, so raise it if customers need previous months — see
@@ -109,4 +112,13 @@ cluster has already filled up.
 - ✅ Backend V1 built (auth, ingestion worker, MongoDB layer, pluggable LLM, all BFF routes).
 - ✅ All four screens wired through `lib/api.ts` (Campaigns, Dashboard, Combine, Analytics), real
   Firebase login, and `.env.example` credentials. Unset env still falls back to the seeded demo data.
-- ⏳ Token refresh for long-running jobs, prettier batch ids, GridFS export retention (see `BACKEND.md`).
+- ✅ Token refresh. A Firebase ID token lives **one hour** under an eight-hour session cookie; it is now
+  re-minted from a stored refresh token in three independent places — the browser, `getTenantContext()`
+  on every route, and the ingestion worker mid-job — so nobody is bounced to `/login` mid-session and a
+  long ingest no longer dies at the hour mark. Needs a Firebase Web API key the *server* can read
+  (`FIREBASE_API_KEY`, falling back to `NEXT_PUBLIC_FIREBASE_API_KEY`); with neither, sessions still
+  work but expire with the ID token. See [`BACKEND.md`](./BACKEND.md#token-refresh).
+- ⏳ A **service credential** for background jobs, which would decouple ingestion from any user's session
+  entirely — it needs a magick-master-side change, so it is tracked separately (see
+  [`BACKEND.md`](./BACKEND.md) → *Known V1 tradeoffs*). Prettier batch ids and GridFS export retention
+  are likewise deferred.

@@ -44,7 +44,7 @@ The app authenticates users against `magick-master` (Firebase id_token → sessi
   - `analytics.magickvoice.com → <SERVER_IP>`
 - **MongoDB Atlas**: a cluster + database user, with the EC2 public IP added to **Network Access** (IP allowlist)
 - **magick-master** reachable at its base URL (e.g. `https://appi.magickvoice.com`)
-- **Firebase web config** (apiKey / authDomain / projectId / appId) for the login screen
+- **Firebase web config** (apiKey / authDomain / projectId / appId) for the login screen — the apiKey is wanted twice: compiled into the bundle for login, and in the server's environment so sessions can be renewed past the ID token's hour (step 3)
 - **LLM credentials**: an OpenAI-compatible endpoint + key (e.g. NVIDIA NIM, OpenRouter, Moonshot) or an Anthropic key
 
 ## 1. Install Dependencies
@@ -117,7 +117,13 @@ MONGODB_DB=magickutils
 
 # Shared secret guarding POST /api/cron/cleanup, which the daily GitHub Actions
 # workflow calls to prune expired data. Without it the endpoint returns 503 and
-# NOTHING is ever pruned — storage grows until the cluster refuses writes.
+# NOTHING is ever pruned — storage grows until the cluster refuses writes, and
+# the sweep's second job stops too: an ingest job carries the caller's Firebase
+# refresh token (a credential that does NOT expire) so it can re-mint mid-run.
+# The worker drops that token in the same atomic write that ends the job, so the
+# sweep is the backstop for jobs that never reach a terminal state — one paused
+# awaiting a retry, or one whose process was killed mid-run — not the only
+# eraser. DATA_RETENTION_DAYS below bounds how long those sit at rest.
 CRON_SECRET=<32+ char secret>
 
 # How long campaign data is kept, in days. Default 5 when unset.
@@ -136,6 +142,19 @@ LLM_MODEL=moonshotai/kimi-k2-instruct
 LLM_BASE_URL=https://integrate.api.nvidia.com/v1
 LLM_API_KEY=nvapi-...
 
+# Firebase Web API key, read by the SERVER at runtime — the same value as
+# NEXT_PUBLIC_FIREBASE_API_KEY below. It is used only to exchange a stored
+# refresh token for a fresh Firebase ID token, which is what lets an 8h session
+# (and a long ingest job) outlive the ID token's 1h lifetime. The key is public:
+# it identifies the project and authorizes nothing on its own.
+# Usually optional — the app falls back to NEXT_PUBLIC_FIREBASE_API_KEY, and
+# Compose's `env_file: .env` (like `docker run --env-file .env`) puts every line
+# of this file into the container's runtime environment, public vars included.
+# Set it anyway: it costs nothing and it survives a pipeline that supplies the
+# public values only as build args. With neither variable visible to the server,
+# users are signed out roughly an hour after signing in.
+FIREBASE_API_KEY=AIza...
+
 # --- Build-time (baked into the client bundle) ---
 # Firebase web config used by the login screen to obtain an id_token.
 NEXT_PUBLIC_FIREBASE_API_KEY=AIza...
@@ -145,6 +164,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=1:...:web:...
 ```
 
 > **Why the split matters:** `next build` inlines `NEXT_PUBLIC_*` into the JavaScript served to the browser. If they're missing at build time, the login screen can't initialise Firebase even if the values are present at runtime. The Docker build reads them as build args (see step 4). All other values are read by the server at runtime and can be rotated by restarting the container — no rebuild needed.
+>
+> `FIREBASE_API_KEY` is the one value that sits on both sides of that line: it is the *same* key as `NEXT_PUBLIC_FIREBASE_API_KEY`, but the browser needs it compiled in while the server needs it at runtime, to re-mint ID tokens as they expire. Keeping the server-side copy explicit means the session refresh does not depend on the public value happening to reach the container's environment as well as the bundle.
 
 > **`.env` is gitignored and excluded from the image** (`.dockerignore`). Secrets live only on the host and are injected at runtime; only the `NEXT_PUBLIC_*` values are compiled in.
 
@@ -166,9 +187,12 @@ Verify it's up:
 ```bash
 docker compose ps
 curl -s http://127.0.0.1:3008/api/health
-# Expected: {"ok":true,"backend":true,"llm":true}
-#   backend:true  → MAGICK_MASTER_BASE_URL + SESSION_SECRET are set
-#   llm:true       → LLM_* are set
+# Expected: {"ok":true,"backend":true,"llm":true,"tokenRefresh":true}
+#   backend:true       → MAGICK_MASTER_BASE_URL + SESSION_SECRET are set
+#   llm:true           → LLM_* are set
+#   tokenRefresh:true  → a Firebase Web API key is visible to the server, so it
+#                        can renew an expiring ID token. false means sessions
+#                        end after an hour (see Troubleshooting).
 ```
 
 > Prefer plain Docker? `docker build -t magick-utils --build-arg NEXT_PUBLIC_FIREBASE_API_KEY=... [other NEXT_PUBLIC_* args] .` then `docker run -d -p 127.0.0.1:3008:3000 --env-file .env --restart unless-stopped magick-utils`. Add `-v "$PWD/brands:/app/brands:ro"` to mount brand packs (see below).
@@ -311,11 +335,12 @@ The image declares a `HEALTHCHECK` against `/api/health`, so `docker compose ps`
 
 ## Troubleshooting
 
-### `/api/health` shows `backend:false` or `llm:false`
+### `/api/health` shows `backend:false`, `llm:false` or `tokenRefresh:false`
 
 The corresponding env group isn't fully set in the container.
 - `backend:false` → `MAGICK_MASTER_BASE_URL` and/or `SESSION_SECRET` missing. Check: `docker compose exec app printenv MAGICK_MASTER_BASE_URL SESSION_SECRET`.
 - `llm:false` → `LLM_MODEL` / `LLM_API_KEY` missing.
+- `tokenRefresh:false` → no Firebase Web API key reaches the server; sessions expire after an hour. See the sign-out entry below.
 
 ### AI Insights / chat fail with `llm_failed` and `404 page not found`
 
@@ -328,6 +353,14 @@ The corresponding env group isn't fully set in the container.
 ### Login screen does nothing / "Firebase is not configured"
 
 The `NEXT_PUBLIC_FIREBASE_*` values weren't present at **build** time, so they aren't in the client bundle. Set them in `.env` and rebuild: `docker compose --env-file .env up -d --build`. (Setting them only at runtime has no effect — they're compiled in.)
+
+### Users are signed out about an hour after signing in / bounced to `/login` mid-session
+
+A Firebase ID token lives **one hour**; the session cookie lives eight. The server closes that gap by re-minting the ID token from a stored refresh token — but only if it has a Firebase Web API key to do it with. Without one, the session (and any ingest job still running) can't outlive the token it started with.
+- Confirm it first: `curl -s http://127.0.0.1:3008/api/health` reports `"tokenRefresh":false` when the server has no key. (`tokenRefresh:true` means the key is there and the cause is elsewhere.)
+- The server accepts either variable: `FIREBASE_API_KEY`, or `NEXT_PUBLIC_FIREBASE_API_KEY` as a fallback. Check both: `docker compose exec app printenv FIREBASE_API_KEY NEXT_PUBLIC_FIREBASE_API_KEY` — at least one must print the key.
+- Fix: add `FIREBASE_API_KEY=<same value as NEXT_PUBLIC_FIREBASE_API_KEY>` to `.env` and `docker compose up -d` to recreate the container. It's a runtime value — no rebuild needed.
+- The worker side of the same failure: a **merge** that pauses with "Your sign-in expired while this merge was running" is a job that could not re-mint its credential. An analysis shows no banner while it is paused — its progress bar simply stalls, and after ~20 minutes it ends with "Your sign-in expired and could not be renewed. Sign in again, then retry."
 
 ### MongoDB connection errors / timeouts
 

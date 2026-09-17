@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { isDashboardRange, inListingRange, type DashboardRange } from "@/lib/date-range";
 import { isBackendConfigured } from "@/lib/server/env";
-import { getSession, getTenantContext } from "@/lib/server/session";
+import { getSession, getTenantContext, persistRefreshedCredential } from "@/lib/server/session";
+import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient, MagickApiError, type RawBulkJob } from "@/lib/server/magick-client";
 import { getBatch, refreshBatchFromSource } from "@/lib/server/repositories";
 import { MAX_SELECTION_BATCHES } from "@/lib/server/selection";
@@ -69,8 +70,24 @@ async function refreshJobsToBatches(ctx: TenantContext, jobs: RawBulkJob[]) {
 
 /** An expired/invalid magick-master token surfaces as a 401. The stored session
  *  is now useless, so clear it and signal the client to re-login rather than
- *  masking it as a generic upstream failure. */
+ *  masking it as a generic upstream failure.
+ *
+ *  `TokenRefreshPermanentError` counts as the same thing. It reaches here by a
+ *  path the freshness check cannot pre-empt: revoking a user (password change,
+ *  account disabled) kills the refresh token while the ID token still has
+ *  minutes left, so `getTenantContext()` sees nothing to renew, magick-master
+ *  401s the still-unexpired token, `MagickClient` tries to mint a replacement
+ *  and Google refuses for good. Reporting that as a generic 502 left the user
+ *  staring at "Unable to load campaigns" forever — `handleSessionExpiry` only
+ *  reacts to a 401, so they were never bounced and the dead cookie was never
+ *  cleared. Before this change they were signed out cleanly. */
 async function upstreamErrorResponse(err: unknown) {
+  if (err instanceof TokenRefreshPermanentError) {
+    const session = await getSession();
+    session.destroy();
+    log().warn({ reason: err.reason }, "campaigns credential is unrenewable — session expired, cleared");
+    return NextResponse.json({ error: "session_expired", detail: err.reason }, { status: 401 });
+  }
   if (err instanceof MagickApiError && err.status === 401) {
     const session = await getSession();
     session.destroy();
@@ -104,7 +121,7 @@ export const GET = withLogging("campaigns", async (req: Request) => {
     log().warn({ requested }, "campaigns got an unknown range — listing all time instead");
   }
 
-  const client = new MagickClient(ctx);
+  const client = new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential });
 
   // Resolving a known selection does not need — and must not pay for — a full
   // inventory scan. Analytics arrives holding the ids the customer picked; it

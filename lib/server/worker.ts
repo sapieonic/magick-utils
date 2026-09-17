@@ -193,6 +193,9 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
         // upstream is throttling us"; `reason` in the line above says which.
         status: "rate_limited",
         retryAt,
+        // The status cannot distinguish these two; this is what the screen reads
+        // to tell the customer whether to wait or to sign in again.
+        deferReason: credential ? "credential" : "rate_limited",
         // Each backoff advances only its own counter, so a long ingest that has
         // survived many rate limits still gets its full credential grace.
         ...(credential
@@ -212,12 +215,18 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
       return;
     }
     log().error({ err, durationMs: Date.now() - startedAt }, "[worker] job failed");
-    const failed = await updateClaimedJob(claimed.jobId, claimed.leaseId, {
-      status: "error",
-      leaseUntil: null,
-      leaseId: null,
-      error: terminalErrorMessage(err),
-    });
+    const failed = await updateClaimedJob(
+      claimed.jobId,
+      claimed.leaseId,
+      {
+        status: "error",
+        leaseUntil: null,
+        leaseId: null,
+        error: terminalErrorMessage(err),
+      },
+      // The job is over; it has no further use for the caller's credential.
+      { clearCredential: true },
+    );
     if (!failed) throw err;
     await Promise.all(claimed.batchIds.map(async (batchId) => {
       await failBatchIfOwned(claimed.tenantId, claimed.accountId, batchId, claimed.jobId, claimed.leaseId!);
@@ -298,7 +307,14 @@ export async function processJob(job: Job) {
   }
 
   const result = job.type === "merge" ? { rowCount: done } : undefined;
-  const completed = await updateClaimedJob(job.jobId, leaseId, { status: "done", done, cursor: 0, batchIndex: job.batchIds.length, leaseUntil: null, leaseId: null, result });
+  const completed = await updateClaimedJob(
+    job.jobId,
+    leaseId,
+    { status: "done", done, cursor: 0, batchIndex: job.batchIds.length, leaseUntil: null, leaseId: null, result },
+    // A merge that finished in thirty seconds must not leave a non-expiring
+    // refresh token sitting in Mongo until the retention sweep gets to it.
+    { clearCredential: true },
+  );
   if (!completed) throw new Error("job lease lost before completion");
 }
 

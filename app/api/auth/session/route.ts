@@ -61,7 +61,17 @@ export const POST = withLogging("auth/session", async (req: Request) => {
       id: (res.user?.id as string | undefined) ?? undefined,
     };
     session.tenants = tenants;
-    await session.save();
+    try {
+      await session.save();
+    } catch (err) {
+      // iron-session throws outright past 4096 bytes, and this cookie carries an
+      // ID token, a refresh token and the whole tenant list with its nested
+      // accounts — a user with many tenants is the one who trips it. Falling
+      // into the catch below would report it as "magick-master auth rejected",
+      // pointing whoever debugs it at the one system that is working fine.
+      log().error({ err }, "login failed — session cookie could not be written");
+      return NextResponse.json({ error: "session_too_large" }, { status: 500 });
+    }
     log().info(
       { userId: session.user.id, tenantCount: tenants.length },
       "session established (login)",

@@ -156,6 +156,25 @@ describe("POST /api/auth/session", () => {
     expect(json.error).toBe("auth_failed");
   });
 
+  it("reports an unwritable cookie as its own failure, not as an upstream one", async () => {
+    // iron-session throws outright past 4096 bytes, and this cookie carries an
+    // ID token, a refresh token and the whole tenant list with its nested
+    // accounts — a user with many tenants is the one who trips it. Reported as
+    // `auth_failed` (502) it pointed whoever debugged it at magick-master, the
+    // one system that was working fine.
+    vi.mocked(isAuthConfigured).mockReturnValue(true);
+    vi.mocked(authSession).mockResolvedValue({ user: { id: "u1" }, tenants: [] } as never);
+    const session = fakeSession();
+    session.save.mockRejectedValue(new Error("Cookie length is too big, 5000 > 4096"));
+    vi.mocked(getSession).mockResolvedValue(session as never);
+
+    const { POST } = await import("@/app/api/auth/session/route");
+    const res = await POST(req({ idToken: "good-token", refreshToken: "refresh-1" }));
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toEqual({ error: "session_too_large" });
+  });
+
   it("falls back to 502 for a generic thrown error", async () => {
     vi.mocked(isAuthConfigured).mockReturnValue(true);
     vi.mocked(authSession).mockRejectedValue(new Error("network down"));

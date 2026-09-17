@@ -23,7 +23,9 @@ vi.mock("@/lib/server/firebase-token", async (importOriginal) => ({
 
 import { TokenRefreshPermanentError, TokenRefreshTransientError } from "@/lib/server/firebase-token";
 import {
+  getFreshIdToken,
   getTenantContext,
+  persistRefreshedCredential,
   sessionIsLive,
   sessionOptions,
   stampCredential,
@@ -210,5 +212,97 @@ describe("getTenantContext", () => {
 
     expect(ctx?.idToken).toBe(fresh);
     expect(s.destroy).not.toHaveBeenCalled();
+  });
+});
+
+describe("getFreshIdToken", () => {
+  // The account picker runs before a tenant or account has been chosen, so
+  // getTenantContext() cannot serve it — and reading session.idToken raw is what
+  // kept that one screen on the 1-hour cliff after every other screen was fixed.
+
+  it("returns null when auth is not configured", async () => {
+    flags.auth = false;
+    session({ idToken: LIVE() });
+
+    expect(await getFreshIdToken()).toBeNull();
+  });
+
+  it("returns null when the session holds no credential", async () => {
+    session({});
+
+    expect(await getFreshIdToken()).toBeNull();
+  });
+
+  it("passes a still-fresh token through without minting", async () => {
+    const token = LIVE();
+    session({ idToken: token, refreshToken: "rt" });
+
+    expect(await getFreshIdToken()).toBe(token);
+    expect(mintIdToken).not.toHaveBeenCalled();
+  });
+
+  it("mints and persists a replacement for a near-expired token", async () => {
+    const fresh = LIVE();
+    mintIdToken.mockResolvedValue({ idToken: fresh, refreshToken: "rotated", expiresAt: Date.now() + 3.6e6 });
+    const s = session({ idToken: NEARLY_DEAD(), refreshToken: "rt" });
+
+    expect(await getFreshIdToken()).toBe(fresh);
+    expect(mintIdToken).toHaveBeenCalledWith("rt");
+    expect(s.idToken).toBe(fresh);
+    expect(s.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns null and clears the session when the credential is permanently dead", async () => {
+    mintIdToken.mockRejectedValue(new TokenRefreshPermanentError("USER_DISABLED"));
+    const s = session({ idToken: NEARLY_DEAD(), refreshToken: "rt" });
+
+    expect(await getFreshIdToken()).toBeNull();
+    expect(s.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps serving the stored token through a transient mint failure", async () => {
+    mintIdToken.mockRejectedValue(new TokenRefreshTransientError("secure-token responded 503"));
+    const stale = NEARLY_DEAD();
+    const s = session({ idToken: stale, refreshToken: "rt" });
+
+    expect(await getFreshIdToken()).toBe(stale);
+    expect(s.destroy).not.toHaveBeenCalled();
+  });
+});
+
+describe("persistRefreshedCredential", () => {
+  it("writes a mid-request rotation back to the cookie", async () => {
+    // MagickClient can mint a replacement mid-request, and Google may rotate the
+    // refresh token on that exchange. Without this the rotation lives only in
+    // that request's memory and the cookie keeps a value refused an hour later.
+    const fresh = LIVE();
+    const s = session({ idToken: NEARLY_DEAD(), refreshToken: "rt", tenantId: "t1", accountId: "a1" });
+
+    await persistRefreshedCredential({ idToken: fresh, refreshToken: "rotated" });
+
+    expect(s.idToken).toBe(fresh);
+    expect(s.refreshToken).toBe("rotated");
+    expect(s.idTokenExp).toBeGreaterThan(Date.now());
+    expect(s.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resurrect a session that was destroyed underneath it", async () => {
+    // A parallel request hitting a permanent refusal clears the cookie;
+    // re-stamping it here would put a dead session back on its feet.
+    const s = session({});
+
+    await persistRefreshedCredential({ idToken: LIVE(), refreshToken: "rotated" });
+
+    expect(s.idToken).toBeUndefined();
+    expect(s.save).not.toHaveBeenCalled();
+  });
+
+  it("swallows a failed write — the request already holds a working token", async () => {
+    const s = session({ idToken: NEARLY_DEAD(), refreshToken: "rt" });
+    s.save.mockRejectedValue(new Error("iron-session: Cookie length is too big (4200 bytes)"));
+
+    await expect(
+      persistRefreshedCredential({ idToken: LIVE(), refreshToken: "rotated" }),
+    ).resolves.toBeUndefined();
   });
 });

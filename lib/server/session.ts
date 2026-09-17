@@ -145,6 +145,51 @@ async function ensureFreshIdToken(session: MutableSession): Promise<string | nul
   }
 }
 
+/** The session's ID token, refreshed if it is near expiry.
+ *
+ *  For the routes that legitimately act BEFORE a workspace is chosen — the
+ *  account picker is the only one — where `getTenantContext()` cannot help
+ *  because there is no tenant or account to return yet. Without this, that
+ *  screen kept the exact 1-hour cliff the rest of this change removes: a user
+ *  who idled an hour, came back to a working dashboard and then clicked "Switch
+ *  workspace" was bounced to /login by the account cascade alone.
+ *
+ *  Every OTHER upstream call must go through `getTenantContext()`. */
+export async function getFreshIdToken(): Promise<string | null> {
+  if (!isAuthConfigured()) return null;
+  const s = await getSession();
+  if (!s.idToken) return null;
+  return ensureFreshIdToken(s as MutableSession);
+}
+
+/** An `onCredentialRefresh` handler for route handlers.
+ *
+ *  `MagickClient` can mint a replacement token mid-request when magick-master
+ *  refuses a token that still looked live — revocation, typically. Google may
+ *  rotate the refresh token on that exchange, and `firebase-token.ts` is
+ *  explicit that a rotated value MUST be persisted: keep the old one and the
+ *  session is holding a credential that gets refused an hour later. The worker
+ *  writes it back to its job document; a route has to write it back to the
+ *  cookie, or the rotation lives only in that request's memory.
+ *
+ *  Best-effort by design — the request already holds a working token, so a
+ *  failed write is a missed optimisation, not a failure worth surfacing. */
+export async function persistRefreshedCredential(minted: {
+  idToken: string;
+  refreshToken: string;
+}): Promise<void> {
+  try {
+    const s = await getSession();
+    // The session was destroyed underneath us (a parallel request hit a
+    // permanent refusal). Re-stamping would resurrect a dead cookie.
+    if (!s.idToken) return;
+    stampCredential(s, minted.idToken, minted.refreshToken);
+    await s.save();
+  } catch (err) {
+    log().warn({ err }, "could not persist a mid-request credential refresh");
+  }
+}
+
 /** Returns the authenticated tenant context, or null if not fully logged in
  *  (also null when auth isn't configured, so callers never hit iron-session).
  *

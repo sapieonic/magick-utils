@@ -57,11 +57,20 @@ async function post(body?: unknown, opts?: { badJson?: boolean }) {
   return POST(req(body, opts));
 }
 
+/** A session that already holds a credential for `u1` — the only shape this
+ *  route acts on, since it extends a session and never creates one. */
+function liveSession(extra: Record<string, unknown> = {}) {
+  return fakeSession({ idToken: "old", user: { id: "u1" }, ...extra });
+}
+
 describe("POST /api/auth/refresh", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(isAuthConfigured).mockReturnValue(true);
-    vi.mocked(authMe).mockResolvedValue({ user: {} } as never);
+    // Upstream confirms the token belongs to the same user the session was
+    // issued to. The identity guard fails closed, so a double that answered
+    // `{ user: {} }` would 403 every otherwise-happy test.
+    vi.mocked(authMe).mockResolvedValue({ user: { id: "u1" } } as never);
   });
 
   it("503 when auth is not configured", async () => {
@@ -72,15 +81,36 @@ describe("POST /api/auth/refresh", () => {
   });
 
   it("400 invalid_json", async () => {
+    vi.mocked(getSession).mockResolvedValue(liveSession() as never);
     const res = await post(undefined, { badJson: true });
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toEqual({ error: "invalid_json" });
   });
 
   it("400 missing_id_token", async () => {
+    vi.mocked(getSession).mockResolvedValue(liveSession() as never);
     const res = await post({});
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toEqual({ error: "missing_id_token" });
+  });
+
+  it("400 missing_id_token when idToken is present but not a string", async () => {
+    vi.mocked(getSession).mockResolvedValue(liveSession() as never);
+    const res = await post({ idToken: { toString: "nice try" } });
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: "missing_id_token" });
+    expect(authMe).not.toHaveBeenCalled();
+  });
+
+  it("turns an unauthenticated caller away BEFORE reading the body", async () => {
+    // The body is parsed after the session check so an anonymous caller cannot
+    // make this long-running Node host buffer a payload it will never use.
+    // Malformed JSON is the observable proxy: if the body were read first this
+    // would be 400 invalid_json.
+    vi.mocked(getSession).mockResolvedValue(fakeSession({}) as never);
+    const res = await post(undefined, { badJson: true });
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({ error: "not_authenticated" });
   });
 
   it("401s without establishing a session when there is none", async () => {
@@ -98,6 +128,7 @@ describe("POST /api/auth/refresh", () => {
     const session = fakeSession({
       idToken: jwt(Date.now() - 60_000),
       idTokenExp: Date.now() - 60_000,
+      refreshToken: "stored-r",
       user: { id: "u1" },
       tenants: [{ id: "t1" }],
       tenantId: "t1",
@@ -105,12 +136,12 @@ describe("POST /api/auth/refresh", () => {
     });
     vi.mocked(getSession).mockResolvedValue(session as never);
 
-    const res = await post({ idToken: FRESH, refreshToken: "r2" });
+    const res = await post({ idToken: FRESH });
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toMatchObject({ ok: true, persisted: true });
     expect(authMe).toHaveBeenCalledWith(FRESH);
     expect(session.idToken).toBe(FRESH);
-    expect(session.refreshToken).toBe("r2");
+    expect(session.refreshToken).toBe("stored-r");
     expect(session.idTokenExp).toBeGreaterThan(Date.now());
     expect(session.save).toHaveBeenCalled();
     // Re-running the login exchange here would rewrite these — and log a bogus
@@ -121,11 +152,66 @@ describe("POST /api/auth/refresh", () => {
   });
 
   it("keeps the stored refresh token when the client sends none", async () => {
-    const session = fakeSession({ idToken: "old", refreshToken: "kept" });
+    const session = liveSession({ refreshToken: "kept" });
     vi.mocked(getSession).mockResolvedValue(session as never);
     const res = await post({ idToken: FRESH });
     expect(res.status).toBe(200);
     expect(session.refreshToken).toBe("kept");
+  });
+
+  it("ignores a refresh token supplied by the client", async () => {
+    // `authMe` above verifies the ID TOKEN only. Accepting a refresh token from
+    // the page would let a caller pair a valid ID token with someone else's
+    // durable credential and have the session act as them from the next mint on.
+    // The refresh token is set once, at login, by the exchange that verified it.
+    const session = liveSession({ refreshToken: "set-at-login" });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+
+    const res = await post({ idToken: FRESH, refreshToken: "attacker-supplied" });
+
+    expect(res.status).toBe(200);
+    expect(session.refreshToken).toBe("set-at-login");
+    expect(session.idToken).toBe(FRESH);
+  });
+
+  it("accepts a token matching on email when neither side carries an id", async () => {
+    // Login reads /auth/session and this route reads /auth/me; an id is not
+    // guaranteed on either, so email is the fallback the guard compares on.
+    const session = liveSession({ user: { email: "Person@Example.com" } });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    vi.mocked(authMe).mockResolvedValue({ user: { email: "person@example.com" } } as never);
+
+    const res = await post({ idToken: FRESH });
+
+    expect(res.status).toBe(200);
+    expect(session.idToken).toBe(FRESH);
+  });
+
+  it("refuses when neither an id nor an email can be compared", async () => {
+    // Fails CLOSED. A guard that evaporates exactly when it cannot identify the
+    // user is not a guard — and refusing costs only this belt-and-braces
+    // hand-off, since getTenantContext() renews the session server-side anyway.
+    const session = liveSession({ user: { name: "No Ids Here" } });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    vi.mocked(authMe).mockResolvedValue({ user: { name: "No Ids Here" } } as never);
+
+    const res = await post({ idToken: FRESH });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: "user_mismatch" });
+    expect(session.idToken).toBe("old");
+    expect(session.save).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the session has no user to compare against", async () => {
+    const session = fakeSession({ idToken: "old" });
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    vi.mocked(authMe).mockResolvedValue({ user: { id: "u1" } } as never);
+
+    const res = await post({ idToken: FRESH });
+
+    expect(res.status).toBe(403);
+    expect(session.idToken).toBe("old");
   });
 
   it("destroys the session and 401s when upstream rejects the token", async () => {
@@ -174,7 +260,7 @@ describe("POST /api/auth/refresh", () => {
   });
 
   it("reports a rejected cookie write instead of throwing a 500", async () => {
-    const session = fakeSession({ idToken: "old" });
+    const session = liveSession();
     session.save.mockRejectedValue(new Error("Cookie length is too big, 5000 > 4096"));
     vi.mocked(getSession).mockResolvedValue(session as never);
     const res = await post({ idToken: FRESH, refreshToken: "r1" });

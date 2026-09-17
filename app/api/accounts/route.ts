@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { isAuthConfigured } from "@/lib/server/env";
-import { getSession, type SessionTenant } from "@/lib/server/session";
+import { getFreshIdToken, getSession, type SessionTenant } from "@/lib/server/session";
 import { listTenantAccounts, MagickApiError, type RawAccount } from "@/lib/server/magick-client";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
@@ -21,10 +21,20 @@ export const GET = withLogging("accounts", async (req: Request) => {
   }
   setRequestContext({ tenantId });
 
-  const session = await getSession();
-  if (!session.idToken) {
+  // Refreshed rather than read raw: this runs on the workspace picker, which a
+  // user reaches after idling — often well past the ID token's hour. Bearer'ing
+  // the stored token directly is what left this one screen still bouncing people
+  // to /login after every other screen had been fixed.
+  //
+  // This runs FIRST, and the session is read afterwards, because refreshing may
+  // rewrite (or destroy) the stored session. Reading it beforehand would leave
+  // this handler holding a pre-refresh snapshot — harmless while only `tenants`
+  // is read off it, and a trap the moment anything here reads a credential field.
+  const idToken = await getFreshIdToken();
+  if (!idToken) {
     return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
   }
+  const session = await getSession();
   const known = (session.tenants ?? []).some((t: SessionTenant) => t.id === tenantId);
   if (session.tenants && session.tenants.length > 0 && !known) {
     log().warn({ tenantId }, "account list denied — tenant not in session");
@@ -32,7 +42,7 @@ export const GET = withLogging("accounts", async (req: Request) => {
   }
 
   try {
-    const res = await listTenantAccounts(session.idToken, tenantId);
+    const res = await listTenantAccounts(idToken, tenantId);
     const accounts = (res.accounts ?? [])
       .filter((a: RawAccount) => a.status !== "deleted")
       .map((a: RawAccount) => ({

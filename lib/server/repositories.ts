@@ -3,7 +3,7 @@
 // never leak across tenants. Server-only.
 
 import { randomUUID } from "node:crypto";
-import type { AnyBulkWriteOperation, Filter, FindCursor, WithId } from "mongodb";
+import type { AnyBulkWriteOperation, Filter, FindCursor, UpdateFilter, WithId } from "mongodb";
 import {
   aggregates,
   aiUsage,
@@ -1079,14 +1079,29 @@ export async function updateJob(
 export async function updateClaimedJob(
   jobId: string,
   leaseId: string,
-  patch: Partial<Job>
+  patch: Partial<Job>,
+  options: { clearCredential?: boolean } = {}
 ): Promise<Job | null> {
   const col = await jobs();
   const rest = { ...patch };
   delete rest.jobId;
+  const update: UpdateFilter<Job> = { $set: { ...rest, updatedAt: nowIso() } };
+  // Dropped in the SAME atomic write that ends the job, so a finished job never
+  // sits in Mongo holding a credential it no longer needs. This matters far more
+  // for `refreshToken` than for `idToken`: a refresh token does not expire, so a
+  // thirty-second merge job would otherwise leave a standing credential at rest
+  // until the retention sweep — a sweep that runs from an external cron, fails
+  // silently if it stops, and is sized by DATA_RETENTION_DAYS, which an operator
+  // may raise for data-visibility reasons without realising it also extends how
+  // long credentials live. Tying the credential's life to the job's removes the
+  // dependency entirely. Never set on the deferral path: a paused job resumes
+  // and still needs both the credential and the reason it is waiting.
+  // `deferReason` goes with them: it explains why a job is PAUSED, so leaving it
+  // beside `status: "done"` is a field outliving its own meaning.
+  if (options.clearCredential) update.$unset = { idToken: "", refreshToken: "", deferReason: "" };
   return col.findOneAndUpdate(
     { jobId, status: "running", leaseId },
-    { $set: { ...rest, updatedAt: nowIso() } },
+    update,
     { returnDocument: "after" }
   );
 }

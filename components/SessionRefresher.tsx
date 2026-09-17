@@ -28,11 +28,13 @@ export function SessionRefresher() {
     // through /api/auth/me. There is nothing to hand over.
     if (!cred || cred.idToken === deliveredToken.current) return;
     deliveredToken.current = cred.idToken;
-    const ok = await postRefresh(cred.idToken, cred.refreshToken).catch(() => false);
-    // Only a delivered token may be remembered as delivered. Marking a failed
-    // hand-off as done would make the next wake skip it and leave the cookie on
-    // the dead credential until the user is bounced.
-    if (!ok) deliveredToken.current = "";
+    const outcome = await postRefresh(cred.idToken).catch(() => "retry" as const);
+    // Only a RETRYABLE failure releases the token to be offered again. A
+    // delivered token is done, and so is a refused one: the server has said it
+    // will not take this credential, and re-offering it on every token change,
+    // tab focus and wake would be an unbounded loop the user never sees. A
+    // genuinely transient failure still gets another go on the next wake.
+    if (outcome === "retry") deliveredToken.current = "";
   });
 
   useEffect(() => {
@@ -55,8 +57,15 @@ export function SessionRefresher() {
     };
 
     (async () => {
-      // `backendStatus()` throws rather than guessing when /api/health can't be
-      // reached — a network blip must not be read as "demo mode".
+      // `backendStatus()` throws rather than returning a guess when /api/health
+      // is unreachable, and here that throw is treated as "don't subscribe".
+      // That is a deliberate one-way door: this effect has no retry, so a health
+      // check that fails at mount leaves the browser half of the refresh off for
+      // the page's lifetime. It is acceptable only because the shell guard
+      // (`app/(app)/layout.tsx`) awaits and caches the same call before this
+      // component renders, so by the time we get here it is a cache hit — a page
+      // that reached this point at all has already talked to /api/health. If the
+      // shell ever stops gating on it, this needs a retry.
       const backend = await backendStatus().then((s) => s.backend, () => false);
       if (!alive || !backend) return;
       unwatch = watchIdToken((cred) => {

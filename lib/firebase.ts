@@ -8,6 +8,7 @@ import {
   getAuth,
   GoogleAuthProvider,
   onIdTokenChanged,
+  signOut as firebaseAuthSignOut,
   signInWithPopup,
   signInWithEmailAndPassword,
   type Auth,
@@ -107,5 +108,21 @@ export async function currentIdToken(force = false): Promise<FirebaseCredential 
     return user ? await credentialFor(user, force) : null;
   } catch {
     return null;
+  }
+}
+
+/** Sign the Firebase SDK out, clearing the refresh token it keeps in IndexedDB.
+ *
+ *  Without this, "Sign out" left the browser holding a credential that can mint
+ *  new ID tokens indefinitely — so the next person at a shared machine could be
+ *  handed a working session by the refresher. No-ops when Firebase is
+ *  unconfigured, and never throws: failing to sign out of the SDK must not stop
+ *  the server session being destroyed, which is the part that actually matters. */
+export async function firebaseSignOut(): Promise<void> {
+  if (!isFirebaseConfigured()) return;
+  try {
+    await firebaseAuthSignOut(auth());
+  } catch {
+    // Already signed out, or the SDK never initialised on this page.
   }
 }

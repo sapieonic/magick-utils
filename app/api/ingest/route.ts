@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isBackendConfigured } from "@/lib/server/env";
-import { getTenantContext } from "@/lib/server/session";
+import { getTenantContext, persistRefreshedCredential } from "@/lib/server/session";
 import { MagickClient } from "@/lib/server/magick-client";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
 import {
@@ -46,7 +46,7 @@ async function refreshableBatchIds(
   batchDocs: BatchDoc[],
   complete: boolean[],
 ): Promise<string[]> {
-  const client = new MagickClient(ctx);
+  const client = new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential });
   const keep: string[] = [];
   for (let i = 0; i < batchIds.length; i += REFRESH_CHECK_CONCURRENCY) {
     const slice = batchIds.slice(i, i + REFRESH_CHECK_CONCURRENCY);

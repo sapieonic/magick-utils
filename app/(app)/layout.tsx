@@ -62,8 +62,10 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   }
 
   const switchWorkspace = () => router.push("/workspace");
-  const doSignOut = () => {
-    signOut();
+  const doSignOut = async () => {
+    // Awaited so the cookie-clearing response lands before /login loads and asks
+    // the server whether this browser is still authenticated.
+    await signOut();
     router.push("/login");
   };
 

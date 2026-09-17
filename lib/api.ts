@@ -15,6 +15,11 @@ export interface JobDto {
   done: number;
   retryAt: string | null;
   retryCount: number;
+  /** Why a `rate_limited` job is paused — throttling, or a credential the job
+   *  can no longer use. Null on any other status. Optional so callers (and their
+   *  test doubles) that predate it keep type-checking, the same way `truncated`
+   *  is above; read it as a value that may simply be absent. */
+  deferReason?: "rate_limited" | "credential" | null;
   error: string | null;
   result: unknown;
   createdAt: string;
@@ -386,6 +391,23 @@ export async function postContext(tenantId: string, accountId: string): Promise<
   }
 }
 
+/** Destroy the server session cookie.
+ *
+ *  `POST /api/auth/logout` existed from the start but nothing ever called it —
+ *  signing out only cleared React state and sessionStorage, leaving the cookie
+ *  live. That was survivable while the cookie carried a credential that died
+ *  within the hour; it is not now that the session can renew itself for its
+ *  whole 8h life. Never throws: a failed logout must not strand the user on a
+ *  screen they are trying to leave, and the client-side state is cleared
+ *  regardless. */
+export async function postLogout(): Promise<void> {
+  try {
+    await fetch("/api/auth/logout", { method: "POST", cache: "no-store" });
+  } catch {
+    // Offline or the route is unreachable — the local sign-out still proceeds.
+  }
+}
+
 /** Hand a freshly minted Firebase ID token to the BFF so the session cookie
  *  stops carrying a dead one. Called by `SessionRefresher` on every
  *  `onIdTokenChanged` and on every tab wake — never by a screen.
@@ -397,14 +419,41 @@ export async function postContext(tenantId: string, accountId: string): Promise<
  *  server destroys a session whose credential upstream refuses) so the caller
  *  knows not to record the token as delivered.
  */
-export async function postRefresh(idToken: string, refreshToken?: string): Promise<boolean> {
+export type RefreshOutcome =
+  /** The cookie now carries this token. */
+  | "delivered"
+  /** Not this time — a 5xx, a network fault, or a cookie the server could not
+   *  write. Offering the same token again later is worth doing. */
+  | "retry"
+  /** The server will not take this token, and will not take it next time
+   *  either. Re-offering it is a loop with no exit. */
+  | "refused";
+
+export async function postRefresh(idToken: string): Promise<RefreshOutcome> {
   const res = await fetch("/api/auth/refresh", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(refreshToken ? { idToken, refreshToken } : { idToken }),
+    // The ID token only. The refresh token is the durable credential and is set
+    // once, at login, from the exchange that verified it — never re-supplied
+    // from the page, where it could be paired with someone else's ID token.
+    body: JSON.stringify({ idToken }),
   });
-  if (handleSessionExpiry(res)) return false;
-  return res.ok;
+  // 401 — the session is gone; `handleSessionExpiry` is already sending the user
+  // to /login, so there is nothing left to hand over.
+  if (handleSessionExpiry(res)) return "refused";
+  // 403 — the route cannot verify this token names the session's user. That
+  // answer does not change when we ask again with the same credential, so this
+  // must not be retried: the refresher would otherwise re-offer it on every
+  // token change, every tab focus and every wake, forever, with no backoff and
+  // nothing visible to the user.
+  if (res.status === 403) return "refused";
+  if (!res.ok) return "retry";
+  // The route answers 200 with `persisted: false` when it verified the token but
+  // could not write the cookie. Reporting that as delivered would let the caller
+  // mark this token done and never offer it again, leaving the session on the
+  // old one; reporting it as retryable costs one attempt on the next wake.
+  const body = await res.json().catch(() => ({}) as { persisted?: boolean });
+  return body.persisted === false ? "retry" : "delivered";
 }
 
 export interface SessionUserInfo {

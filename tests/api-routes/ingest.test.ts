@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/server/env", () => ({ isBackendConfigured: vi.fn() }));
+// No `getSession` on purpose. The route must take its credential from
+// `getTenantContext()` — the one place a near-expired ID token is re-minted —
+// and never from a second read of the raw session. Leaving the export off this
+// mock makes any reintroduced `getSession()` call fail this whole file loudly
+// instead of quietly re-arming the 1-hour cliff.
 vi.mock("@/lib/server/session", () => ({
   getTenantContext: vi.fn(),
-  getSession: vi.fn(),
+  persistRefreshedCredential,
 }));
 vi.mock("@/lib/server/repositories", () => ({
   acquireIngestionLocks: vi.fn().mockResolvedValue(undefined),
@@ -18,11 +23,15 @@ vi.mock("@/lib/server/magick-client", () => ({
   MagickClient: vi.fn(() => ({ getBulkJob })),
 }));
 
-// hoisted so the (also-hoisted) MagickClient factory above can close over it
-const { getBulkJob } = vi.hoisted(() => ({ getBulkJob: vi.fn() }));
+// hoisted so the (also-hoisted) factories above can close over them
+const { getBulkJob, persistRefreshedCredential } = vi.hoisted(() => ({
+  getBulkJob: vi.fn(),
+  persistRefreshedCredential: vi.fn(),
+}));
 
 import { isBackendConfigured } from "@/lib/server/env";
-import { getTenantContext, getSession } from "@/lib/server/session";
+import { MagickClient } from "@/lib/server/magick-client";
+import { getTenantContext } from "@/lib/server/session";
 import {
   countRecords,
   createJob,
@@ -79,7 +88,6 @@ describe("POST /api/ingest", () => {
   it("creates an ingest job, sums batch totals, returns {jobId,total}", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockImplementation(
       (_t: string, _a: string, id: string) => Promise.resolve(({ total: id === "b1" ? 10 : 5 }) as never),
     );
@@ -101,7 +109,6 @@ describe("POST /api/ingest", () => {
   it("honors type:merge", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
     vi.mocked(countRecords).mockResolvedValue(0);
     const { POST } = await import("@/app/api/ingest/route");
@@ -125,7 +132,6 @@ describe("POST /api/ingest", () => {
   it("does not misclassify a repository outage as batch_not_found", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockRejectedValue(new Error("mongo down"));
     const { POST } = await import("@/app/api/ingest/route");
     await expect(POST(req({ batchIds: ["b1"] }))).rejects.toThrow("mongo down");
@@ -134,7 +140,6 @@ describe("POST /api/ingest", () => {
   it("reattaches callers to overlapping active ingestion jobs", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
     vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, done: 4, batchIds: ["b1"] } as never);
     const { POST } = await import("@/app/api/ingest/route");
@@ -167,30 +172,52 @@ describe("POST /api/ingest", () => {
     expect(res.status).toBe(200);
   });
 
-  it("stamps a new job from the context, not from a second session read", async () => {
+  it("stamps a new job with BOTH halves of the context's credential", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
-    // getTenantContext() has already re-minted a near-expired token; reading the
-    // raw session again hands the worker the old one, which is the whole
-    // one-hour cliff this path exists to avoid.
+    // getTenantContext() has already re-minted a near-expired token. Anything
+    // else the route could reach for — the raw session's stored idToken — is
+    // the token that expires mid-ingestion, which is the whole 1-hour cliff this
+    // path exists to avoid. The session module's mock deliberately has no
+    // `getSession`, so a route that reached for it would blow up here rather
+    // than pass quietly.
     vi.mocked(getTenantContext).mockResolvedValue({ ...ctx, idToken: "freshly-minted", refreshToken: "r1" } as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "stale-token" } as never);
     vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
     vi.mocked(countRecords).mockResolvedValue(0);
     const { POST } = await import("@/app/api/ingest/route");
     await POST(req({ batchIds: ["b1"] }));
-    expect(vi.mocked(createJob).mock.calls[0][0]).toMatchObject({
-      idToken: "freshly-minted",
-      // Without this the worker has no way to mint its own replacement and dies
-      // at the one-hour mark mid-ingestion.
-      refreshToken: "r1",
-    });
+    const created = vi.mocked(createJob).mock.calls[0][0];
+    expect(created.idToken).toBe("freshly-minted");
+    // Without this the worker has no way to mint its own replacement and dies
+    // at the one-hour mark mid-ingestion.
+    expect(created.refreshToken).toBe("r1");
+  });
+
+  it("gives the refresh check's client a hook that persists a rotated credential", async () => {
+    // The source check runs upstream calls of its own, so magick-master can
+    // refuse a token mid-request and MagickClient mint a replacement. Google may
+    // rotate the refresh token on that exchange; without this hook the rotation
+    // lives only in the request's memory and the cookie keeps a credential that
+    // is refused an hour later.
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T11:00:00Z" });
+
+    const { POST } = await import("@/app/api/ingest/route");
+    await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+
+    expect(MagickClient).toHaveBeenCalledWith(ctx, { onCredentialRefresh: persistRefreshedCredential });
   });
 
   it("rejects reattachment when an overlapping job does not cover the full selection", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none" } as never);
     vi.mocked(findActiveJobForBatches).mockResolvedValue({ jobId: "active", total: 10, batchIds: ["b1"] } as never);
     const { POST } = await import("@/app/api/ingest/route");
@@ -214,7 +241,6 @@ describe("POST /api/ingest", () => {
   it("re-pulls ready analyze batches when refresh is true and the source moved", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
@@ -237,7 +263,6 @@ describe("POST /api/ingest", () => {
   it("skips a refresh whose upstream job has not been touched since ingestion", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
@@ -259,7 +284,6 @@ describe("POST /api/ingest", () => {
   it("re-ingests a job that has not finished, even with an unchanged timestamp", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
@@ -275,7 +299,6 @@ describe("POST /api/ingest", () => {
   it("refreshes a stale batch, which is readable but behind its source", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "stale",
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
@@ -296,7 +319,6 @@ describe("POST /api/ingest", () => {
   it("refreshes a stale batch even when its upstream timestamp has not moved", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "stale",
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
@@ -315,7 +337,6 @@ describe("POST /api/ingest", () => {
   it("re-ingests rather than skipping when the upstream source check fails", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
@@ -331,7 +352,6 @@ describe("POST /api/ingest", () => {
   it("does not consult upstream for a batch that was never fully ingested", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getSession).mockResolvedValue({ idToken: "tk" } as never);
     vi.mocked(getBatch).mockResolvedValue({ total: 10, selType: "ai", ingestStatus: "none", sourceId: "job-1" } as never);
     vi.mocked(countRecords).mockResolvedValue(0);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);

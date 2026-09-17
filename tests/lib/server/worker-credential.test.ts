@@ -286,6 +286,49 @@ describe("runClaimedJob credential failures", () => {
     );
   });
 
+  it("marks a credential deferral as such, not as throttling", async () => {
+    // Both pauses share the `rate_limited` status, and the Combine screen used
+    // to read that as "rate limit reached, it will retry, just wait" — sending a
+    // signed-out user away from the one action that rescues their merge.
+    client.listCalls.mockRejectedValueOnce(new MagickApiError(401, "token expired", "url"));
+
+    await runClaimedJob(job({ refreshToken: "refresh-1" }));
+
+    expect(patchWhere((p) => p.status === "rate_limited")).toMatchObject({ deferReason: "credential" });
+  });
+
+  it("marks a transient mint failure as a credential deferral too", async () => {
+    token.mintIdToken.mockRejectedValueOnce(new TokenRefreshTransientError("secure-token responded 503"));
+
+    await runClaimedJob(job({ refreshToken: "refresh-1" }));
+
+    expect(patchWhere((p) => p.status === "rate_limited")).toMatchObject({ deferReason: "credential" });
+  });
+
+  it("leaves the credential on a job it expects to resume", async () => {
+    // The deferral is the one transition that must NOT clear it: the job comes
+    // back and keeps paging, and a reattach after signing in re-stamps it.
+    client.listCalls.mockRejectedValueOnce(new MagickApiError(401, "token expired", "url"));
+
+    await runClaimedJob(job({ refreshToken: "refresh-1" }));
+
+    const deferral = repositories.updateClaimedJob.mock.calls.find(
+      ([, , patch]) => (patch as { status?: string }).status === "rate_limited",
+    );
+    expect(deferral?.[3]).toBeUndefined();
+  });
+
+  it("clears the credential when a dead refresh token ends the job", async () => {
+    token.mintIdToken.mockRejectedValueOnce(new TokenRefreshPermanentError("TOKEN_EXPIRED"));
+
+    await runClaimedJob(job({ refreshToken: "revoked" }));
+
+    const failure = repositories.updateClaimedJob.mock.calls.find(
+      ([, , patch]) => (patch as { status?: string }).status === "error",
+    );
+    expect(failure?.[3]).toEqual({ clearCredential: true });
+  });
+
   it("still fails outright on a data error", async () => {
     client.listCalls.mockRejectedValueOnce(new Error("upstream failed"));
 

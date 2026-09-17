@@ -163,6 +163,14 @@ export interface Job {
   batchIndex?: number;
   retryAt?: string | null;
   retryCount?: number;
+  /** Why a `rate_limited` job is paused. That status means "alive, paused,
+   *  resume at retryAt" and is reused for both throttling and an expired
+   *  credential — which are identical to the scheduler and opposite to the
+   *  customer. Without this the Combine screen told a user whose sign-in had
+   *  expired that the upstream was rate limiting them and to simply wait, when
+   *  waiting is the one thing that does not help: signing back in is what
+   *  re-stamps the job's credential and lets it finish. */
+  deferReason?: "rate_limited" | "credential";
   /** Deferrals caused by a CREDENTIAL problem, counted separately from
    *  `retryCount`. The two backoffs are independent: a large ingest legitimately
    *  hits rate limits many times, and sharing one counter would spend a long

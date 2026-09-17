@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { isAuthConfigured } from "@/lib/server/env";
-import { authMe, MagickApiError } from "@/lib/server/magick-client";
-import { getSession, stampCredential } from "@/lib/server/session";
+import { authMe, MagickApiError, type RawUser } from "@/lib/server/magick-client";
+import { getSession, stampCredential, type SessionUser } from "@/lib/server/session";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
+import { jsonBodyErrorResponse, parseJsonBody } from "@/lib/server/request";
 
 /** Re-stamp an existing session with a freshly minted Firebase ID token.
  *
@@ -20,20 +21,29 @@ import { log } from "@/lib/server/logger";
  *  the workspace the user is standing in if upstream returned a changed tenant
  *  list mid-session. This route touches the credential fields and nothing else.
  */
+/** Whether a refreshed token names the same person the session was issued to.
+ *
+ *  Compares on the upstream id, falling back to email when either side omits an
+ *  id. Returns FALSE when no field can be compared on both sides — an
+ *  unidentifiable user is a refusal, not a pass. */
+function sameUser(stored: SessionUser | undefined, refreshed: RawUser | null | undefined): boolean {
+  const pick = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+  const storedId = pick(stored?.id);
+  const refreshedId = pick(refreshed?.id);
+  if (storedId && refreshedId) return storedId === refreshedId;
+  const storedEmail = pick(stored?.email);
+  const refreshedEmail = pick(refreshed?.email);
+  if (storedEmail && refreshedEmail) return storedEmail.toLowerCase() === refreshedEmail.toLowerCase();
+  return false;
+}
+
 export const POST = withLogging("auth/refresh", async (req: Request) => {
   if (!isAuthConfigured()) {
     return NextResponse.json({ error: "auth_not_configured" }, { status: 503 });
   }
-  let body: { idToken?: string; refreshToken?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "invalid_json" }, { status: 400 });
-  }
-  if (!body.idToken) {
-    return NextResponse.json({ error: "missing_id_token" }, { status: 400 });
-  }
-
+  // The session check comes FIRST, and the body is read through `parseJsonBody`
+  // rather than `req.json()`, so an unauthenticated caller cannot make this
+  // long-running Node host buffer an arbitrary payload before being turned away.
   const session = await getSession();
   // Refresh extends a session; it never creates one. An expired or tampered
   // iron-session seal does not throw — it decrypts to `{}` — so presence of a
@@ -45,12 +55,25 @@ export const POST = withLogging("auth/refresh", async (req: Request) => {
     return NextResponse.json({ error: "not_authenticated" }, { status: 401 });
   }
 
+  let body: { idToken?: unknown };
+  try {
+    body = await parseJsonBody(req);
+  } catch (error) {
+    const response = jsonBodyErrorResponse(error);
+    if (response) return response;
+    throw error;
+  }
+  const idToken = typeof body.idToken === "string" ? body.idToken : "";
+  if (!idToken) {
+    return NextResponse.json({ error: "missing_id_token" }, { status: 400 });
+  }
+
   let me;
   try {
     // Cheapest possible proof that the token is real and accepted upstream —
     // no tenant headers, no data fetched. Stamping an unverified token would
     // let any script running on the page swap the cookie's credential.
-    me = await authMe(body.idToken);
+    me = await authMe(idToken);
   } catch (err) {
     const status = err instanceof MagickApiError ? err.status : 502;
     if (status === 401) {
@@ -71,14 +94,30 @@ export const POST = withLogging("auth/refresh", async (req: Request) => {
   // is only safe while the new token names the same user — otherwise the cookie
   // would authorize calls as someone else against the previous user's selected
   // tenant/account.
-  const rawId = me.user?.id;
-  const refreshedUserId = typeof rawId === "string" ? rawId : undefined;
-  if (session.user?.id && refreshedUserId && refreshedUserId !== session.user.id) {
-    log().warn({ userId: session.user.id }, "refresh token names a different user; refusing");
+  //
+  // This fails CLOSED. An earlier version only compared when both sides yielded
+  // an id, which meant the guard silently did nothing whenever one was missing —
+  // and `RawUser` is `{ [key: string]: unknown }`, so an id is genuinely not
+  // guaranteed, and the two sides read different upstream endpoints
+  // (`/auth/session` at login vs `/auth/me` here). A check that evaporates
+  // exactly when it cannot identify the user is not a check.
+  //
+  // Refusing costs little: the server-side path in `getTenantContext()` renews
+  // the session from its own stored refresh token regardless, so a deployment
+  // whose upstream returns an unidentifiable user loses this belt-and-braces
+  // hand-off, not the fix.
+  if (!sameUser(session.user, me.user)) {
+    log().warn({ userId: session.user?.id }, "refresh token does not verifiably name this session's user; refusing");
     return NextResponse.json({ error: "user_mismatch" }, { status: 403 });
   }
 
-  stampCredential(session, body.idToken, body.refreshToken);
+  // Only the ID token is taken from the request. The refresh token is the
+  // durable credential — everything the session does for the next eight hours is
+  // ultimately minted from it — and `authMe` above verifies only the ID token,
+  // so accepting one here would let a caller pair a valid ID token with someone
+  // else's refresh token and have the session act as them from the next hour on.
+  // It is set once, at login, from the same exchange that verified it.
+  stampCredential(session, idToken);
   try {
     await session.save();
   } catch (err) {

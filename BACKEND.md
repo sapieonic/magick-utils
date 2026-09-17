@@ -26,7 +26,8 @@ the worker when the backend is configured.
   the one place a stored ID token is refreshed before use — see *Token refresh*).
 - `firebase-token.ts` — exchanges a Firebase refresh token for a fresh ID token via Google's
   secure-token endpoint; classifies a failure as permanent (re-login) or transient (retry).
-- `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` with
+- `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` — which also
+  re-mints and retries once on a 401, see *Token refresh* — with
   `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `batchAnalytics`,
   `exportCallsCsv`).
 - `normalize.ts` — core call/message → `NormalizedRecord`; `buildBatchDoc`; dispatch-type mapping.
@@ -59,28 +60,58 @@ places cooperate, and they are deliberately independent so that losing one degra
 2. **Every route handler**, via `getTenantContext()`. It re-mints a near-expired token from the stored
    refresh token before handing it to any caller. This is why campaigns, ingest, export and analytics
    all inherit the fix with no per-route logic — and why reaching into `session.idToken` directly is a
-   bug that reintroduces the one-hour cliff.
-3. **The ingestion worker**, which carries the refresh token on the job so a long run can re-mint
-   mid-flight rather than dying at the hour mark.
+   bug that reintroduces the one-hour cliff. The **one** legitimate exception is `/api/accounts`, which
+   runs before a workspace is chosen and so has no tenant/account for `getTenantContext()` to return;
+   it uses `getFreshIdToken()` instead. That route was the last screen still on the cliff — a user who
+   idled an hour, came back to a working dashboard and clicked "Switch workspace" was bounced by the
+   account cascade alone.
+3. **`MagickClient` itself**, which on a magick-master 401 mints a replacement and retries the call
+   **once**. This catches the case the freshness check cannot: revoking a user kills the refresh token
+   while the ID token still has minutes left on it, so nothing looks stale until upstream refuses it.
+   Routes pass `onCredentialRefresh: persistRefreshedCredential` so a rotated refresh token reaches the
+   cookie instead of living only in that request's memory.
+4. **The ingestion worker**, which carries the refresh token on the job so a long run can re-mint
+   mid-flight rather than dying at the hour mark. It mints *pre-flight* too: a job resumed after a
+   deferral or a host restart is holding the token from whichever request enqueued it.
 
 `firebase-token.ts` splits failures the same way `call-analysis.ts` splits settled from momentary, and
 for the same reason: a **transient** failure (5xx, network, timeout) must keep the session and retry —
 Google being briefly unreachable must not sign everyone out — while a **permanent** one (`TOKEN_EXPIRED`,
-`USER_DISABLED`, `USER_NOT_FOUND`, `INVALID_REFRESH_TOKEN`) clears the session, because retrying a
-revoked credential forever is worse than asking for a login. An *unrecognised* 400 is treated as
+`USER_DISABLED`, `USER_NOT_FOUND`, `INVALID_REFRESH_TOKEN`, `MISSING_REFRESH_TOKEN`) clears the session,
+because retrying a revoked credential forever is worse than asking for a login. A permanent refusal that
+surfaces inside a route is mapped to `401 session_expired` rather than a generic 502 — the client only
+reacts to a 401, so anything else leaves the user staring at an error with a dead cookie nobody clears. An *unrecognised* 400 is treated as
 transient on purpose: guessing "permanent" wrongly signs a working user out.
 
 Notes for anyone changing this:
-- **The refresh token is a long-lived credential at rest.** Unlike the ID token it does not expire. Two
-  things keep storing it on a job acceptable and both are load-bearing: `deleteJobsOlderThan` sweeps
-  jobs within `DATA_RETENTION_DAYS`, and `REDACT_PATHS` (`logger.ts`) keeps it out of log storage.
+- **The refresh token is a long-lived credential at rest.** Unlike the ID token it does not expire, so
+  a job must not keep one a moment longer than it needs it. `updateClaimedJob(..., { clearCredential })`
+  `$unset`s both tokens in the *same atomic write* that ends a job, so a thirty-second merge does not
+  leave a standing credential behind; the retention sweep (`deleteJobsOlderThan`, bounded by
+  `DATA_RETENTION_DAYS`) is the **backstop** for jobs that never reach a terminal state, not the primary
+  eraser. Treat it as a backstop with real gaps: it runs only from the external cron
+  (`POST /api/cron/cleanup`, which 503s unless `CRON_SECRET` is set), and there is no TTL index on
+  `jobs` to catch what the cron misses — `createdAt` is an ISO *string*, and Mongo TTL indexes act only
+  on BSON `Date`.
+- **`REDACT_PATHS` (`logger.ts`) keeps it out of log storage**, and is load-bearing for the same reason.
+  Mind the caveat the file itself states: pino wildcards are single-segment, so `*.refreshToken` does
+  **not** cover a nested `context.job.refreshToken`. Nothing logs a whole `Job` or `TenantContext`
+  today; if you add such a call site, the redaction will not save you.
 - **Cookie budget.** iron-session *throws* above 4096 bytes. The session already holds an ID token
-  (~1KB), the refresh token, and a `tenants[]` array with nested accounts. `getTenantContext()`
-  therefore tolerates a failed save rather than letting one oversized cookie 500 every screen.
+  (~1KB), the refresh token, and a `tenants[]` array with nested accounts. `getTenantContext()` and
+  `/api/auth/refresh` therefore tolerate a failed save rather than letting one oversized cookie 500
+  every screen; login cannot tolerate it and reports `session_too_large` rather than blaming
+  magick-master for a cookie this app could not write.
 - **`ttl`, not `cookieOptions.maxAge`.** Setting `maxAge` yourself takes an iron-session branch that
   leaves `ttl` at its 14-day default and derives neither value from the other — which left the seal
   replayable for ~13 days after the browser dropped the cookie. Passing `ttl` alone derives
   `maxAge = ttl - 60`.
+- **A paused job carries `deferReason`.** `rate_limited` is reused as the "alive, paused, resume at
+  `retryAt`" status for both throttling and an expired credential, because the scheduler treats them
+  identically — but the customer must not. Combine reads `deferReason` to choose between "the upstream
+  is throttling us, just wait" and "your sign-in expired; sign in again and reopen this screen". Only
+  the second is actionable, and telling a signed-out user to wait sends them away from the one thing
+  that rescues the merge.
 
 ### Sentiment and key topics
 

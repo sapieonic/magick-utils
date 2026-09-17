@@ -79,6 +79,10 @@ export function CombineScreen() {
   );
   const [error, setError] = useState<string | null>(null);
   const [rateLimitRetryAt, setRateLimitRetryAt] = useState<string | null>(null);
+  // A paused job's status is `rate_limited` whether upstream is throttling us or
+  // the caller's sign-in expired. Telling a signed-out user to wait sends them
+  // away from the only thing that rescues the merge.
+  const [pausedReason, setPausedReason] = useState<"rate_limited" | "credential" | null>(null);
   const [prepared, setPrepared] = useState<PreparedExport | null>(readPrepared);
   const schedulingRef = useRef(false);
 
@@ -174,7 +178,9 @@ export function CombineScreen() {
         if (job) {
           setError(null);
           setProg((current) => Math.max(current, jobProgressPercent(job.done, job.total, job.status)));
-          setRateLimitRetryAt(job.status === "rate_limited" ? job.retryAt : null);
+          const paused = job.status === "rate_limited";
+          setRateLimitRetryAt(paused ? job.retryAt : null);
+          setPausedReason(paused ? job.deferReason ?? "rate_limited" : null);
           if (job.status === "done") {
             setProg(100);
             setPhase("done");
@@ -560,11 +566,22 @@ export function CombineScreen() {
                     />
                     {rateLimitRetryAt && (
                       <div className="mt-3 flex items-start gap-2 text-[13px] text-amber-700">
-                        <Icon name="Clock3" size={15} className="mt-0.5 shrink-0" />
+                        <Icon name={pausedReason === "credential" ? "LogIn" : "Clock3"} size={15} className="mt-0.5 shrink-0" />
                         <span>
-                          Rate limit reached. This job will retry automatically at{" "}
-                          {formatAppClock(rateLimitRetryAt)} IST. You can refresh this page;
-                          the merge will resume.
+                          {pausedReason === "credential" ? (
+                            <>
+                              Your sign-in expired while this merge was running. Sign in again and
+                              reopen this screen to let it finish — it will retry on its own at{" "}
+                              {formatAppClock(rateLimitRetryAt)} IST, but only signing back in
+                              renews the access it needs.
+                            </>
+                          ) : (
+                            <>
+                              Rate limit reached. This job will retry automatically at{" "}
+                              {formatAppClock(rateLimitRetryAt)} IST. You can refresh this page;
+                              the merge will resume.
+                            </>
+                          )}
                         </span>
                       </div>
                     )}
