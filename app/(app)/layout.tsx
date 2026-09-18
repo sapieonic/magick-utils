@@ -64,9 +64,12 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const switchWorkspace = () => router.push("/workspace");
   const doSignOut = async () => {
     // Awaited so the cookie-clearing response lands before /login loads and asks
-    // the server whether this browser is still authenticated.
-    await signOut();
-    router.push("/login");
+    // the server whether this browser is still authenticated. A sign-out the
+    // server never confirmed is reported on the login screen rather than
+    // swallowed — on a shared machine, silently leaving a live session behind is
+    // the exact failure this whole path exists to prevent.
+    const ended = await signOut();
+    router.push(ended ? "/login" : "/login?signout=incomplete");
   };
 
   return (

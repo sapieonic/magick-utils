@@ -150,8 +150,8 @@ export default function WorkspacePage() {
   };
 
   const onBack = async () => {
-    await signOut();
-    router.push("/login");
+    const ended = await signOut();
+    router.push(ended ? "/login" : "/login?signout=incomplete");
   };
 
   return (

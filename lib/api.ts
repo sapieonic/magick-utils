@@ -391,21 +391,38 @@ export async function postContext(tenantId: string, accountId: string): Promise<
   }
 }
 
+/** True once a sign-out has begun in this tab.
+ *
+ *  `postRefresh` checks it so an in-flight refresher cannot re-seal the cookie
+ *  that logout is about to clear. iron-session is stateless: `/api/auth/refresh`
+ *  reads the session, stamps it and writes it back, so a refresh that read the
+ *  session BEFORE logout destroyed it would resurrect it by saving afterwards. */
+let sessionEnded = false;
+
 /** Destroy the server session cookie.
  *
  *  `POST /api/auth/logout` existed from the start but nothing ever called it —
  *  signing out only cleared React state and sessionStorage, leaving the cookie
  *  live. That was survivable while the cookie carried a credential that died
  *  within the hour; it is not now that the session can renew itself for its
- *  whole 8h life. Never throws: a failed logout must not strand the user on a
- *  screen they are trying to leave, and the client-side state is cleared
- *  regardless. */
-export async function postLogout(): Promise<void> {
-  try {
-    await fetch("/api/auth/logout", { method: "POST", cache: "no-store" });
-  } catch {
-    // Offline or the route is unreachable — the local sign-out still proceeds.
+ *  whole 8h life.
+ *
+ *  Returns whether the server actually confirmed the session was destroyed.
+ *  `fetch` does not throw on a 4xx/5xx, so treating "it returned" as success
+ *  reported a sign-out that never happened — precisely the shared-machine case
+ *  this exists to close. Retried once, because the cost of a spurious failure
+ *  report is a scary message and the cost of a missed one is a live session. */
+export async function postLogout(): Promise<boolean> {
+  sessionEnded = true;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await fetch("/api/auth/logout", { method: "POST", cache: "no-store" });
+      if (res.ok) return true;
+    } catch {
+      // Offline or unreachable — fall through to the retry, then report failure.
+    }
   }
+  return false;
 }
 
 /** Hand a freshly minted Firebase ID token to the BFF so the session cookie
@@ -430,6 +447,8 @@ export type RefreshOutcome =
   | "refused";
 
 export async function postRefresh(idToken: string): Promise<RefreshOutcome> {
+  // Never hand a credential back to a session this tab is signing out of.
+  if (sessionEnded) return "refused";
   const res = await fetch("/api/auth/refresh", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

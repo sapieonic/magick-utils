@@ -30,6 +30,7 @@
 // values win and this quietly becomes a no-op.
 
 import { MagickApiError, MagickClient, type RawBatchAnalytics } from "./magick-client";
+import { persistRefreshedCredential } from "./session";
 import { MAX_TOPICS, SENTIMENT_ORDER, sentimentDisplayName } from "./aggregate";
 import { log } from "./logger";
 import type { AggregatesDoc, BatchDoc, TenantContext } from "./types";
@@ -273,7 +274,12 @@ async function fetchRollup(
   jobIds: string[],
   key: string,
 ): Promise<RawBatchAnalytics | null> {
-  const client = MagickClient.fromContext(ctx);
+  // Passed the same persistence hook the routes use. Without it a 401 here
+  // re-minted a working token that was then thrown away with the request, so the
+  // session kept the rejected one and every later analytics, insights or chat
+  // call repeated the same 401-and-exchange — and a rotated refresh token, which
+  // `firebase-token.ts` says callers MUST persist, was lost outright.
+  const client = MagickClient.fromContext(ctx, { onCredentialRefresh: persistRefreshedCredential });
   try {
     return await client.batchAnalytics(jobIds);
   } catch (err) {

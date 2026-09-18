@@ -7,7 +7,7 @@ import type { ReactNode } from "react";
 // Firebase SDK's stored refresh token. Both are stubbed so the store's own
 // behaviour is what these tests observe, and so neither hangs the awaited
 // sign-out.
-vi.mock("@/lib/api", () => ({ postLogout: vi.fn(async () => {}) }));
+vi.mock("@/lib/api", () => ({ postLogout: vi.fn(async () => true) }));
 vi.mock("@/lib/firebase", () => ({ firebaseSignOut: vi.fn(async () => {}) }));
 
 import { AppProvider, useApp } from "@/lib/store";
@@ -22,6 +22,7 @@ const wrapper = ({ children }: { children: ReactNode }) => <AppProvider>{childre
 beforeEach(() => {
   sessionStorage.clear();
   vi.mocked(postLogout).mockClear();
+  vi.mocked(postLogout).mockResolvedValue(true);
   vi.mocked(firebaseSignOut).mockClear();
 });
 
@@ -135,13 +136,43 @@ describe("signOut", () => {
     expect(firebaseSignOut).toHaveBeenCalledTimes(1);
   });
 
+  it("reports an unconfirmed sign-out instead of claiming success", async () => {
+    // Callers route to /login?signout=incomplete on false, which surfaces it.
+    // Swallowing it told a user on a shared machine they had signed out while
+    // the session cookie was still live.
+    vi.mocked(postLogout).mockResolvedValueOnce(false);
+    const { result } = renderHook(() => useApp(), { wrapper });
+
+    let ended: boolean | undefined;
+    await act(async () => {
+      ended = await result.current.signOut();
+    });
+
+    expect(ended).toBe(false);
+  });
+
+  it("signs out of Firebase BEFORE clearing the server session", async () => {
+    // Ordering, not concurrency: the SDK must stop minting tokens before the
+    // cookie is cleared. Run together, an in-flight /api/auth/refresh could land
+    // after logout and re-seal the very session being destroyed, because
+    // iron-session reads, stamps and writes the session back.
+    const order: string[] = [];
+    vi.mocked(firebaseSignOut).mockImplementationOnce(async () => { order.push("firebase"); });
+    vi.mocked(postLogout).mockImplementationOnce(async () => { order.push("logout"); return true; });
+    const { result } = renderHook(() => useApp(), { wrapper });
+
+    await act(async () => { await result.current.signOut(); });
+
+    expect(order).toEqual(["firebase", "logout"]);
+  });
+
   it("does not resolve until the server session is actually gone", async () => {
     // Callers navigate to /login the moment this resolves, and /login asks the
     // server whether this browser is still authenticated. Resolving early races
     // the Set-Cookie that clears it.
     let releaseLogout = () => {};
     vi.mocked(postLogout).mockImplementationOnce(
-      () => new Promise<void>((resolve) => { releaseLogout = resolve; }),
+      () => new Promise<boolean>((resolve) => { releaseLogout = () => resolve(true); }),
     );
     const { result } = renderHook(() => useApp(), { wrapper });
 

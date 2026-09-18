@@ -139,11 +139,45 @@ describe("postLogout", () => {
     expect(init?.cache).toBe("no-store");
   });
 
-  it("never throws, so a failed logout cannot strand the user", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => {
+  it("reports failure instead of throwing when the server is unreachable", async () => {
+    const fetchMock = vi.fn(async () => {
       throw new Error("offline");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await freshApi();
+    // Never throws — a failed logout must not strand the user on a screen they
+    // are trying to leave — but it must not claim success either.
+    await expect(api.postLogout()).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports failure on a non-2xx, which fetch does NOT throw for", async () => {
+    // The whole bug: `fetch` resolves for a 500, so "it returned" was read as
+    // "the session is gone" and the user was told they had signed out while the
+    // HttpOnly cookie stayed live — the shared-machine case this path exists for.
+    vi.stubGlobal("fetch", vi.fn(async () => res(500)));
+    const api = await freshApi();
+    await expect(api.postLogout()).resolves.toBe(false);
+  });
+
+  it("succeeds on a retry after one transient failure", async () => {
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      return call === 1 ? res(502) : res(200);
     }));
     const api = await freshApi();
-    await expect(api.postLogout()).resolves.toBeUndefined();
+    await expect(api.postLogout()).resolves.toBe(true);
+  });
+
+  it("stops this tab refreshing once a sign-out has begun", async () => {
+    // iron-session is stateless: /api/auth/refresh reads the session, stamps it
+    // and writes it back. A refresh that read the session before logout cleared
+    // it would resurrect it by saving afterwards.
+    vi.stubGlobal("fetch", vi.fn(async () => res(200)));
+    const api = await freshApi();
+    await api.postLogout();
+
+    await expect(api.postRefresh("id-after-logout")).resolves.toBe("refused");
   });
 });

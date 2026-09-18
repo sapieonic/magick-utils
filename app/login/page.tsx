@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState, type ChangeEvent, type FormEvent, type MouseEvent } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Button, Icon, Input, Spinner } from "@/components/ui";
 import { Logo } from "@/components/Logo";
 import { backendStatus, postSession } from "@/lib/api";
@@ -36,9 +36,25 @@ export default function LoginPage() {
   const [showToken, setShowToken] = useState(false);
   const [idToken, setIdToken] = useState("");
 
+  // A sign-out the server never confirmed arrives as `?signout=incomplete`. Say
+  // so: the user believes they are signed out, and on a shared machine a session
+  // cookie this app failed to clear is exactly what must not pass unmentioned.
+  //
+  // Derived during render rather than pushed into state from an effect — it is a
+  // value read from the URL, not an event. Reading `window.location` directly
+  // would differ between the server render and the client one; `useSearchParams`
+  // does not, and this route is server-rendered on demand, so it costs no
+  // prerendering.
+  const signOutIncomplete = useSearchParams().get("signout") === "incomplete";
+  const notice = error ||
+    (signOutIncomplete
+      ? "We could not confirm your sign-out with the server, so your session may still be active. Sign in again and retry, or close this browser if you are on a shared machine."
+      : "");
+
   useEffect(() => {
     backendStatus().then((s) => setBackendOn(s.backend));
   }, []);
+
 
   const submit = async (e: FormEvent | null, via: "google" | "email" | "token") => {
     e?.preventDefault();
@@ -118,10 +134,10 @@ export default function LoginPage() {
             <p className="text-slate-500 text-sm mt-1.5">{brand.tagline}</p>
           </div>
 
-          {error && (
+          {notice && (
             <div className="mb-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 text-[13px] text-red-700 fade-in">
               <Icon name="AlertCircle" size={16} className="mt-0.5 shrink-0" />
-              <span>{error}</span>
+              <span>{notice}</span>
             </div>
           )}
 

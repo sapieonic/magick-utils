@@ -21,7 +21,7 @@ interface AppState {
   setCombineTargets: (ids: string[]) => void;
   analyzeTargets: string[];
   setAnalyzeTargets: (ids: string[]) => void;
-  signOut: () => Promise<void>;
+  signOut: () => Promise<boolean>;
 }
 
 const AppCtx = createContext<AppState | null>(null);
@@ -85,14 +85,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
    *  can renew itself for its whole life.
    *
    *  Awaited by callers before they navigate, so the Set-Cookie that clears the
-   *  session lands before the next screen asks whether it is authenticated. */
+   *  session lands before the next screen asks whether it is authenticated.
+   *
+   *  Returns false when the server did NOT confirm the session was destroyed,
+   *  so the caller can say so rather than showing a sign-out that did not
+   *  happen. Ordered, not concurrent: Firebase goes first so the SDK stops
+   *  minting tokens before the cookie is cleared, which closes the window where
+   *  an in-flight `/api/auth/refresh` could land after logout and re-seal the
+   *  very session being destroyed. `postLogout()` also latches a flag that stops
+   *  this tab issuing any further refresh. (A refresh already in flight when the
+   *  click lands, or one from another tab, is not covered — that would need a
+   *  shared abort channel.) */
   const signOut = useCallback(async () => {
     sessionStorage.removeItem(KEY);
     setWorkspaceState(null);
     setUserState(null);
     setCombineTargetsState([]);
     setAnalyzeTargetsState([]);
-    await Promise.all([postLogout(), firebaseSignOut()]);
+    await firebaseSignOut();
+    return postLogout();
   }, []);
 
   const value = useMemo<AppState>(

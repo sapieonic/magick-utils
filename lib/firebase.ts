@@ -70,8 +70,19 @@ export async function emailSignIn(email: string, password: string): Promise<Fire
  *  those hours.
  *
  *  Fires once on registration with the restored user (or null when signed out).
- *  That first call is wanted, not noise: it is what stamps a refresh token onto
- *  sessions established before the cookie had a field to keep one in.
+ *  That first call is wanted, not noise: it re-stamps the cookie with a live ID
+ *  token as soon as the shell mounts, rather than waiting for the SDK's next
+ *  scheduled refresh.
+ *
+ *  It does NOT back-fill a refresh token. `refreshToken` below reaches the
+ *  server only through the login exchange, which verifies it; `/api/auth/refresh`
+ *  deliberately refuses to accept one from the page, because `authMe` verifies
+ *  the ID token alone and a caller could otherwise pair a valid ID token with
+ *  someone else's durable credential. The consequence is a real and accepted
+ *  limitation: a session predating this field — or one established by pasting an
+ *  ID token — never gains server-side renewal. It stays alive only while a tab
+ *  is open to re-stamp it, and dies at the ID token's hour once that tab closes.
+ *  Signing in again is what fixes it.
  *
  *  No-ops — returning a no-op unsubscribe — when Firebase is unconfigured, so
  *  mock mode and the token-paste flow never reach the SDK. */

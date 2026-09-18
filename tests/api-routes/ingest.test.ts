@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/server/env", () => ({ isBackendConfigured: vi.fn() }));
-// No `getSession` on purpose. The route must take its credential from
-// `getTenantContext()` — the one place a near-expired ID token is re-minted —
-// and never from a second read of the raw session. Leaving the export off this
-// mock makes any reintroduced `getSession()` call fail this whole file loudly
-// instead of quietly re-arming the 1-hour cliff.
+// `getSession` is present for ONE purpose: destroying a session whose refresh
+// token is permanently dead, which is what campaigns does too. It must never be
+// used to READ a credential — that belongs to `getTenantContext()`, the one
+// place a near-expired ID token is re-minted, and a second raw read is how the
+// 1-hour cliff gets quietly re-armed. "stamps a new job with BOTH halves of the
+// context's credential" below is the assertion that pins that.
 vi.mock("@/lib/server/session", () => ({
   getTenantContext: vi.fn(),
+  getSession: vi.fn(async () => ({ destroy: sessionDestroy })),
   persistRefreshedCredential,
 }));
 vi.mock("@/lib/server/repositories", () => ({
@@ -24,12 +26,14 @@ vi.mock("@/lib/server/magick-client", () => ({
 }));
 
 // hoisted so the (also-hoisted) factories above can close over them
-const { getBulkJob, persistRefreshedCredential } = vi.hoisted(() => ({
+const { getBulkJob, persistRefreshedCredential, sessionDestroy } = vi.hoisted(() => ({
   getBulkJob: vi.fn(),
   persistRefreshedCredential: vi.fn(),
+  sessionDestroy: vi.fn(),
 }));
 
 import { isBackendConfigured } from "@/lib/server/env";
+import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
 import { getTenantContext } from "@/lib/server/session";
 import {
@@ -255,6 +259,52 @@ describe("POST /api/ingest", () => {
     const json = await res.json();
     expect(json).toMatchObject({ total: 10, done: 0, ready: false });
     expect(typeof json.jobId).toBe("string");
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the session and 401s when the refresh check hits a dead credential", async () => {
+    // The source-check catch treats a failure as "re-ingest to be safe". For a
+    // permanently dead credential that was the worst of both worlds: a full
+    // duplicate dataset queued, a job id handed back, and the worker failing it
+    // moments later — instead of clearing the session and bouncing the user to
+    // /login the way every other route does.
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockRejectedValue(new TokenRefreshPermanentError("USER_DISABLED"));
+
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: "session_expired", detail: "USER_DISABLED" });
+    expect(sessionDestroy).toHaveBeenCalledTimes(1);
+    // The point of the fix: no duplicate dataset queued behind a dead login.
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  it("still re-ingests when the source check fails for any OTHER reason", async () => {
+    // Only an unrenewable credential short-circuits. An ordinary upstream blip
+    // must keep the old "re-ingest to be safe" behaviour.
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockRejectedValue(new Error("upstream had a bad minute"));
+
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+
+    expect(res.status).toBe(200);
     expect(createJob).toHaveBeenCalledTimes(1);
   });
 

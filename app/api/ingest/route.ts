@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isBackendConfigured } from "@/lib/server/env";
-import { getTenantContext, persistRefreshedCredential } from "@/lib/server/session";
+import { getSession, getTenantContext, persistRefreshedCredential } from "@/lib/server/session";
+import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
 import {
@@ -75,6 +76,12 @@ async function refreshableBatchIds(
             return null;
           }
         } catch (err) {
+          // A credential that can never be renewed is NOT a source-check
+          // failure. Swallowing it here queued a full re-ingest — a complete
+          // duplicate dataset, per the batch revision rules — and handed back a
+          // job id that the worker then failed, instead of clearing the dead
+          // session and bouncing the user to /login as every other route does.
+          if (err instanceof TokenRefreshPermanentError) throw err;
           log().warn({ error: err, batchId }, "refresh source check failed — re-ingesting to be safe");
         }
         return batchId;
@@ -134,9 +141,23 @@ export const POST = withLogging("ingest", async (req: Request) => {
   const complete = requestedBatchIds.map(
     (_, index) => isBatchReadable(batchDocs[index]) && counts[index] === batchDocs[index].total,
   );
-  const batchIds = forceRefresh
-    ? await refreshableBatchIds(ctx, requestedBatchIds, batchDocs, complete)
-    : requestedBatchIds.filter((_, index) => !complete[index]);
+  let batchIds: string[];
+  try {
+    batchIds = forceRefresh
+      ? await refreshableBatchIds(ctx, requestedBatchIds, batchDocs, complete)
+      : requestedBatchIds.filter((_, index) => !complete[index]);
+  } catch (error) {
+    // Same treatment campaigns gives it: the stored session is unrenewable, so
+    // clear it and answer 401 rather than 500-ing or, worse, enqueueing work
+    // that cannot possibly authenticate.
+    if (error instanceof TokenRefreshPermanentError) {
+      const session = await getSession();
+      session.destroy();
+      log().warn({ reason: error.reason }, "ingest credential is unrenewable — session expired, cleared");
+      return NextResponse.json({ error: "session_expired", detail: error.reason }, { status: 401 });
+    }
+    throw error;
+  }
   if (batchIds.length === 0) {
     // `upToDate` distinguishes "we checked upstream and there is nothing new"
     // from "these batches were already ingested". Without it a refresh that

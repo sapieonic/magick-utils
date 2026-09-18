@@ -49,7 +49,7 @@ theoretical one: for seven of every eight hours the cookie carried a credential 
 already stopped accepting, so `/campaigns` 401'd and bounced the user to `/login` mid-session, and any
 ingest still running an hour after login died and **discarded its staged revision**.
 
-The credential is now refreshed instead of being allowed to expire under a longer-lived cookie. Three
+The credential is now refreshed instead of being allowed to expire under a longer-lived cookie. Four
 places cooperate, and they are deliberately independent so that losing one degrades rather than breaks:
 
 1. **The browser** (`components/SessionRefresher.tsx`, mounted in `app/(app)/layout.tsx`) keeps a
