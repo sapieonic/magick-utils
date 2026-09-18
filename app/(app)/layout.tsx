@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
+import { SessionRefresher } from "@/components/SessionRefresher";
 import { backendStatus, fetchMe } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import { useBrand } from "@/components/brand/BrandProvider";
@@ -61,13 +62,23 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   }
 
   const switchWorkspace = () => router.push("/workspace");
-  const doSignOut = () => {
-    signOut();
-    router.push("/login");
+  const doSignOut = async () => {
+    // Awaited so the cookie-clearing response lands before /login loads and asks
+    // the server whether this browser is still authenticated. A sign-out the
+    // server never confirmed is reported on the login screen rather than
+    // swallowed — on a shared machine, silently leaving a live session behind is
+    // the exact failure this whole path exists to prevent.
+    const ended = await signOut();
+    router.push(ended ? "/login" : "/login?signout=incomplete");
   };
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-[#f6f7f9]">
+      {/* Mounted with the shell, not per screen: a Firebase ID token lasts an
+          hour and this cookie eight, so something has to hold an `Auth` object —
+          and therefore the SDK's refresh scheduler — open for as long as the user
+          is inside the app. It renders nothing and no-ops without Firebase. */}
+      <SessionRefresher />
       <Sidebar workspace={workspace} collapsed={collapsed} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} onSwitch={switchWorkspace} />
       <div className="flex-1 flex flex-col min-w-0 h-full">
         <Topbar

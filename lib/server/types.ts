@@ -18,7 +18,15 @@ export function isBatchReadable(batch: Pick<BatchDoc, "ingestStatus">): boolean 
 export interface TenantContext {
   tenantId: string;
   accountId: string;
-  idToken: string; // Firebase ID token, forwarded as Bearer to magick-master
+  /** Firebase ID token, forwarded as Bearer to magick-master. Valid for one
+   *  hour from when it was minted — treat it as perishable, not as an identity. */
+  idToken: string;
+  /** Firebase refresh token, when the session has one. Lets a long-running
+   *  caller (the ingestion worker) re-mint `idToken` instead of dying at the
+   *  one-hour mark. Absent when the deployment has no Firebase Web API key, or
+   *  for a session established by pasting an ID token in local testing — both
+   *  cases degrade to the old behaviour rather than failing. */
+  refreshToken?: string;
 }
 
 /** Cached campaign/batch metadata. Mirrors the frontend `Batch` shape so the UI
@@ -134,9 +142,17 @@ export interface Job {
   tenantId: string;
   accountId: string;
   /** Caller's Firebase ID token, stored so the background worker can call
-   *  magick-master on the user's behalf. V1 tradeoff — see PROPOSAL (refresh
-   *  tokens / service credentials are an iterate-later concern). */
+   *  magick-master on the user's behalf. Perishable: it expires an hour after
+   *  login, which is well inside the time a large ingest can take. */
   idToken?: string;
+  /** Caller's Firebase refresh token, so the worker can mint a replacement
+   *  `idToken` mid-run instead of failing the job at the one-hour mark.
+   *
+   *  This is a long-lived credential at rest. Two things keep that acceptable
+   *  and both are load-bearing: `deleteJobsOlderThan` (repositories.ts) sweeps
+   *  every job within `DATA_RETENTION_DAYS`, and `REDACT_PATHS` (logger.ts)
+   *  keeps it out of log storage. Removing either turns this field into a leak. */
+  refreshToken?: string;
   batchIds: string[];
   /** For insights jobs: the backend-configured model. */
   model?: string;
@@ -147,6 +163,21 @@ export interface Job {
   batchIndex?: number;
   retryAt?: string | null;
   retryCount?: number;
+  /** Why a `rate_limited` job is paused. That status means "alive, paused,
+   *  resume at retryAt" and is reused for both throttling and an expired
+   *  credential — which are identical to the scheduler and opposite to the
+   *  customer. Without this the Combine screen told a user whose sign-in had
+   *  expired that the upstream was rate limiting them and to simply wait, when
+   *  waiting is the one thing that does not help: signing back in is what
+   *  re-stamps the job's credential and lets it finish. */
+  deferReason?: "rate_limited" | "credential";
+  /** Deferrals caused by a CREDENTIAL problem, counted separately from
+   *  `retryCount`. The two backoffs are independent: a large ingest legitimately
+   *  hits rate limits many times, and sharing one counter would spend a long
+   *  job's entire auth grace on throttling it already survived — landing the
+   *  penalty on exactly the jobs most likely to outlive their token and most
+   *  worth rescuing. */
+  authRetryCount?: number;
   leaseUntil?: string | null;
   leaseId?: string | null;
   fingerprint?: string;

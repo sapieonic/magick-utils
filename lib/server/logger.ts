@@ -28,12 +28,16 @@ function buildStreams(): pino.StreamEntry<pino.LevelWithSilent>[] {
 }
 
 // Secret-bearing fields that must never reach stdout or log storage. magick-utils
-// carries Firebase `idToken` on jobs/contexts and may log request headers.
+// carries Firebase `idToken` AND `refreshToken` on jobs/contexts and may log
+// request headers. The refresh token matters most: unlike the ID token it does
+// not expire, so one leaked line is a standing credential rather than an hour's.
 // Note: "*.idToken" matches one nesting level only (pino wildcards are single-segment);
 // deeper paths like context.job.idToken are not covered.
 export const REDACT_PATHS = [
   "idToken",
   "*.idToken",
+  "refreshToken",
+  "*.refreshToken",
   "headers.authorization",
   'headers["x-api-key"]',
   "req.headers.authorization",

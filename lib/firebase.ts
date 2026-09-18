@@ -7,9 +7,12 @@ import { initializeApp, getApps, getApp, type FirebaseApp } from "firebase/app";
 import {
   getAuth,
   GoogleAuthProvider,
+  onIdTokenChanged,
+  signOut as firebaseAuthSignOut,
   signInWithPopup,
   signInWithEmailAndPassword,
   type Auth,
+  type User,
 } from "firebase/auth";
 
 const config = {
@@ -31,12 +34,106 @@ function auth(): Auth {
   return _auth;
 }
 
-export async function googleSignIn(): Promise<string> {
-  const cred = await signInWithPopup(auth(), new GoogleAuthProvider());
-  return cred.user.getIdToken();
+/** A credential pair as the BFF wants it: the perishable ID token that is
+ *  Bearer'd upstream, plus the long-lived refresh token the server stores so it
+ *  can mint the next one without a human at a login screen.
+ *
+ *  Always read `refreshToken` off the live `User` rather than caching the value
+ *  seen at sign-in — the SDK replaces it if Google ever rotates it, and a stale
+ *  copy is a credential the secure-token endpoint will refuse. */
+export interface FirebaseCredential {
+  idToken: string;
+  refreshToken: string;
 }
 
-export async function emailSignIn(email: string, password: string): Promise<string> {
+async function credentialFor(user: User, force = false): Promise<FirebaseCredential> {
+  return { idToken: await user.getIdToken(force), refreshToken: user.refreshToken };
+}
+
+export async function googleSignIn(): Promise<FirebaseCredential> {
+  const cred = await signInWithPopup(auth(), new GoogleAuthProvider());
+  return credentialFor(cred.user);
+}
+
+export async function emailSignIn(email: string, password: string): Promise<FirebaseCredential> {
   const cred = await signInWithEmailAndPassword(auth(), email, password);
-  return cred.user.getIdToken();
+  return credentialFor(cred.user);
+}
+
+/** Subscribe to ID-token changes; returns the unsubscribe function.
+ *
+ *  Registering this matters as much for its side effect as for its callback:
+ *  constructing `Auth` is what starts the SDK's own proactive refresh
+ *  scheduler. This module used to be imported by `/login` alone, so on every
+ *  other screen no `Auth` object existed, nothing re-minted the hour-long ID
+ *  token, and the 8h session cookie carried a dead credential for seven of
+ *  those hours.
+ *
+ *  Fires once on registration with the restored user (or null when signed out).
+ *  That first call is wanted, not noise: it re-stamps the cookie with a live ID
+ *  token as soon as the shell mounts, rather than waiting for the SDK's next
+ *  scheduled refresh.
+ *
+ *  It does NOT back-fill a refresh token. `refreshToken` below reaches the
+ *  server only through the login exchange, which verifies it; `/api/auth/refresh`
+ *  deliberately refuses to accept one from the page, because `authMe` verifies
+ *  the ID token alone and a caller could otherwise pair a valid ID token with
+ *  someone else's durable credential. The consequence is a real and accepted
+ *  limitation: a session predating this field — or one established by pasting an
+ *  ID token — never gains server-side renewal. It stays alive only while a tab
+ *  is open to re-stamp it, and dies at the ID token's hour once that tab closes.
+ *  Signing in again is what fixes it.
+ *
+ *  No-ops — returning a no-op unsubscribe — when Firebase is unconfigured, so
+ *  mock mode and the token-paste flow never reach the SDK. */
+export function watchIdToken(cb: (cred: FirebaseCredential | null) => void): () => void {
+  if (!isFirebaseConfigured()) return () => {};
+  try {
+    return onIdTokenChanged(auth(), (user: User | null) => {
+      if (!user) {
+        cb(null);
+        return;
+      }
+      credentialFor(user).then(cb, () => cb(null));
+    });
+  } catch {
+    // A malformed config must not take the app shell down with it — the caller
+    // is a background refresher, not a login screen.
+    return () => {};
+  }
+}
+
+/** The signed-in user's current credential, or null when Firebase is off, the
+ *  SDK has not restored a user yet, or the token could not be obtained.
+ *
+ *  `getIdToken()` re-mints on its own once the cached token is near expiry,
+ *  which is the whole point of the wake path: a laptop that slept through the
+ *  SDK's refresh timer fires no `onIdTokenChanged` when it resumes, so the
+ *  visibility handler has to ask for the token explicitly to get a fresh one.
+ *  `force` bypasses the SDK cache outright; the wake path deliberately doesn't
+ *  use it, since a network round trip on every tab focus buys nothing. */
+export async function currentIdToken(force = false): Promise<FirebaseCredential | null> {
+  if (!isFirebaseConfigured()) return null;
+  try {
+    const user = auth().currentUser;
+    return user ? await credentialFor(user, force) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Sign the Firebase SDK out, clearing the refresh token it keeps in IndexedDB.
+ *
+ *  Without this, "Sign out" left the browser holding a credential that can mint
+ *  new ID tokens indefinitely — so the next person at a shared machine could be
+ *  handed a working session by the refresher. No-ops when Firebase is
+ *  unconfigured, and never throws: failing to sign out of the SDK must not stop
+ *  the server session being destroyed, which is the part that actually matters. */
+export async function firebaseSignOut(): Promise<void> {
+  if (!isFirebaseConfigured()) return;
+  try {
+    await firebaseAuthSignOut(auth());
+  } catch {
+    // Already signed out, or the SDK never initialised on this page.
+  }
 }

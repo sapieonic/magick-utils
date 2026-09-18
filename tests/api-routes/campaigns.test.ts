@@ -3,9 +3,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("@/lib/server/env", () => ({ isBackendConfigured: vi.fn() }));
 
 const sessionDestroy = vi.fn();
+const persistRefreshedCredential = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/server/session", () => ({
   getTenantContext: vi.fn(),
   getSession: vi.fn(async () => ({ destroy: sessionDestroy })),
+  // Handed to MagickClient so a refresh token Google rotated mid-request is
+  // written back to the cookie instead of living only in this request's memory.
+  persistRefreshedCredential,
 }));
 
 const listBulkJobs = vi.fn();
@@ -25,8 +29,14 @@ class MagickApiError extends Error {
     this.status = status;
   }
 }
+/** Every `new MagickClient(ctx, options)` the route makes, so a test can check
+ *  the credential-refresh hook is actually wired up. */
+const clientConstructions = vi.hoisted(() => [] as { ctx: unknown; options: unknown }[]);
 vi.mock("@/lib/server/magick-client", () => ({
   MagickClient: class {
+    constructor(ctx: unknown, options?: unknown) {
+      clientConstructions.push({ ctx, options });
+    }
     listBulkJobs = listBulkJobs;
     getBulkJob = getBulkJob;
     async *iterateBulkJobs() {
@@ -55,6 +65,7 @@ vi.mock("@/lib/server/map", () => ({
 }));
 
 import { isBackendConfigured } from "@/lib/server/env";
+import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { getTenantContext } from "@/lib/server/session";
 import { getBatch } from "@/lib/server/repositories";
 
@@ -85,7 +96,10 @@ function ready() {
 }
 
 describe("GET /api/campaigns", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clientConstructions.length = 0;
+  });
 
   it("503 when backend not configured", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(false);
@@ -130,6 +144,38 @@ describe("GET /api/campaigns", () => {
     expect(res.status).toBe(401);
     await expect(res.json()).resolves.toMatchObject({ error: "session_expired" });
     expect(sessionDestroy).toHaveBeenCalledOnce();
+  });
+
+  it("401 session_expired when the credential can never be renewed again", async () => {
+    // Revocation (password change, account disabled) kills the refresh token
+    // while the ID token still has minutes left, so getTenantContext() sees
+    // nothing to renew and the failure only surfaces here. Reported as a 502 the
+    // client's handleSessionExpiry ignores it, so the user was left staring at
+    // "Unable to load campaigns" with a dead cookie nobody cleared.
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    listBulkJobs.mockRejectedValue(new TokenRefreshPermanentError("USER_DISABLED"));
+
+    const res = await get();
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({
+      error: "session_expired",
+      detail: "USER_DISABLED",
+    });
+    expect(sessionDestroy).toHaveBeenCalledOnce();
+  });
+
+  it("gives the client a hook that writes a rotated refresh token back to the cookie", async () => {
+    ready();
+    listBulkJobs.mockResolvedValue({ jobs: [], total: 0 });
+
+    await get();
+
+    expect(clientConstructions).toHaveLength(1);
+    expect(clientConstructions[0].options).toMatchObject({
+      onCredentialRefresh: persistRefreshedCredential,
+    });
   });
 
   // --- pagination past the old hard 100 cap ------------------------------

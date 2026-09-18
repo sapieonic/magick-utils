@@ -132,6 +132,57 @@ describe("CombineScreen — completed download flow", () => {
     expect(createIngestJob).not.toHaveBeenCalled();
   });
 
+  /** A merge left mid-flight by a page refresh, resumed by polling. */
+  function resumeWorkingJob(job: Partial<Record<string, unknown>>) {
+    sessionStorage.setItem("combineJobId", "job-1");
+    sessionStorage.setItem("combinePhase", "working");
+    sessionStorage.setItem(
+      "combinePrepared",
+      JSON.stringify({ batchIds: ["b1", "b2"], columns: ["record_id"], totalRows: 20, batchCount: 2 }),
+    );
+    vi.mocked(getJob).mockResolvedValue({
+      jobId: "job-1",
+      type: "merge",
+      status: "rate_limited",
+      total: 20,
+      done: 8,
+      retryAt: "2026-08-12T12:30:00Z",
+      retryCount: 1,
+      error: null,
+      result: null,
+      createdAt: "2026-08-12T00:00:00Z",
+      updatedAt: "2026-08-12T00:00:01Z",
+      ...job,
+    } as never);
+  }
+
+  it("tells a throttled merge's owner to wait", async () => {
+    resumeWorkingJob({ deferReason: "rate_limited" });
+    render(<CombineScreen />);
+    await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-1"));
+    expect(await screen.findByText(/Rate limit reached/i)).toBeInTheDocument();
+  });
+
+  it("tells a merge paused on an expired sign-in to sign in again", async () => {
+    // Both pauses arrive as `rate_limited`. Telling this user to simply wait
+    // sends them away from the only thing that rescues the merge: signing back
+    // in re-stamps the job's credential.
+    resumeWorkingJob({ deferReason: "credential" });
+    render(<CombineScreen />);
+    await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-1"));
+    expect(await screen.findByText(/sign-in expired while this merge was running/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Rate limit reached/i)).not.toBeInTheDocument();
+  });
+
+  it("falls back to the throttling message when the job predates deferReason", async () => {
+    // A job enqueued before this field existed, or one polled by an older route
+    // build, reports no reason at all — the throttling wording is the safe read.
+    resumeWorkingJob({});
+    render(<CombineScreen />);
+    await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-1"));
+    expect(await screen.findByText(/Rate limit reached/i)).toBeInTheDocument();
+  });
+
   it("reattaches when working state was saved before the job id", async () => {
     sessionStorage.setItem("combinePhase", "working");
     sessionStorage.setItem(

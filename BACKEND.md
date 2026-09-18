@@ -14,14 +14,20 @@ Flags (`lib/server/env.ts`): `isAuthConfigured` (magick-master + SESSION_SECRET)
 
 ## Configure
 Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESSION_SECRET`,
-`MONGODB_URI`, the `LLM_*` set, and the `NEXT_PUBLIC_FIREBASE_*` web config. On boot,
-`instrumentation.ts` ensures Mongo indexes and starts the worker when the backend is configured.
+`MONGODB_URI`, the `LLM_*` set, the `NEXT_PUBLIC_FIREBASE_*` web config, and `FIREBASE_API_KEY`
+(the same key, readable server-side at runtime — see *Token refresh* below; without it sessions
+still work but die after an hour). On boot, `instrumentation.ts` ensures Mongo indexes and starts
+the worker when the backend is configured.
 
 ## Server modules (`lib/server/`)
 - `env.ts` — typed config + the `*Configured` flags.
 - `types.ts` — contracts: `TenantContext`, `BatchDoc`, `NormalizedRecord`, `Job`, `AggregatesDoc`, `Insight`.
-- `session.ts` — iron-session cookie; `getTenantContext()` (null when not logged in / unconfigured).
-- `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` with
+- `session.ts` — iron-session cookie; `getTenantContext()` (null when not logged in / unconfigured, and
+  the one place a stored ID token is refreshed before use — see *Token refresh*).
+- `firebase-token.ts` — exchanges a Firebase refresh token for a fresh ID token via Google's
+  secure-token endpoint; classifies a failure as permanent (re-login) or transient (retry).
+- `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` — which also
+  re-mints and retries once on a 401, see *Token refresh* — with
   `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `batchAnalytics`,
   `exportCallsCsv`).
 - `normalize.ts` — core call/message → `NormalizedRecord`; `buildBatchDoc`; dispatch-type mapping.
@@ -35,6 +41,77 @@ Copy `.env.example` → `.env.local` and fill in `MAGICK_MASTER_BASE_URL`, `SESS
   `AnthropicProvider`; `complete`/`stream`/`structured` (Zod-validated, retry-on-parse-fail). `INSIGHT_SCHEMA`.
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
   records, rebuild the `BatchDoc`. Resumable progress via `Job.done`/`cursor`.
+
+### Token refresh
+
+A Firebase ID token lives **one hour**; the session cookie lives eight. That gap was a live bug, not a
+theoretical one: for seven of every eight hours the cookie carried a credential magick-master had
+already stopped accepting, so `/campaigns` 401'd and bounced the user to `/login` mid-session, and any
+ingest still running an hour after login died and **discarded its staged revision**.
+
+The credential is now refreshed instead of being allowed to expire under a longer-lived cookie. Four
+places cooperate, and they are deliberately independent so that losing one degrades rather than breaks:
+
+1. **The browser** (`components/SessionRefresher.tsx`, mounted in `app/(app)/layout.tsx`) keeps a
+   Firebase `onIdTokenChanged` subscription alive and re-posts each new token to `POST /api/auth/refresh`.
+   This matters more than it looks: `lib/firebase.ts` used to be imported *only* by `app/login/page.tsx`,
+   so outside `/login` no `Auth` object existed and the SDK's own refresh scheduler never ran at all.
+   A `visibilitychange` check covers the sleeping-laptop case, where no timer fires for hours.
+2. **Every route handler**, via `getTenantContext()`. It re-mints a near-expired token from the stored
+   refresh token before handing it to any caller. This is why campaigns, ingest, export and analytics
+   all inherit the fix with no per-route logic — and why reaching into `session.idToken` directly is a
+   bug that reintroduces the one-hour cliff. The **one** legitimate exception is `/api/accounts`, which
+   runs before a workspace is chosen and so has no tenant/account for `getTenantContext()` to return;
+   it uses `getFreshIdToken()` instead. That route was the last screen still on the cliff — a user who
+   idled an hour, came back to a working dashboard and clicked "Switch workspace" was bounced by the
+   account cascade alone.
+3. **`MagickClient` itself**, which on a magick-master 401 mints a replacement and retries the call
+   **once**. This catches the case the freshness check cannot: revoking a user kills the refresh token
+   while the ID token still has minutes left on it, so nothing looks stale until upstream refuses it.
+   Routes pass `onCredentialRefresh: persistRefreshedCredential` so a rotated refresh token reaches the
+   cookie instead of living only in that request's memory.
+4. **The ingestion worker**, which carries the refresh token on the job so a long run can re-mint
+   mid-flight rather than dying at the hour mark. It mints *pre-flight* too: a job resumed after a
+   deferral or a host restart is holding the token from whichever request enqueued it.
+
+`firebase-token.ts` splits failures the same way `call-analysis.ts` splits settled from momentary, and
+for the same reason: a **transient** failure (5xx, network, timeout) must keep the session and retry —
+Google being briefly unreachable must not sign everyone out — while a **permanent** one (`TOKEN_EXPIRED`,
+`USER_DISABLED`, `USER_NOT_FOUND`, `INVALID_REFRESH_TOKEN`, `MISSING_REFRESH_TOKEN`) clears the session,
+because retrying a revoked credential forever is worse than asking for a login. A permanent refusal that
+surfaces inside a route is mapped to `401 session_expired` rather than a generic 502 — the client only
+reacts to a 401, so anything else leaves the user staring at an error with a dead cookie nobody clears. An *unrecognised* 400 is treated as
+transient on purpose: guessing "permanent" wrongly signs a working user out.
+
+Notes for anyone changing this:
+- **The refresh token is a long-lived credential at rest.** Unlike the ID token it does not expire, so
+  a job must not keep one a moment longer than it needs it. `updateClaimedJob(..., { clearCredential })`
+  `$unset`s both tokens in the *same atomic write* that ends a job, so a thirty-second merge does not
+  leave a standing credential behind; the retention sweep (`deleteJobsOlderThan`, bounded by
+  `DATA_RETENTION_DAYS`) is the **backstop** for jobs that never reach a terminal state, not the primary
+  eraser. Treat it as a backstop with real gaps: it runs only from the external cron
+  (`POST /api/cron/cleanup`, which 503s unless `CRON_SECRET` is set), and there is no TTL index on
+  `jobs` to catch what the cron misses — `createdAt` is an ISO *string*, and Mongo TTL indexes act only
+  on BSON `Date`.
+- **`REDACT_PATHS` (`logger.ts`) keeps it out of log storage**, and is load-bearing for the same reason.
+  Mind the caveat the file itself states: pino wildcards are single-segment, so `*.refreshToken` does
+  **not** cover a nested `context.job.refreshToken`. Nothing logs a whole `Job` or `TenantContext`
+  today; if you add such a call site, the redaction will not save you.
+- **Cookie budget.** iron-session *throws* above 4096 bytes. The session already holds an ID token
+  (~1KB), the refresh token, and a `tenants[]` array with nested accounts. `getTenantContext()` and
+  `/api/auth/refresh` therefore tolerate a failed save rather than letting one oversized cookie 500
+  every screen; login cannot tolerate it and reports `session_too_large` rather than blaming
+  magick-master for a cookie this app could not write.
+- **`ttl`, not `cookieOptions.maxAge`.** Setting `maxAge` yourself takes an iron-session branch that
+  leaves `ttl` at its 14-day default and derives neither value from the other — which left the seal
+  replayable for ~13 days after the browser dropped the cookie. Passing `ttl` alone derives
+  `maxAge = ttl - 60`.
+- **A paused job carries `deferReason`.** `rate_limited` is reused as the "alive, paused, resume at
+  `retryAt`" status for both throttling and an expired credential, because the scheduler treats them
+  identically — but the customer must not. Combine reads `deferReason` to choose between "the upstream
+  is throttling us, just wait" and "your sign-in expired; sign in again and reopen this screen". Only
+  the second is actionable, and telling a signed-out user to wait sends them away from the one thing
+  that rescues the merge.
 
 ### Sentiment and key topics
 
@@ -240,8 +317,10 @@ mock/canned output when the backend/LLM is off.
    (Everything is read-only against magick-master; only our own Mongo is written.)
 
 ## Known V1 tradeoffs (iterate later)
-- The caller's Firebase ID token is stored on ingest jobs so the worker can act on their behalf — fine
-  for an internal tool; revisit with refresh tokens / a service credential for long-running jobs.
+- ~~The caller's Firebase ID token is stored on ingest jobs — revisit with refresh tokens.~~ **Done**:
+  jobs now carry a refresh token and re-mint mid-run (see *Token refresh*). What remains deferred is a
+  **service credential** for background jobs, which would decouple ingestion from any user's session
+  entirely; it needs a magick-master-side change, so it is tracked separately.
 - Batch id = upstream source id (a UUID) for key consistency; `humanBatchId()` exists for a prettier
   display id later.
 - `statusSummary` proxy path is best-effort (tolerates 404). Fingerprints currently recompute from

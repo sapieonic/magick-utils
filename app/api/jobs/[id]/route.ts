@@ -24,6 +24,7 @@ export const GET = withLogging(
       done: job.done,
       retryAt: job.retryAt ?? null,
       retryCount: job.retryCount ?? 0,
+      deferReason: job.deferReason ?? null,
       error: job.error ?? null,
       result: job.result ?? null,
       createdAt: job.createdAt,

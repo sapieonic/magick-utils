@@ -113,7 +113,12 @@ describe("processJob resume", () => {
     expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({ done: 101, cursor: 101, batchIndex: 0 }));
     expect(repositories.checkpointJob).toHaveBeenNthCalledWith(2, "j1", "lease-1", expect.objectContaining({ done: 101, cursor: 101, batchIndex: 0 }));
     expect(repositories.checkpointJob).toHaveBeenNthCalledWith(3, "j1", "lease-1", { done: 101, cursor: 0, batchIndex: 1 });
-    expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({ status: "done", done: 101 }));
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ status: "done", done: 101 }),
+      { clearCredential: true },
+    );
   });
 
   it("keeps the raw pagination cursor separate from unique-record progress", async () => {
@@ -144,10 +149,12 @@ describe("processJob resume", () => {
       cursor: 0,
       batchIndex: 1,
     });
-    expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({
-      status: "done",
-      done: 2,
-    }));
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ status: "done", done: 2 }),
+      { clearCredential: true },
+    );
   });
 
   it("resumes duplicate-heavy pagination from the raw offset with unique progress", async () => {
@@ -166,10 +173,12 @@ describe("processJob resume", () => {
       done: 2,
       cursor: 3,
     }));
-    expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith("j1", "lease-1", expect.objectContaining({
-      status: "done",
-      done: 2,
-    }));
+    expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ status: "done", done: 2 }),
+      { clearCredential: true },
+    );
   });
 
   it("starts the next batch from zero after a durable batch transition", async () => {
@@ -181,7 +190,12 @@ describe("processJob resume", () => {
     expect(repositories.getBatch).toHaveBeenCalledWith("t1", "a1", "b2");
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b2", limit: 100, offset: 0 });
     expect(repositories.deleteBatchRevisionRecords).toHaveBeenCalledWith("t1", "a1", "b2", "j1");
-    expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({ done: 101 }));
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ done: 101 }),
+      { clearCredential: true },
+    );
   });
 
   it("stops if ownership is lost while checkpointing", async () => {
@@ -342,6 +356,7 @@ describe("processJob resume", () => {
       "j1",
       "lease-1",
       expect.objectContaining({ status: "done" }),
+      { clearCredential: true },
     );
   });
 
@@ -504,6 +519,60 @@ describe("runClaimedJob 429", () => {
     client.listCalls.mockRejectedValueOnce(new MagickApiError(429, "limited", "url", "1"));
     repositories.updateClaimedJob.mockResolvedValueOnce(job()).mockResolvedValueOnce(null);
     await expect(runClaimedJob(job({ batchIds: ["b1"] }))).rejects.toThrow("job lease lost before rate-limit scheduling");
+  });
+
+  it("names the deferral reason so the screen can say which kind of pause this is", async () => {
+    client.listCalls.mockRejectedValueOnce(new MagickApiError(429, "limited", "url", "60"));
+
+    await runClaimedJob(job({ batchIds: ["b1"] }));
+
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({ status: "rate_limited", deferReason: "rate_limited" }),
+    );
+  });
+
+  it("KEEPS the job's credential when it is only deferred", async () => {
+    // A deferred job resumes and pages the rest of the campaign with this same
+    // credential. Clearing it here would strand every paused job.
+    client.listCalls.mockRejectedValueOnce(new MagickApiError(429, "limited", "url", "60"));
+
+    await runClaimedJob(job({ batchIds: ["b1"], refreshToken: "refresh-1" }));
+
+    const deferral = repositories.updateClaimedJob.mock.calls.find(
+      ([, , patch]) => (patch as { status?: string }).status === "rate_limited",
+    );
+    expect(deferral).toBeDefined();
+    expect(deferral?.[3]).toBeUndefined();
+  });
+});
+
+describe("runClaimedJob credential lifetime", () => {
+  it("drops the credential in the same write that completes the job", async () => {
+    // A refresh token does not expire. A thirty-second merge would otherwise
+    // leave one at rest in Mongo until the retention sweep — an external cron
+    // that fails silently and is sized by DATA_RETENTION_DAYS, which an operator
+    // may raise for reasons that have nothing to do with credentials.
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await runClaimedJob(job({ batchIds: ["b1"], total: 1, refreshToken: "refresh-1" }));
+
+    const completion = repositories.updateClaimedJob.mock.calls.find(
+      ([, , patch]) => (patch as { status?: string }).status === "done",
+    );
+    expect(completion?.[3]).toEqual({ clearCredential: true });
+  });
+
+  it("drops the credential when the job fails for good, too", async () => {
+    client.listCalls.mockRejectedValueOnce(new Error("upstream failed"));
+
+    await runClaimedJob(job({ batchIds: ["b1"], refreshToken: "refresh-1" }));
+
+    const failure = repositories.updateClaimedJob.mock.calls.find(
+      ([, , patch]) => (patch as { status?: string }).status === "error",
+    );
+    expect(failure?.[3]).toEqual({ clearCredential: true });
   });
 });
 

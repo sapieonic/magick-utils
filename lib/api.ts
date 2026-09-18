@@ -15,6 +15,11 @@ export interface JobDto {
   done: number;
   retryAt: string | null;
   retryCount: number;
+  /** Why a `rate_limited` job is paused — throttling, or a credential the job
+   *  can no longer use. Null on any other status. Optional so callers (and their
+   *  test doubles) that predate it keep type-checking, the same way `truncated`
+   *  is above; read it as a value that may simply be absent. */
+  deferReason?: "rate_limited" | "credential" | null;
   error: string | null;
   result: unknown;
   createdAt: string;
@@ -332,12 +337,19 @@ export interface SessionTenantInfo {
 }
 
 /** Exchange a Firebase ID token for a BFF session. Returns the tenants the user
- *  belongs to (for the workspace picker), or throws with a readable message. */
-export async function postSession(idToken: string): Promise<{ tenants: SessionTenantInfo[] }> {
+ *  belongs to (for the workspace picker), or throws with a readable message.
+ *
+ *  Pass `refreshToken` whenever the sign-in produced one: the ID token dies after
+ *  an hour and the session cookie lives eight, so it is the refresh token that
+ *  lets the server keep the cookie's credential alive for the rest of them. */
+export async function postSession(
+  idToken: string,
+  refreshToken?: string,
+): Promise<{ tenants: SessionTenantInfo[] }> {
   const res = await fetch("/api/auth/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ idToken }),
+    body: JSON.stringify(refreshToken ? { idToken, refreshToken } : { idToken }),
   });
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
@@ -377,6 +389,90 @@ export async function postContext(tenantId: string, accountId: string): Promise<
     const j = await res.json().catch(() => ({}));
     throw new Error(j.error ? `${j.error}` : `context ${res.status}`);
   }
+}
+
+/** True once a sign-out has begun in this tab.
+ *
+ *  `postRefresh` checks it so an in-flight refresher cannot re-seal the cookie
+ *  that logout is about to clear. iron-session is stateless: `/api/auth/refresh`
+ *  reads the session, stamps it and writes it back, so a refresh that read the
+ *  session BEFORE logout destroyed it would resurrect it by saving afterwards. */
+let sessionEnded = false;
+
+/** Destroy the server session cookie.
+ *
+ *  `POST /api/auth/logout` existed from the start but nothing ever called it —
+ *  signing out only cleared React state and sessionStorage, leaving the cookie
+ *  live. That was survivable while the cookie carried a credential that died
+ *  within the hour; it is not now that the session can renew itself for its
+ *  whole 8h life.
+ *
+ *  Returns whether the server actually confirmed the session was destroyed.
+ *  `fetch` does not throw on a 4xx/5xx, so treating "it returned" as success
+ *  reported a sign-out that never happened — precisely the shared-machine case
+ *  this exists to close. Retried once, because the cost of a spurious failure
+ *  report is a scary message and the cost of a missed one is a live session. */
+export async function postLogout(): Promise<boolean> {
+  sessionEnded = true;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await fetch("/api/auth/logout", { method: "POST", cache: "no-store" });
+      if (res.ok) return true;
+    } catch {
+      // Offline or unreachable — fall through to the retry, then report failure.
+    }
+  }
+  return false;
+}
+
+/** Hand a freshly minted Firebase ID token to the BFF so the session cookie
+ *  stops carrying a dead one. Called by `SessionRefresher` on every
+ *  `onIdTokenChanged` and on every tab wake — never by a screen.
+ *
+ *  Deliberately NOT `postSession`: that route re-runs the login exchange, resets
+ *  `tenants` and writes a "login" log line, so routing an hourly refresh through
+ *  it would invent a login event every hour. Returns false when the hand-off
+ *  didn't stick (the 401 case has already redirected to /login, because the
+ *  server destroys a session whose credential upstream refuses) so the caller
+ *  knows not to record the token as delivered.
+ */
+export type RefreshOutcome =
+  /** The cookie now carries this token. */
+  | "delivered"
+  /** Not this time — a 5xx, a network fault, or a cookie the server could not
+   *  write. Offering the same token again later is worth doing. */
+  | "retry"
+  /** The server will not take this token, and will not take it next time
+   *  either. Re-offering it is a loop with no exit. */
+  | "refused";
+
+export async function postRefresh(idToken: string): Promise<RefreshOutcome> {
+  // Never hand a credential back to a session this tab is signing out of.
+  if (sessionEnded) return "refused";
+  const res = await fetch("/api/auth/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // The ID token only. The refresh token is the durable credential and is set
+    // once, at login, from the exchange that verified it — never re-supplied
+    // from the page, where it could be paired with someone else's ID token.
+    body: JSON.stringify({ idToken }),
+  });
+  // 401 — the session is gone; `handleSessionExpiry` is already sending the user
+  // to /login, so there is nothing left to hand over.
+  if (handleSessionExpiry(res)) return "refused";
+  // 403 — the route cannot verify this token names the session's user. That
+  // answer does not change when we ask again with the same credential, so this
+  // must not be retried: the refresher would otherwise re-offer it on every
+  // token change, every tab focus and every wake, forever, with no backoff and
+  // nothing visible to the user.
+  if (res.status === 403) return "refused";
+  if (!res.ok) return "retry";
+  // The route answers 200 with `persisted: false` when it verified the token but
+  // could not write the cookie. Reporting that as delivered would let the caller
+  // mark this token done and never offer it again, leaving the session on the
+  // old one; reporting it as retryable costs one attempt on the next wake.
+  const body = await res.json().catch(() => ({}) as { persisted?: boolean });
+  return body.persisted === false ? "retry" : "delivered";
 }
 
 export interface SessionUserInfo {

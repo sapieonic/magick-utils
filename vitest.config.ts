@@ -16,7 +16,10 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "html"],
       include: ["lib/**/*.{ts,tsx}", "components/**/*.{ts,tsx}", "app/**/*.{ts,tsx}"],
-      exclude: ["**/*.d.ts", "lib/firebase.ts"],
+      // `lib/firebase.ts` used to be two SDK one-liners with nothing to cover.
+      // It now holds real refresh and sign-out logic — and its own test file —
+      // so it is measured like everything else.
+      exclude: ["**/*.d.ts"],
     },
   },
 });

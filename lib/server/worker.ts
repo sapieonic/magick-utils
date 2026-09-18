@@ -24,6 +24,14 @@ import {
   updateClaimedJob,
 } from "./repositories";
 import { MagickApiError, MagickClient } from "./magick-client";
+import {
+  idTokenNeedsRefresh,
+  mintIdToken,
+  TokenRefreshPermanentError,
+  TokenRefreshTransientError,
+  type MintedToken,
+} from "./firebase-token";
+import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
 import type { Job, NormalizedRecord, TenantContext } from "./types";
@@ -34,6 +42,28 @@ const PAGE_SIZE = 100;
 const IDLE_DELAY_MS = 2500;
 const DEFAULT_RETRY_AFTER_MS = 30_000;
 const LEASE_MS = 60_000;
+/** How long a job waits before trying a credential again. A minute is long
+ *  enough that a Google outage or a magick-master auth blip has moved on, and
+ *  short enough that a user who signs back in sees their ingestion continue
+ *  rather than assuming it is dead and starting another one. */
+const AUTH_RETRY_DELAY_MS = 60_000;
+/** How many times a job may be put back for a credential problem before it is
+ *  failed outright. Waiting is only worth anything because something CAN hand
+ *  the job a new token — /api/ingest re-stamps the credential when a signed-in
+ *  user reattaches to this job — but nothing guarantees anyone will, and a job
+ *  that defers forever shows the customer a progress bar that never finishes and
+ *  never errors. At AUTH_RETRY_DELAY_MS apiece this is ~20 minutes of grace,
+ *  then a message that tells them exactly what to do.
+ *
+ *  Counted off `authRetryCount`, which only credential deferrals advance — a
+ *  long ingest that has already survived a dozen rate limits arrives here with
+ *  its full grace intact, and those are precisely the jobs long enough to outlive
+ *  their token in the first place. */
+const MAX_AUTH_DEFERRALS = 20;
+/** The job `error` a customer reads when a credential problem is terminal. The
+ *  UI prints `job.error` verbatim, so this says what to do rather than naming a
+ *  status code they cannot act on. */
+const RELOGIN_ERROR = "Your sign-in expired and could not be renewed. Sign in again, then retry.";
 /** Small margin so a deferred sweep fires strictly after the grace cutoff it
  *  is waiting on, rather than racing it by a millisecond. */
 export const SWEEP_DELAY_MARGIN_MS = 5_000;
@@ -90,6 +120,50 @@ async function loop() {
   }
 }
 
+/** A failure that says the job's credential — not its data — is the problem: a
+ *  magick-master 401, or a mint attempt that failed for a reason that may not
+ *  recur. Both are recoverable by waiting, and neither says anything about the
+ *  records already staged.
+ *
+ *  `TokenRefreshPermanentError` is deliberately excluded. A revoked or expired
+ *  refresh token answers the same way every time, so waiting on it only delays
+ *  the message that tells the customer to sign in again. */
+function isCredentialProblem(err: unknown): boolean {
+  if (err instanceof TokenRefreshTransientError) return true;
+  return err instanceof MagickApiError && err.status === 401;
+}
+
+/** How long to put a job back for, or null when it must fail instead. */
+function deferralFor(
+  err: unknown,
+  claimed: Job,
+): { retryAfterMs: number; reason: string; credential: boolean } | null {
+  if (err instanceof MagickApiError && err.status === 429) {
+    return {
+      retryAfterMs: Math.max(err.retryAfterMs ?? DEFAULT_RETRY_AFTER_MS, IDLE_DELAY_MS),
+      reason: "rate_limited",
+      credential: false,
+    };
+  }
+  if (!isCredentialProblem(err)) return null;
+  if ((claimed.authRetryCount ?? 0) >= MAX_AUTH_DEFERRALS) return null;
+  return {
+    retryAfterMs: AUTH_RETRY_DELAY_MS,
+    reason: err instanceof MagickApiError ? "unauthorized" : "token_refresh_unavailable",
+    credential: true,
+  };
+}
+
+/** What to write into `job.error` when a job is failing for good. */
+function terminalErrorMessage(err: unknown): string {
+  // A dead refresh token, or credential trouble we have already waited out: in
+  // both cases the only thing that helps is a human signing in again, so say so
+  // instead of printing "MagickApiError 401" at someone who cannot act on it.
+  if (err instanceof TokenRefreshPermanentError) return `${RELOGIN_ERROR} (${err.reason})`;
+  if (isCredentialProblem(err)) return RELOGIN_ERROR;
+  return String(err);
+}
+
 export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
   if (!claimed.leaseId) throw new Error("claimed job has no leaseId");
   try {
@@ -99,16 +173,39 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
     });
     log().info({ durationMs: Date.now() - startedAt }, "[worker] job completed");
   } catch (err) {
-    if (err instanceof MagickApiError && err.status === 429) {
-      const retryAfterMs = Math.max(err.retryAfterMs ?? DEFAULT_RETRY_AFTER_MS, IDLE_DELAY_MS);
+    const deferral = deferralFor(err, claimed);
+    if (deferral) {
+      const { retryAfterMs, reason, credential } = deferral;
       const retryAt = new Date(Date.now() + retryAfterMs).toISOString();
-      log().warn({ retryAfterMs, retryAt, durationMs: Date.now() - startedAt }, "[worker] rate limited; job scheduled to resume");
+      log().warn(
+        { reason, retryAfterMs, retryAt, durationMs: Date.now() - startedAt },
+        "[worker] job deferred; scheduled to resume",
+      );
       const scheduled = await updateClaimedJob(claimed.jobId, claimed.leaseId, {
+        // `rate_limited` is the ONE status that means "alive, paused, come back
+        // at retryAt": `claimNextJob` re-claims it once `retryAt` passes, and
+        // `findActiveJobForBatches` still counts it as active so nothing
+        // enqueues a duplicate ingestion over it. An expired credential wants
+        // exactly that behaviour, so it reuses the status rather than adding a
+        // sibling — a new JobStatus would ripple into every screen that switches
+        // on it, and the UI's only reaction here is to poll again at `retryAt`,
+        // which is correct either way. Read it as "deferred", not as "the
+        // upstream is throttling us"; `reason` in the line above says which.
         status: "rate_limited",
         retryAt,
-        retryCount: (claimed.retryCount ?? 0) + 1,
+        // The status cannot distinguish these two; this is what the screen reads
+        // to tell the customer whether to wait or to sign in again.
+        deferReason: credential ? "credential" : "rate_limited",
+        // Each backoff advances only its own counter, so a long ingest that has
+        // survived many rate limits still gets its full credential grace.
+        ...(credential
+          ? { authRetryCount: (claimed.authRetryCount ?? 0) + 1 }
+          : { retryCount: (claimed.retryCount ?? 0) + 1 }),
         leaseUntil: null,
         leaseId: null,
+        // Clearing the error matters most for the credential case: the staged
+        // revision is intact and the job is expected to continue, so leaving a
+        // previous run's message on it would show a failure that is not one.
         error: null,
       });
       if (!scheduled) throw new Error("job lease lost before rate-limit scheduling");
@@ -118,12 +215,18 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
       return;
     }
     log().error({ err, durationMs: Date.now() - startedAt }, "[worker] job failed");
-    const failed = await updateClaimedJob(claimed.jobId, claimed.leaseId, {
-      status: "error",
-      leaseUntil: null,
-      leaseId: null,
-      error: String(err),
-    });
+    const failed = await updateClaimedJob(
+      claimed.jobId,
+      claimed.leaseId,
+      {
+        status: "error",
+        leaseUntil: null,
+        leaseId: null,
+        error: terminalErrorMessage(err),
+      },
+      // The job is over; it has no further use for the caller's credential.
+      { clearCredential: true },
+    );
     if (!failed) throw err;
     await Promise.all(claimed.batchIds.map(async (batchId) => {
       await failBatchIfOwned(claimed.tenantId, claimed.accountId, batchId, claimed.jobId, claimed.leaseId!);
@@ -137,9 +240,47 @@ export async function runClaimedJob(claimed: Job, startedAt = Date.now()) {
 
 export async function processJob(job: Job) {
   if (!job.idToken) throw new Error("job has no idToken; cannot call magick-master");
-  const ctx: TenantContext = { idToken: job.idToken, tenantId: job.tenantId, accountId: job.accountId };
-  const client = new MagickClient(ctx);
   if (!job.leaseId) throw new Error("job has no leaseId; cannot process without ownership");
+  const leaseId = job.leaseId;
+  const ctx: TenantContext = {
+    idToken: job.idToken,
+    refreshToken: job.refreshToken,
+    tenantId: job.tenantId,
+    accountId: job.accountId,
+  };
+
+  /** Adopt a freshly minted credential, in memory and on the job document.
+   *
+   *  The job document is what a later claim reads — after a crash, a lease
+   *  expiry or a deferral — so a token that only ever lived in this process is a
+   *  token the next run does not have. The refresh token matters even more:
+   *  Google may rotate it on exchange, and the rotated value going unwritten
+   *  leaves the job holding one that is refused the next time it is used. */
+  const adoptCredential = async (minted: MintedToken) => {
+    ctx.idToken = minted.idToken;
+    ctx.refreshToken = minted.refreshToken;
+    const stored = await updateClaimedJob(job.jobId, leaseId, {
+      idToken: minted.idToken,
+      refreshToken: minted.refreshToken,
+    });
+    if (!stored) {
+      // Not fatal here: the run continues on the token in hand, and the very
+      // next checkpoint fails loudly on the same lost lease.
+      log().warn("[worker] could not store the re-minted credential; lease may have moved on");
+    }
+  };
+
+  // Mint before the first upstream call rather than after the first 401, when
+  // the token we were handed is already spent. A job that sat out a rate-limit
+  // pause — or that a restart re-claimed hours later — resumes with a credential
+  // from the request that enqueued it, and that hour is long gone.
+  if (ctx.refreshToken && isTokenRefreshConfigured() && idTokenNeedsRefresh(ctx.idToken)) {
+    log().info("[worker] stored id token is at or near expiry; minting a replacement before resuming");
+    await adoptCredential(await mintIdToken(ctx.refreshToken));
+  }
+  // The client re-mints on a 401 of its own accord; this callback is how the
+  // credential it switched to reaches the job document.
+  const client = new MagickClient(ctx, { onCredentialRefresh: adoptCredential });
 
   let done = job.done ?? 0;
   const startBatch = job.batchIndex ?? 0;
@@ -155,7 +296,7 @@ export async function processJob(job: Job) {
       client,
       ctx,
       job.jobId,
-      job.leaseId,
+      leaseId,
       batchId,
       batchIndex,
       job.cursor ?? 0,
@@ -166,7 +307,14 @@ export async function processJob(job: Job) {
   }
 
   const result = job.type === "merge" ? { rowCount: done } : undefined;
-  const completed = await updateClaimedJob(job.jobId, job.leaseId, { status: "done", done, cursor: 0, batchIndex: job.batchIds.length, leaseUntil: null, leaseId: null, result });
+  const completed = await updateClaimedJob(
+    job.jobId,
+    leaseId,
+    { status: "done", done, cursor: 0, batchIndex: job.batchIds.length, leaseUntil: null, leaseId: null, result },
+    // A merge that finished in thirty seconds must not leave a non-expiring
+    // refresh token sitting in Mongo until the retention sweep gets to it.
+    { clearCredential: true },
+  );
   if (!completed) throw new Error("job lease lost before completion");
 }
 

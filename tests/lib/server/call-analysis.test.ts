@@ -1,14 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const batchAnalytics = vi.fn();
+// Hoisted: unlike `batchAnalytics` — which the old factory only dereferenced
+// inside a nested arrow — these are read the moment the factory runs.
+const { persistRefreshedCredential, fromContextMock } = vi.hoisted(() => ({
+  persistRefreshedCredential: vi.fn(),
+  fromContextMock: vi.fn(),
+}));
 
 // `MagickApiError` stays real: the module under test branches on its `status`
 // to decide whether a failure is settled or momentary, which is the whole of
 // the caching policy. Stubbing it out would make every error look momentary.
 vi.mock("@/lib/server/magick-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/server/magick-client")>()),
-  MagickClient: { fromContext: () => ({ batchAnalytics }) },
+  MagickClient: { fromContext: fromContextMock },
 }));
+vi.mock("@/lib/server/session", () => ({ persistRefreshedCredential }));
+fromContextMock.mockImplementation(() => ({ batchAnalytics }));
 vi.mock("@/lib/server/env", () => ({
   env: { magickMasterBaseUrl: "https://mm.test" },
   isAuthConfigured: () => true,
@@ -370,5 +378,23 @@ describe("enrichWithCallAnalysis", () => {
     // raising one of them alone into a failing test instead of a customer-facing
     // error on large selections.
     expect(MAX_SELECTION_BATCHES).toBeLessThanOrEqual(50);
+  });
+});
+
+describe("credential persistence", () => {
+  it("gives its client the hook that writes a re-minted token back to the session", async () => {
+    // Without it, a 401 here re-minted a working token that died with the
+    // request: the session kept the rejected one, so every later analytics,
+    // insights or chat call repeated the same 401-and-exchange, and a rotated
+    // refresh token — which firebase-token.ts says callers MUST persist — was
+    // lost outright.
+    batchAnalytics.mockResolvedValue(null);
+
+    await enrichWithCallAnalysis(ctx, docs(), agg());
+
+    expect(fromContextMock).toHaveBeenCalled();
+    expect(fromContextMock.mock.calls[0][1]).toMatchObject({
+      onCredentialRefresh: persistRefreshedCredential,
+    });
   });
 });

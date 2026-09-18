@@ -3,7 +3,7 @@
 // never leak across tenants. Server-only.
 
 import { randomUUID } from "node:crypto";
-import type { AnyBulkWriteOperation, Filter, FindCursor, WithId } from "mongodb";
+import type { AnyBulkWriteOperation, Filter, FindCursor, UpdateFilter, WithId } from "mongodb";
 import {
   aggregates,
   aiUsage,
@@ -1020,6 +1020,46 @@ export async function findActiveJobForBatches(
   });
 }
 
+/**
+ * Re-stamp a live job's Firebase credential from a caller that has just proved a
+ * fresh one.
+ *
+ * The worker runs on whatever token was stamped when the job was enqueued, and
+ * that token dies an hour later — well inside a large ingestion. The worker
+ * re-mints for itself while it holds a refresh token, but a job that has no
+ * usable credential at all can only be rescued from outside: the user signs in
+ * again, the screen re-POSTs /api/ingest, reattaches to this very job, and that
+ * request carries a freshly minted token. This is what moves it onto the job, so
+ * the worker's next claim resumes instead of deferring again.
+ *
+ * Scoped to (tenantId, accountId) so one tenant can never write a credential
+ * onto another's job, and to the non-terminal statuses so a finished or failed
+ * job is never quietly rewritten. Returns whether anything was updated.
+ */
+export async function refreshJobCredential(
+  tenantId: string,
+  accountId: string,
+  jobId: string,
+  credential: { idToken?: string; refreshToken?: string },
+): Promise<boolean> {
+  if (!credential.idToken) return false;
+  const col = await jobs();
+  const res = await col.updateOne(
+    { jobId, tenantId, accountId, status: { $in: ["queued", "running", "rate_limited"] } },
+    {
+      $set: {
+        idToken: credential.idToken,
+        // Only overwrite the refresh token when the caller actually has one:
+        // a token-paste test session has none, and blanking the job's would
+        // strip the worker of the only thing that lets it re-mint mid-run.
+        ...(credential.refreshToken ? { refreshToken: credential.refreshToken } : {}),
+        updatedAt: nowIso(),
+      },
+    },
+  );
+  return (res.modifiedCount ?? 0) > 0;
+}
+
 /** Patch a job, always bumping updatedAt. Returns the updated job or null. */
 export async function updateJob(
   jobId: string,
@@ -1039,14 +1079,29 @@ export async function updateJob(
 export async function updateClaimedJob(
   jobId: string,
   leaseId: string,
-  patch: Partial<Job>
+  patch: Partial<Job>,
+  options: { clearCredential?: boolean } = {}
 ): Promise<Job | null> {
   const col = await jobs();
   const rest = { ...patch };
   delete rest.jobId;
+  const update: UpdateFilter<Job> = { $set: { ...rest, updatedAt: nowIso() } };
+  // Dropped in the SAME atomic write that ends the job, so a finished job never
+  // sits in Mongo holding a credential it no longer needs. This matters far more
+  // for `refreshToken` than for `idToken`: a refresh token does not expire, so a
+  // thirty-second merge job would otherwise leave a standing credential at rest
+  // until the retention sweep — a sweep that runs from an external cron, fails
+  // silently if it stops, and is sized by DATA_RETENTION_DAYS, which an operator
+  // may raise for data-visibility reasons without realising it also extends how
+  // long credentials live. Tying the credential's life to the job's removes the
+  // dependency entirely. Never set on the deferral path: a paused job resumes
+  // and still needs both the credential and the reason it is waiting.
+  // `deferReason` goes with them: it explains why a job is PAUSED, so leaving it
+  // beside `status: "done"` is a field outliving its own meaning.
+  if (options.clearCredential) update.$unset = { idToken: "", refreshToken: "", deferReason: "" };
   return col.findOneAndUpdate(
     { jobId, status: "running", leaseId },
-    { $set: { ...rest, updatedAt: nowIso() } },
+    update,
     { returnDocument: "after" }
   );
 }

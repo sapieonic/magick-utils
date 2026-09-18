@@ -18,6 +18,14 @@ export const env = {
   mongoUri: process.env.MONGODB_URI ?? "",
   mongoDb: process.env.MONGODB_DB ?? "magickutils",
 
+  // Firebase Web API key, used server-side ONLY to exchange a stored refresh
+  // token for a fresh ID token (lib/server/firebase-token.ts). This is the same
+  // public key the client bundle carries — it identifies the project, it does
+  // not authorize anything on its own; the refresh token is the credential.
+  // `NEXT_PUBLIC_FIREBASE_API_KEY` is inlined at BUILD time, so a deployment
+  // that sets it only at runtime needs the server-side `FIREBASE_API_KEY`.
+  firebaseApiKey: process.env.FIREBASE_API_KEY || process.env.NEXT_PUBLIC_FIREBASE_API_KEY || "",
+
   // Shared secret guarding the cron cleanup endpoint (POST /api/cron/cleanup),
   // which the daily GitHub Actions workflow calls with a Bearer token.
   cronSecret: process.env.CRON_SECRET ?? "",
@@ -50,6 +58,13 @@ export function isAuthConfigured(): boolean {
 
 export function isMongoConfigured(): boolean {
   return Boolean(env.mongoUri);
+}
+
+/** A Firebase Web API key is present → the server can mint a fresh ID token from
+ *  a stored refresh token. Without it, sessions still work but expire after the
+ *  ID token's own hour, and long ingests cannot outlive it. */
+export function isTokenRefreshConfigured(): boolean {
+  return Boolean(env.firebaseApiKey);
 }
 
 /** A cron secret is set → the scheduled cleanup endpoint will accept requests. */
