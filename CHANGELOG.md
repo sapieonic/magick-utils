@@ -1,3 +1,10 @@
+## [1.3.7](https://github.com/sapieonic/magick-utils/compare/v1.3.6...v1.3.7) (2026-09-18)
+
+
+### Bug Fixes
+
+* **auth:** refresh the Firebase ID token so sessions stop expiring an hour after login ([#37](https://github.com/sapieonic/magick-utils/issues/37)) ([4d821f5](https://github.com/sapieonic/magick-utils/commit/4d821f58e61a0ebc2edfab759332ef54d07f9b7c))
+
 ## [1.3.6](https://github.com/sapieonic/magick-utils/compare/v1.3.5...v1.3.6) (2026-09-15)
 
 
