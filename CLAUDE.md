@@ -57,9 +57,13 @@ A pull that returns **zero records for a job upstream says it dispatched** is a 
 batch — `ingestBatch` throws rather than publishing it. Publishing it put a green "Up to date" over an
 empty Analytics screen, and it was self-concealing: the empty commit collapsed `total` to 0, after which
 `/api/ingest` scored the batch complete (`counts === doc.total` is `0 === 0`), enqueued nothing, and no
-later refresh could reach it. Both halves have to hold together — if you change one, check the other.
-Only a job that PROVABLY finished dialling arms that guard; a still-running, cancelled or unreadable job
-must stay exempt, or healthy campaigns get an `error` no click can clear.
+later refresh could reach it. **Three places** have to agree on what that fault looks like and they see it
+from different angles, so they share one predicate, `isEmptyDispatchedPull`: the worker mid-pull, the
+ingest route deciding what to enqueue, and `failBatchIfOwned`, which must NOT resolve such a published
+revision back to `ready`/`stale` — a batch already poisoned by an older build would otherwise re-earn
+`ready` on every failed retry and keep serving its empty revision. If you change one, check the others.
+Only a job that PROVABLY finished dialling arms the worker's guard; a still-running, cancelled or
+unreadable job must stay exempt, or healthy campaigns get an `error` no click can clear.
 
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see

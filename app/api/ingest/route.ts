@@ -14,7 +14,14 @@ import {
   refreshJobCredential,
   releaseIngestionLocks,
 } from "@/lib/server/repositories";
-import { isBatchReadable, type BatchDoc, type Job, type JobType, type TenantContext } from "@/lib/server/types";
+import {
+  isBatchReadable,
+  isEmptyDispatchedPull,
+  type BatchDoc,
+  type Job,
+  type JobType,
+  type TenantContext,
+} from "@/lib/server/types";
 import { withLogging } from "@/lib/server/http-log";
 import { log } from "@/lib/server/logger";
 import { setRequestContext } from "@/lib/server/observability/request-context";
@@ -153,7 +160,7 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // the customer got a green "Up to date" over an empty screen with no way to
     // clear it. Treating it as incomplete puts it back in front of the worker,
     // which decides — and now says so.
-    return !(counts[index] === 0 && (doc.sourceTotal ?? 0) > 0);
+    return !isEmptyDispatchedPull(counts[index], doc.sourceTotal);
   });
   let batchIds: string[];
   try {

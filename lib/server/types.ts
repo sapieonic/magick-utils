@@ -14,6 +14,25 @@ export function isBatchReadable(batch: Pick<BatchDoc, "ingestStatus">): boolean 
   return batch.ingestStatus === "ready" || batch.ingestStatus === "stale";
 }
 
+/** Whether a set of records is the empty-pull fault: nothing at all, for a job
+ *  upstream says dispatched contacts.
+ *
+ *  Three places have to agree on this and they see it from different angles —
+ *  the worker mid-pull (`records.length` against the job's reported total), the
+ *  ingest route deciding what to enqueue (a live `countRecords`), and failure
+ *  cleanup deciding whether a published revision is worth falling back to
+ *  (`BatchDoc.total`, which is the ingested record count once a revision has
+ *  committed). One predicate, so a batch cannot be a fault to one of them and
+ *  healthy to another; that disagreement is what let the empty commit persist.
+ *
+ *  `dispatched` must come from a dispatched figure (`sourceTotal`, or the bulk
+ *  job's `total_contacts`), never from `total` — post-commit they are the same
+ *  number and the test collapses to `0 > 0`. Absent is not 0 here either way:
+ *  no dispatched count means no claim, so no fault. */
+export function isEmptyDispatchedPull(recordCount: number, dispatched: number | undefined): boolean {
+  return recordCount === 0 && (dispatched ?? 0) > 0;
+}
+
 /** The authenticated tenant/account context derived from the session cookie. */
 export interface TenantContext {
   tenantId: string;

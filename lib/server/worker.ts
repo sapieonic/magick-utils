@@ -34,7 +34,7 @@ import {
 import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
-import type { Job, NormalizedRecord, TenantContext } from "./types";
+import { isEmptyDispatchedPull, type Job, type NormalizedRecord, type TenantContext } from "./types";
 import { logger, log } from "./logger";
 import { runWithRequestContext } from "./observability/request-context";
 
@@ -555,10 +555,13 @@ async function ingestBatch(
   // at offset 0), which disarms the guard there — acceptable, since a resumed
   // batch has staged rows and so does not reach `records.length === 0`.
   //
-  // Throwing leaves any previously published revision readable and marks a
-  // never-ingested batch "error", which is what the screen should be saying.
+  // Throwing marks a never-ingested batch "error", and — for a batch already
+  // poisoned by an earlier empty publish — `failBatchIfOwned` recognises that
+  // its published revision is this same fault and errors it too rather than
+  // resolving it back to "ready". Any other published revision stays readable,
+  // because a failed refresh has not invalidated the good data behind it.
   const dispatched = Math.max(reportedTotal, batch.sourceTotal ?? 0);
-  if (records.length === 0 && dispatched > 0 && jobFinishedDialling(sourceJob)) {
+  if (isEmptyDispatchedPull(records.length, dispatched) && jobFinishedDialling(sourceJob)) {
     log().error(
       {
         batchId,
