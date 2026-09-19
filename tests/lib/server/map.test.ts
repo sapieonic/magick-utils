@@ -171,8 +171,34 @@ describe("bulkJobToBatchDoc", () => {
     const refreshed = bulkJobToBatchDoc(job, ctx, committed);
 
     expect(refreshed.total).toBe(359);
+    // The ingested count wins for `total`, but the dispatched figure is
+    // upstream's own and is never replaced by it.
+    expect(refreshed.sourceTotal).toBe(369);
     expect(refreshed.ingestStatus).toBe("ready");
     expect(refreshed.publishedRevision).toBe("revision-1");
+  });
+
+  // A zero-record commit used to pull `total` down to 0 and take the dispatched
+  // count with it, leaving nothing to prove records were missing — and silencing
+  // the worker guard that reads it on the next refresh.
+  it("keeps the dispatched count after a commit that ingested nothing", () => {
+    const job: RawBulkJob = {
+      id: "empty-ingest", dispatch_type: "static_call", status: "completed", total_contacts: 3475,
+      updated_at: "2026-09-18T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source,
+      total: 0,
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+      fingerprint: "dataset-fp",
+    };
+
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+
+    expect(refreshed.total).toBe(0);
+    expect(refreshed.sourceTotal).toBe(3475);
   });
 
   it("marks a committed dataset stale when the upstream revision changes", () => {

@@ -280,6 +280,9 @@ export interface BuildBatchDocOpts {
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
   total?: number;
+  /** Upstream's dispatched contact count, carried through publication so a
+   *  committed revision does not drop it (see BatchDoc.sourceTotal). */
+  sourceTotal?: number;
 }
 
 /** Build a BatchDoc summary from a set of normalized records + context.
@@ -322,6 +325,7 @@ export function buildBatchDoc(
     provider: opts.provider,
     date: opts.date,
     total,
+    sourceTotal: opts.sourceTotal,
     breakdown,
     successRate,
     spendInr,
@@ -358,5 +362,6 @@ export function batchDocOptsFromJob(
     date: job.created_at ?? new Date().toISOString(),
     fingerprint: args.fingerprint,
     total: job.total_contacts ?? undefined,
+    sourceTotal: job.total_contacts ?? undefined,
   };
 }

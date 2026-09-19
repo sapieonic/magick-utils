@@ -34,6 +34,7 @@ export function batchDocToBatch(doc: BatchDoc): Batch {
     date: doc.date,
     dayAgo: dayAgo(doc.date),
     total: doc.total,
+    sourceTotal: doc.sourceTotal,
     breakdown: doc.breakdown,
     successRate: doc.successRate,
     spendInr: doc.spendInr,
@@ -213,6 +214,11 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
   // Once committed, unique normalized records—not a possibly stale/raw contact
   // count—are authoritative for readiness, analytics, and exports.
   const total = committed ? existing!.total : sourceTotal;
+  // Never gated on `committed`: this is what upstream says it dispatched, and
+  // an ingestion — however it went — is not evidence about that. Recording it
+  // unconditionally is what keeps a zero-record commit from erasing the proof
+  // that records are missing (see BatchDoc.sourceTotal).
+  const dispatchedTotal = sourceTotal;
 
   let breakdown: BreakdownSeg[];
   let successRate: number;
@@ -260,6 +266,7 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     provider: (job.provider as string | null | undefined) ?? map.channel,
     date: job.created_at ?? new Date().toISOString(),
     total,
+    sourceTotal: dispatchedTotal,
     breakdown,
     successRate,
     // spend unknown until ingestion; preserve any previously ingested figures

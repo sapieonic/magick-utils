@@ -210,14 +210,96 @@ describe("processJob resume", () => {
     );
   });
 
+  // Upstream totals are progress hints, not pagination boundaries: a dispatched
+  // contact with no call row yet makes them run ahead of the rows they count.
+  // A short pull still publishes, with the paginated count as the total.
   it("treats paginated rows as authoritative when an upstream total is stale-high", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 100 });
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 100 });
-    repositories.getRecordsForRevision.mockResolvedValue([]);
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }], total: 100 });
+    repositories.getRecordsForRevision.mockResolvedValue([
+      { recordId: "1", status: "done" },
+      { recordId: "2", status: "done" },
+    ]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 100 }))).resolves.toBeUndefined();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 2 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // The IVR/static-call failure: upstream reports thousands of dispatched
+  // contacts and returns no rows at all. Publishing that put a green "Up to
+  // date" over an empty Analytics screen, so it is now a job failure — which
+  // leaves the batch "error" and the reason on the job.
+  it("fails the batch when upstream returns no records for a job it reports as dispatched", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 3475 });
+    repositories.getRecordsForRevision.mockResolvedValue([]);
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).rejects.toThrow(
+      /no records returned for b1.*3475 dispatched contacts/,
+    );
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+  });
+
+  // A batch poisoned by an empty publish before this guard existed has `total`
+  // already collapsed to 0, and upstream may report 0 on the calls listing too
+  // — `sourceTotal` is the only figure left that proves records are missing, so
+  // the guard has to read it or those batches stay silently empty forever.
+  it("catches a batch whose total already collapsed to zero, via sourceTotal", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 0, sourceTotal: 3475 });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    repositories.getRecordsForRevision.mockResolvedValue([]);
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 0 }))).rejects.toThrow(
+      /3475 dispatched contacts/,
+    );
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+  });
+
+  // A campaign the customer has only just launched has dispatched contacts and
+  // no calls yet. That is not the read-path gap above, and reporting "Sync
+  // failed" on it would be a fresh bug of its own.
+  it("publishes an empty batch while upstream is still dialling", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "processing", updated_at: "2026-09-18T10:00:00Z" });
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    repositories.getRecordsForRevision.mockResolvedValue([]);
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).resolves.toBeUndefined();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalled();
+  });
+
+  // The other direction: a campaign that genuinely dispatched nothing must
+  // still publish, or an empty batch becomes a permanent error nobody can clear.
+  it("publishes an empty batch when upstream reports nothing dispatched either", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 0, sourceTotal: 0 });
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    repositories.getRecordsForRevision.mockResolvedValue([]);
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 0 }))).resolves.toBeUndefined();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ total: 0 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // `total` is the exact ingested count once committed; the dispatched figure
+  // has to ride through publication on its own field or the next listing loses
+  // it again on the commit after that.
+  it("carries the dispatched count through publication", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 10, sourceTotal: 10 });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 10 });
+
+    await processJob(job({ batchIds: ["b1"], total: 10 }));
+
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 1, sourceTotal: 10 }),
       "j1",
       "lease-1",
     );

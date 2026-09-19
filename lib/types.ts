@@ -42,6 +42,11 @@ export interface Batch {
   date: string; // ISO
   dayAgo: number;
   total: number; // record count
+  /** Contacts the bulk job dispatched, as reported upstream. Distinct from
+   *  `total`, which becomes the exact ingested record count once a batch has
+   *  been ingested. Absent on seeded demo batches and on documents written
+   *  before the field existed — fall back to `total` when reading it. */
+  sourceTotal?: number;
   breakdown: BreakdownSeg[];
   successRate: number;
   spendInr: number;

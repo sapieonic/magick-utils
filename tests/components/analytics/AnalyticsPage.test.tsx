@@ -296,6 +296,19 @@ describe("Analytics page live/demo separation", () => {
     expect(await screen.findByText("10 records dispatched")).toBeInTheDocument();
   });
 
+  // `total` holds the dispatched figure only until a batch is ingested, after
+  // which it is the exact record count — so reading it alone made this header
+  // quietly stop being "dispatched", and read 0 for the IVR batches that
+  // ingested nothing while upstream reported thousands.
+  it("reads the dispatched count from sourceTotal, not the ingested total", async () => {
+    mockCampaigns({ batches: [{ ...campaign, total: 0, sourceTotal: 3475 }], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
+    vi.mocked(getAnalytics).mockResolvedValue({ ...aggregates, totalRecords: 0 });
+    render(<Page />);
+
+    expect(await screen.findByText("3,475 records dispatched")).toBeInTheDocument();
+  });
+
   it("does not enqueue a second ingest when Refresh data is double-clicked", async () => {
     mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });

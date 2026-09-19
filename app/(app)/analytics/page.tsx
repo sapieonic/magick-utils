@@ -127,7 +127,13 @@ export default function Page() {
   const ids = useMemo(() => targets.map((t: Batch) => t.id), [targets]);
   const idsKey = ids.join(",");
 
-  const totalRecords = targets.reduce((a: number, c: Batch) => a + c.total, 0);
+  // The dispatched contact count, which is what both readers below label it as.
+  // `total` is only a stand-in for batches that predate `sourceTotal` (and for
+  // seeded demo ones): it holds the dispatched figure until a batch is
+  // ingested, and the exact record count afterwards — so reading it alone made
+  // this silently switch from "dispatched" to "ingested" the moment a campaign
+  // finished ingesting, and show 0 for one that ingested nothing.
+  const totalRecords = targets.reduce((a: number, c: Batch) => a + (c.sourceTotal ?? c.total), 0);
   const hasVoice = targets.some((t: Batch) => t.channel === "voice");
   const hasMsg = targets.some((t: Batch) => t.channel !== "voice");
 

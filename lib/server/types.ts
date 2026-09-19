@@ -43,6 +43,18 @@ export interface BatchDoc {
   provider: string;
   date: string; // ISO
   total: number;
+  /** Contacts the upstream bulk job reports it dispatched (`total_contacts`),
+   *  kept verbatim from the source and never replaced by the ingested count.
+   *
+   *  `total` deliberately switches to the exact record count once a revision is
+   *  committed, which is right for every figure derived from it — but it means
+   *  a batch that ingested nothing ends up claiming upstream had nothing
+   *  either, erasing the one number that proves records are missing. Keeping
+   *  the dispatched count on its own field is what lets the worker tell "an
+   *  empty campaign" apart from "a campaign whose records we could not read",
+   *  and what lets the UI label the two numbers separately. Absent on documents
+   *  written before this field existed. */
+  sourceTotal?: number;
   breakdown: BreakdownSeg[];
   successRate: number;
   spendInr: number;
