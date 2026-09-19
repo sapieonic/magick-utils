@@ -23,7 +23,7 @@ import {
   SUPERSEDED_REVISION_GRACE_MS,
   updateClaimedJob,
 } from "./repositories";
-import { MagickApiError, MagickClient } from "./magick-client";
+import { MagickApiError, MagickClient, type RawBulkJob } from "./magick-client";
 import {
   idTokenNeedsRefresh,
   mintIdToken,
@@ -34,7 +34,7 @@ import {
 import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
-import type { Job, NormalizedRecord, TenantContext } from "./types";
+import { isEmptyDispatchedPull, type Job, type NormalizedRecord, type TenantContext } from "./types";
 import { logger, log } from "./logger";
 import { runWithRequestContext } from "./observability/request-context";
 
@@ -347,6 +347,34 @@ function scheduleSupersededRevisionSweep(ctx: TenantContext, batchId: string, pu
   timer.unref?.();
 }
 
+/** Bulk-job statuses that mean upstream finished putting the contact list on
+ *  the wire, so records for it should exist and an empty pull is a fault.
+ *
+ *  Positive and narrow, deliberately. Only a job we can PROVE finished dialling
+ *  arms the empty-pull guard in `ingestBatch`; anything else — still queued or
+ *  processing, cancelled or failed before it dialled, an unrecognised state, or
+ *  a job detail we could not fetch at all — leaves it disarmed. Both directions
+ *  of error are real, but they are not equal: a missed detection leaves the
+ *  blank batch this guard set out to surface, while a false positive puts
+ *  "Sync failed" on a healthy campaign that is simply still running or was
+ *  deliberately cancelled, and `failBatchIfOwned` writes `error` on a batch with
+ *  no published revision — a red state no click can clear. The second is worse
+ *  and hits far more campaigns, so "unsure" must mean "stay quiet".
+ *
+ *  These three are the statuses `messageBreakdown` (map.ts) treats as "it went
+ *  out". `TERMINAL_JOB_STATUSES` there is a different question — "will anything
+ *  more arrive" — and includes `failed`/`cancelled`, which is exactly why this
+ *  cannot reuse it. */
+const DIALLED_JOB_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "dispatched",
+  "partially_failed",
+]);
+
+function jobFinishedDialling(job: RawBulkJob | null): boolean {
+  return DIALLED_JOB_STATUSES.has((job?.status ?? "").toLowerCase().trim());
+}
+
 async function ingestBatch(
   client: MagickClient,
   ctx: TenantContext,
@@ -390,15 +418,18 @@ async function ingestBatch(
   // job would be reading the stamp after its pause, and would then claim to
   // include changes made during that pause. A null stamp simply means the batch
   // never qualifies for a skip, which is the safe direction.
-  const sourceUpdatedAt = initialOffset === 0 && batch.sourceId
+  // Kept whole rather than reduced to the stamp: `status` is what lets the
+  // empty-pull guard below tell a campaign upstream has not dialled yet from
+  // one whose records we cannot read. Same single fetch either way.
+  const sourceJob = initialOffset === 0 && batch.sourceId
     ? await client
         .getBulkJob(batch.sourceId)
-        .then((job) => job.updated_at ?? null)
         .catch((error) => {
           log().warn({ error, batchId }, "[worker] source stamp unavailable; refreshes will re-pull this batch");
           return null;
         })
     : null;
+  const sourceUpdatedAt = sourceJob?.updated_at ?? null;
 
   const revision = jobId;
   const revisionCreatedAt = new Date();
@@ -503,6 +534,50 @@ async function ingestBatch(
       "[worker] duplicate upstream record ids deduplicated",
     );
   }
+  // Upstream says this campaign dispatched contacts, and pagination returned
+  // nothing at all. Publishing that as a complete revision is what puts a green
+  // "Up to date" over an empty Analytics screen: the batch looks ingested, the
+  // only evidence sits in a warning nobody reads, and the failure then conceals
+  // itself — the empty revision commits, `total` collapses to the ingested 0,
+  // and the next run has no figure left to notice the gap with. `sourceTotal`
+  // is read alongside `reportedTotal` for exactly that reason: it survives a
+  // commit, so a batch already poisoned by an earlier empty publish is still
+  // caught here.
+  //
+  // Deliberately only the total blackout, and only for a job we can prove
+  // finished dialling. Upstream totals routinely run a little ahead of the rows
+  // they count — a dispatched contact with no call row yet — so a short pull
+  // stays the warning below rather than a failure; and `jobFinishedDialling`
+  // keeps a still-running, cancelled or unreadable job out of this entirely,
+  // because reporting "Sync failed" on a campaign the customer has only just
+  // launched, or deliberately cancelled, is a worse bug than the one being
+  // fixed. Note that `sourceJob` is null on a resumed batch (it is fetched only
+  // at offset 0), which disarms the guard there — acceptable, since a resumed
+  // batch has staged rows and so does not reach `records.length === 0`.
+  //
+  // Throwing marks a never-ingested batch "error", and — for a batch already
+  // poisoned by an earlier empty publish — `failBatchIfOwned` recognises that
+  // its published revision is this same fault and errors it too rather than
+  // resolving it back to "ready". Any other published revision stays readable,
+  // because a failed refresh has not invalidated the good data behind it.
+  const dispatched = Math.max(reportedTotal, batch.sourceTotal ?? 0);
+  if (isEmptyDispatchedPull(records.length, dispatched) && jobFinishedDialling(sourceJob)) {
+    log().error(
+      {
+        batchId,
+        selType: batch.selType,
+        channel: batch.channel,
+        dispatched,
+        sourceId: batch.sourceId,
+        sourceStatus: sourceJob?.status ?? null,
+      },
+      "[worker] upstream returned no records for a batch it reports as dispatched",
+    );
+    throw new Error(
+      `no records returned for ${batchId}: upstream reports ${dispatched} dispatched contacts ` +
+        `but returned no records for this ${batch.selType} batch`,
+    );
+  }
   if (reportedTotal !== records.length) {
     log().warn(
       { batchId, reportedTotal, actualTotal: records.length },
@@ -539,6 +614,13 @@ async function ingestBatch(
     selType: batch.selType,
     provider: batch.provider,
     date: batch.date,
+    // `total` below is the exact record count; this is the dispatched figure,
+    // which is upstream's and must survive publication — dropping it here
+    // would let the next listing re-derive it and lose it again on the commit
+    // after that. Prefer the detail payload just fetched over the copy the last
+    // campaigns listing left on the doc, and never let either absence overwrite
+    // a figure already held.
+    sourceTotal: sourceJob?.total_contacts ?? batch.sourceTotal,
     fingerprint: freshFp,
     sourceFingerprint: batch.sourceFingerprint,
     // Stamp what this revision was built from. The fingerprint is what later

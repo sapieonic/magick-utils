@@ -329,6 +329,56 @@ describe("POST /api/ingest", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
+  // The IVR blackout, as it exists in Mongo after a build that published the
+  // empty pull: ingestStatus "ready", publishedRevision set, and `total` already
+  // collapsed to 0 by the commit. `counts === doc.total` is then `0 === 0`, so
+  // both of this route's paths used to agree the batch was finished — the plain
+  // load filtered it out, and the refresh proved the job untouched and skipped
+  // it — which is why the worker guard could never run and the customer kept
+  // getting a green "Up to date" over an empty screen with no way to clear it.
+  // `sourceTotal` is what still says 3,475 contacts went out.
+  it("re-ingests a ready batch holding no records for a job that dispatched contacts", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 0, sourceTotal: 3475, selType: "ivr", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(0);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+
+    // Plain load: must not be filtered out as complete.
+    const plain = await POST(req({ batchIds: ["b1"], type: "ingest" }));
+    expect(plain.status).toBe(200);
+    await expect(plain.json()).resolves.toMatchObject({ ready: false });
+    expect(createJob).toHaveBeenCalled();
+
+    // Refresh: must not be skipped as proven-unchanged either.
+    vi.mocked(createJob).mockClear();
+    const refreshed = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    await expect(refreshed.json()).resolves.toMatchObject({ ready: false });
+    expect(createJob).toHaveBeenCalled();
+  });
+
+  // The ordinary empty campaign must still be left alone, or every batch that
+  // genuinely dispatched nothing re-ingests on every page load forever.
+  it("still treats a batch with no records and nothing dispatched as complete", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 0, sourceTotal: 0, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(0);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
   // A running campaign keeps producing records, and its summary fields can sit
   // still while they do — never skip one, whatever the timestamps say.
   it("re-ingests a job that has not finished, even with an unchanged timestamp", async () => {

@@ -202,6 +202,45 @@ describe("batch worker ownership", () => {
 
     expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("error");
   });
+
+  it("errors a batch whose published revision is the empty pull, rather than restoring it", async () => {
+    // The poisoned document a pre-fix build committed: a published revision
+    // holding no records for a job upstream says dispatched 3,475 contacts, and
+    // an unchanged source — which is exactly what the "ready" branch above keys
+    // off. Restoring it hands the customer the same blank Analytics screen
+    // under a green label, and since nothing about the batch changes, every
+    // retry restores it again and the worker's error can never stick.
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+      total: 0, sourceTotal: 3475,
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("error");
+  });
+
+  it("still restores a genuinely empty campaign's published revision", async () => {
+    // Zero records and zero dispatched contacts is a real, complete batch. An
+    // absent `sourceTotal` (every document written before the field existed)
+    // must read the same way: no dispatched count is no claim, not a claim of
+    // nothing. Erroring these would take a fleet of healthy batches offline.
+    for (const sourceTotal of [0, undefined]) {
+      batchDb.updateOne.mockClear();
+      batchDb.findOne.mockResolvedValue({
+        tenantId: "t1", accountId: "a1", batchId: "b1",
+        publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+        total: 0, sourceTotal,
+      });
+      batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+      await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+      expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("ready");
+    }
+  });
 });
 
 describe("superseded revision reclamation", () => {

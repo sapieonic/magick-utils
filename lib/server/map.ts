@@ -34,6 +34,7 @@ export function batchDocToBatch(doc: BatchDoc): Batch {
     date: doc.date,
     dayAgo: dayAgo(doc.date),
     total: doc.total,
+    sourceTotal: doc.sourceTotal,
     breakdown: doc.breakdown,
     successRate: doc.successRate,
     spendInr: doc.spendInr,
@@ -196,7 +197,12 @@ export function bulkJobIsUnchangedSince(
 export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?: BatchDoc | null): BatchDoc {
   const map = dispatchTypeToType(job.dispatch_type);
   const sourceId = (job.id ?? "").toString();
-  const sourceTotal = job.total_contacts ?? 0;
+  // Named for what it is — a contact count — so it does not read as the
+  // `sourceTotal` FIELD below, which is derived separately. This one seeds
+  // `total` for a batch that has not been ingested yet, and through it the
+  // `successRate` denominator and `messageBreakdown`'s bucket size, so the
+  // `?? 0` floor stays: those want a number, not an absence.
+  const contactCount = job.total_contacts ?? 0;
   const ingested = Boolean(existing && isBatchReadable(existing));
   const sourceFp = bulkJobSourceFingerprint(job);
   // Compare against what the PUBLISHED REVISION was built from, not against the
@@ -212,7 +218,19 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
   const committed = Boolean(ingested && existing);
   // Once committed, unique normalized records—not a possibly stale/raw contact
   // count—are authoritative for readiness, analytics, and exports.
-  const total = committed ? existing!.total : sourceTotal;
+  const total = committed ? existing!.total : contactCount;
+  // Never gated on `committed`: this is what upstream says it dispatched, and
+  // an ingestion — however it went — is not evidence about that. Recording it
+  // unconditionally is what keeps a zero-record commit from erasing the proof
+  // that records are missing (see BatchDoc.sourceTotal).
+  //
+  // But an ABSENT upstream count is not a report of zero, and must not overwrite
+  // a figure we already hold. `total_contacts` is `number | null | undefined`,
+  // so flooring it to 0 here would let one listing that omits it blank the
+  // Analytics header on a healthy batch AND disarm the worker's empty-pull
+  // guard, which reads this field as its last surviving evidence. Undefined
+  // instead, so readers fall back to `total` as both docblocks promise.
+  const dispatchedTotal = job.total_contacts ?? existing?.sourceTotal ?? undefined;
 
   let breakdown: BreakdownSeg[];
   let successRate: number;
@@ -260,6 +278,7 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     provider: (job.provider as string | null | undefined) ?? map.channel,
     date: job.created_at ?? new Date().toISOString(),
     total,
+    sourceTotal: dispatchedTotal,
     breakdown,
     successRate,
     // spend unknown until ingestion; preserve any previously ingested figures

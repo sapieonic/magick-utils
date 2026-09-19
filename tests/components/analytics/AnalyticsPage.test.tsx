@@ -296,6 +296,42 @@ describe("Analytics page live/demo separation", () => {
     expect(await screen.findByText("10 records dispatched")).toBeInTheDocument();
   });
 
+  // `total` holds the dispatched figure only until a batch is ingested, after
+  // which it is the exact record count — so reading it alone made this header
+  // quietly stop being "dispatched", and read 0 for the IVR batches that
+  // ingested nothing while upstream reported thousands.
+  it("reads the dispatched count from sourceTotal, not the ingested total", async () => {
+    mockCampaigns({ batches: [{ ...campaign, total: 0, sourceTotal: 3475 }], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
+    vi.mocked(getAnalytics).mockResolvedValue({ ...aggregates, totalRecords: 0 });
+    render(<Page />);
+
+    expect(await screen.findByText("3,475 records dispatched")).toBeInTheDocument();
+  });
+
+  // The ingest job's total is the sum of batchDoc.total, so the percentage it
+  // reports is a fraction of THAT. Scaling it by the dispatched count mixed two
+  // bases and rendered "3,475 / 3,475" for a batch holding 2,233 records —
+  // inventing 1,242 records to claim completion over.
+  it("shows ingest progress against the job's own denominator, not the dispatched count", async () => {
+    mockCampaigns({ batches: [{ ...campaign, total: 2233, sourceTotal: 3475 }], source: "live" });
+    vi.mocked(createIngestJob).mockResolvedValue({
+      jobId: "job-1", total: 2233, done: 1117, ready: false,
+    });
+    vi.mocked(getJob).mockResolvedValue({
+      jobId: "job-1", type: "ingest", status: "running", total: 2233, done: 1117,
+      retryAt: null, retryCount: 0, error: null, result: null,
+      createdAt: "2026-08-12T00:00:00Z", updatedAt: "2026-08-12T00:00:01Z",
+    });
+    render(<Page />);
+
+    // Both halves: a numerator scaled by the dispatched count would read
+    // "1,738 / 2,233" here, which is why the denominator alone is not enough.
+    expect(await screen.findByText("1,117 / 2,233 records")).toBeInTheDocument();
+    // The header still reports what upstream dispatched.
+    expect(screen.getByText("3,475 records dispatched")).toBeInTheDocument();
+  });
+
   it("does not enqueue a second ingest when Refresh data is double-clicked", async () => {
     mockCampaigns({ batches: [campaign], source: "live" });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });

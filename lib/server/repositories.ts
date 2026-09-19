@@ -20,7 +20,7 @@ import {
   IVR_HANGUP_NODE_KEYS,
   SHORT_CALL_SECONDS,
 } from "@/lib/server/dashboard-quality";
-import { isBatchReadable } from "@/lib/server/types";
+import { isBatchReadable, isEmptyDispatchedPull } from "@/lib/server/types";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -183,11 +183,23 @@ export async function failBatchIfOwned(
     current.ingestedSourceFingerprint && current.ingestedSourceFingerprint === current.sourceFingerprint
       ? "ready"
       : "stale";
+  // ...unless what is published is the empty-pull failure itself. A revision
+  // holding zero records for a job upstream says dispatched thousands is not a
+  // previous good state to fall back to: resolving it to "ready" hands the
+  // customer the same blank Analytics screen under a green label, and because
+  // an unchanged source then resolves it to "ready" again on every retry, the
+  // error the worker raised could never stick to the batch. These documents
+  // exist — they were committed by builds that published the empty pull before
+  // `ingestBatch` refused to — so cleanup has to recognise one, not just avoid
+  // creating it. `error` is the honest state: unreadable, visibly broken, and
+  // replaced the moment an ingestion actually returns records.
+  const publishedIsUsable =
+    Boolean(current.publishedRevision) && !isEmptyDispatchedPull(current.total, current.sourceTotal);
   await col.updateOne(
     { tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId },
     {
       $set: {
-        ingestStatus: current.publishedRevision ? readableStatus : "error",
+        ingestStatus: publishedIsUsable ? readableStatus : "error",
         updatedAt: nowIso(),
       },
       $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
