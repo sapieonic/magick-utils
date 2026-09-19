@@ -1,3 +1,10 @@
+## [1.3.8](https://github.com/sapieonic/magick-utils/compare/v1.3.7...v1.3.8) (2026-09-19)
+
+
+### Bug Fixes
+
+* stop a batch that ingests no records from publishing as "Up to date" ([#38](https://github.com/sapieonic/magick-utils/issues/38)) ([37c6f1a](https://github.com/sapieonic/magick-utils/commit/37c6f1a40ce303001a6979186f99aa83165a36a8)), closes [#23](https://github.com/sapieonic/magick-utils/issues/23)
+
 ## [1.3.7](https://github.com/sapieonic/magick-utils/compare/v1.3.6...v1.3.7) (2026-09-18)
 
 
