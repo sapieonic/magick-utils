@@ -127,13 +127,21 @@ export default function Page() {
   const ids = useMemo(() => targets.map((t: Batch) => t.id), [targets]);
   const idsKey = ids.join(",");
 
-  // The dispatched contact count, which is what both readers below label it as.
+  // The dispatched contact count, for the header that says so.
   // `total` is only a stand-in for batches that predate `sourceTotal` (and for
   // seeded demo ones): it holds the dispatched figure until a batch is
   // ingested, and the exact record count afterwards — so reading it alone made
   // this silently switch from "dispatched" to "ingested" the moment a campaign
   // finished ingesting, and show 0 for one that ingested nothing.
   const totalRecords = targets.reduce((a: number, c: Batch) => a + (c.sourceTotal ?? c.total), 0);
+  // The ingest job's own denominator. `/api/ingest` builds `job.total` by summing
+  // `batchDoc.total`, so the percentage it reports is a fraction of THAT, and
+  // scaling it by `totalRecords` above would mix two bases: a batch with 2,233
+  // records and 3,475 dispatched reads "3,475 / 3,475" at 100%, inventing 1,242
+  // records to claim completion over. Kept separate rather than folded into one
+  // figure because the progress line and the header are asking different
+  // questions — how far through the work we are, and how many contacts went out.
+  const ingestDenominator = targets.reduce((a: number, c: Batch) => a + c.total, 0);
   const hasVoice = targets.some((t: Batch) => t.channel === "voice");
   const hasMsg = targets.some((t: Batch) => t.channel !== "voice");
 
@@ -326,7 +334,7 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idsKey, runToken, batchesReady]);
 
-  const ingested = Math.round((ingest / 100) * totalRecords);
+  const ingested = Math.round((ingest / 100) * ingestDenominator);
 
   const tabs = [
     { value: "overview", label: "Overview", icon: "LayoutDashboard" },
@@ -446,8 +454,13 @@ export default function Page() {
                   <div className="h-1.5 w-full rounded-full bg-slate-200 overflow-hidden">
                     <div className="h-full rounded-full transition-all" style={{ width: ingest + "%", background: "var(--accent)" }} />
                   </div>
-                  <div className="text-[11px] tabnum text-slate-400 mt-1" title="Estimated progress against the dispatched contact count">
-                    {fmtNum(ingested)} / {fmtNum(totalRecords)} dispatched
+                  {/* Both figures are the ingest job's own denominator, never the
+                      dispatched count above: they have to share a base or the
+                      ratio is fiction. Labelled "records" rather than
+                      "dispatched" because on a refresh this counts the records
+                      the job is re-pulling, not contacts that went out. */}
+                  <div className="text-[11px] tabnum text-slate-400 mt-1" title="Estimated progress against the records this job is pulling">
+                    {fmtNum(ingested)} / {fmtNum(ingestDenominator)} records
                   </div>
                 </div>
               ) : ingestError ? (

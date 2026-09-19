@@ -54,7 +54,7 @@ describe("batchDocToBatch", () => {
       tenantId: "t", accountId: "a", batchId: "AI-0001", sourceId: "src",
       name: "Camp", channel: "voice", callType: "ai", provider: "twilio",
       date: new Date(Date.now() - 86_400_000 * 3).toISOString(),
-      selType: "ai", total: 100,
+      selType: "ai", total: 100, sourceTotal: 120,
       breakdown: [{ key: "completed", value: 80 }],
       successRate: 0.8, spendInr: 50, telephonyInr: 30, aiInr: 20,
       avgDuration: 120, avgTalkTime: 90, fingerprint: "fp",
@@ -69,6 +69,10 @@ describe("batchDocToBatch", () => {
     expect(b.provider).toBe("twilio");
     expect(b.dayAgo).toBe(3);
     expect(b.total).toBe(100);
+    // The server->UI seam for the dispatched count. Without this line the
+    // field never reaches the browser and the Analytics header silently
+    // falls back to the ingested total — the bug, restored, invisibly.
+    expect(b.sourceTotal).toBe(120);
     expect(b.breakdown).toEqual([{ key: "completed", value: 80 }]);
     expect(b.successRate).toBe(0.8);
     expect(b.spendInr).toBe(50);

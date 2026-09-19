@@ -138,9 +138,23 @@ export const POST = withLogging("ingest", async (req: Request) => {
   const counts = await Promise.all(
     requestedBatchIds.map((id) => countRecords(ctx.tenantId, ctx.accountId, [id])),
   );
-  const complete = requestedBatchIds.map(
-    (_, index) => isBatchReadable(batchDocs[index]) && counts[index] === batchDocs[index].total,
-  );
+  const complete = requestedBatchIds.map((_, index) => {
+    const doc = batchDocs[index];
+    if (!isBatchReadable(doc) || counts[index] !== doc.total) return false;
+    // A batch holding zero records while upstream reports dispatched contacts
+    // is not complete — it is the empty-pull failure the worker now refuses to
+    // publish, committed by a build that still did. Counting it as complete is
+    // what made it unrecoverable rather than merely wrong: `total` collapsed to
+    // 0 on that commit, so `counts === doc.total` is `0 === 0` and the batch is
+    // filtered out here, meaning no job is enqueued and the worker's guard never
+    // runs. The refresh path is the same story one step later — it reads this
+    // same array, and a "ready" batch whose job upstream has not touched since
+    // is proven unchanged and skipped. Both routes agreed the batch was fine and
+    // the customer got a green "Up to date" over an empty screen with no way to
+    // clear it. Treating it as incomplete puts it back in front of the worker,
+    // which decides — and now says so.
+    return !(counts[index] === 0 && (doc.sourceTotal ?? 0) > 0);
+  });
   let batchIds: string[];
   try {
     batchIds = forceRefresh

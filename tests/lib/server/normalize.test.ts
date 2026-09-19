@@ -302,6 +302,19 @@ describe("buildBatchDoc", () => {
     expect(buildBatchDoc([makeRecord()], ctx, baseOpts({ total: 50 })).total).toBe(50);
   });
 
+  // The publication half of "the dispatched count survives a commit". The worker
+  // test cannot cover this — it mocks buildBatchDoc and so only proves the
+  // option is passed, not that the document carries it.
+  it("writes sourceTotal onto the published document, independently of total", () => {
+    const doc = buildBatchDoc([makeRecord()], ctx, baseOpts({ sourceTotal: 3475 }));
+    expect(doc.sourceTotal).toBe(3475);
+    expect(doc.total).toBe(1);
+  });
+
+  it("leaves sourceTotal absent when the caller has no dispatched figure", () => {
+    expect(buildBatchDoc([makeRecord()], ctx, baseOpts()).sourceTotal).toBeUndefined();
+  });
+
   it("breakdown uses fixed order and only known keys", () => {
     const recs = [
       makeRecord({ status: "failed" }),

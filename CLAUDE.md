@@ -43,6 +43,24 @@ published revision is complete and is what every reader sees, it just has upstre
 Use `isBatchReadable()` from `lib/server/types.ts` rather than comparing to `"ready"`; treating stale as
 un-ingested is what produced intermittent 409s. See BACKEND.md → *Batch freshness*.
 
+A batch carries **two totals and they mean different things**. `BatchDoc.total` is the dispatched contact
+count until a revision commits and the exact ingested record count afterwards — right for everything
+derived from the records (successRate, progress, exports), wrong as "how many contacts went out".
+`BatchDoc.sourceTotal` is upstream's `total_contacts`, never replaced by an ingestion. Reach for
+`sourceTotal ?? total` for a dispatched figure and plain `total` for a record figure, and never scale one
+by the other — the ingest job's progress percentage is a fraction of summed `total`, so rendering it
+against `sourceTotal` invents records. `sourceTotal` is deliberately **absent rather than 0** when
+upstream reports no count, because 0 is a claim: read it with `??`, never with `$exists`/`!== undefined`
+(undefined persists as BSON null).
+
+A pull that returns **zero records for a job upstream says it dispatched** is a failure, not an empty
+batch — `ingestBatch` throws rather than publishing it. Publishing it put a green "Up to date" over an
+empty Analytics screen, and it was self-concealing: the empty commit collapsed `total` to 0, after which
+`/api/ingest` scored the batch complete (`counts === doc.total` is `0 === 0`), enqueued nothing, and no
+later refresh could reach it. Both halves have to hold together — if you change one, check the other.
+Only a job that PROVABLY finished dialling arms that guard; a still-running, cancelled or unreadable job
+must stay exempt, or healthy campaigns get an `error` no click can clear.
+
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see
 `bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`. The one refresh that is never skipped

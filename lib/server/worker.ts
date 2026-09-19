@@ -347,20 +347,32 @@ function scheduleSupersededRevisionSweep(ctx: TenantContext, batchId: string, pu
   timer.unref?.();
 }
 
-/** Bulk-job statuses that mean upstream is still working through the contact
- *  list. Calls for those contacts legitimately do not exist yet, so pulling
- *  nothing is the honest answer rather than the fault the empty-pull guard in
- *  `ingestBatch` reports.
+/** Bulk-job statuses that mean upstream finished putting the contact list on
+ *  the wire, so records for it should exist and an empty pull is a fault.
  *
- *  An allow-list of IN-FLIGHT states, deliberately not of settled ones. An
- *  unrecognised status then reads as settled and an empty pull gets surfaced;
- *  the other way round, a vocabulary that grew a new terminal state would
- *  silently restore the blank-batch bug the guard exists to catch. Values
- *  mirror the job statuses `messageBreakdown` maps in map.ts. */
-const IN_FLIGHT_JOB_STATUSES: ReadonlySet<string> = new Set(["queued", "processing"]);
+ *  Positive and narrow, deliberately. Only a job we can PROVE finished dialling
+ *  arms the empty-pull guard in `ingestBatch`; anything else — still queued or
+ *  processing, cancelled or failed before it dialled, an unrecognised state, or
+ *  a job detail we could not fetch at all — leaves it disarmed. Both directions
+ *  of error are real, but they are not equal: a missed detection leaves the
+ *  blank batch this guard set out to surface, while a false positive puts
+ *  "Sync failed" on a healthy campaign that is simply still running or was
+ *  deliberately cancelled, and `failBatchIfOwned` writes `error` on a batch with
+ *  no published revision — a red state no click can clear. The second is worse
+ *  and hits far more campaigns, so "unsure" must mean "stay quiet".
+ *
+ *  These three are the statuses `messageBreakdown` (map.ts) treats as "it went
+ *  out". `TERMINAL_JOB_STATUSES` there is a different question — "will anything
+ *  more arrive" — and includes `failed`/`cancelled`, which is exactly why this
+ *  cannot reuse it. */
+const DIALLED_JOB_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "dispatched",
+  "partially_failed",
+]);
 
-function jobIsInFlight(job: RawBulkJob | null): boolean {
-  return IN_FLIGHT_JOB_STATUSES.has((job?.status ?? "").toLowerCase().trim());
+function jobFinishedDialling(job: RawBulkJob | null): boolean {
+  return DIALLED_JOB_STATUSES.has((job?.status ?? "").toLowerCase().trim());
 }
 
 async function ingestBatch(
@@ -532,18 +544,21 @@ async function ingestBatch(
   // commit, so a batch already poisoned by an earlier empty publish is still
   // caught here.
   //
-  // Deliberately only the total blackout, and only once upstream has finished
-  // dialling. Upstream totals routinely run a little ahead of the rows they
-  // count — a dispatched contact with no call row yet — so a short pull stays
-  // the warning below rather than a failure; and a job still queued or
-  // processing has every right to have produced nothing so far, which is why
-  // `jobIsInFlight` exempts it instead of reporting "Sync failed" on every
-  // campaign the customer has only just launched.
+  // Deliberately only the total blackout, and only for a job we can prove
+  // finished dialling. Upstream totals routinely run a little ahead of the rows
+  // they count — a dispatched contact with no call row yet — so a short pull
+  // stays the warning below rather than a failure; and `jobFinishedDialling`
+  // keeps a still-running, cancelled or unreadable job out of this entirely,
+  // because reporting "Sync failed" on a campaign the customer has only just
+  // launched, or deliberately cancelled, is a worse bug than the one being
+  // fixed. Note that `sourceJob` is null on a resumed batch (it is fetched only
+  // at offset 0), which disarms the guard there — acceptable, since a resumed
+  // batch has staged rows and so does not reach `records.length === 0`.
   //
   // Throwing leaves any previously published revision readable and marks a
   // never-ingested batch "error", which is what the screen should be saying.
   const dispatched = Math.max(reportedTotal, batch.sourceTotal ?? 0);
-  if (records.length === 0 && dispatched > 0 && !jobIsInFlight(sourceJob)) {
+  if (records.length === 0 && dispatched > 0 && jobFinishedDialling(sourceJob)) {
     log().error(
       {
         batchId,
@@ -596,11 +611,13 @@ async function ingestBatch(
     selType: batch.selType,
     provider: batch.provider,
     date: batch.date,
-    // `total` is left to default to the exact record count, but the dispatched
-    // figure is upstream's and must survive publication — dropping it here
+    // `total` below is the exact record count; this is the dispatched figure,
+    // which is upstream's and must survive publication — dropping it here
     // would let the next listing re-derive it and lose it again on the commit
-    // after that.
-    sourceTotal: batch.sourceTotal,
+    // after that. Prefer the detail payload just fetched over the copy the last
+    // campaigns listing left on the doc, and never let either absence overwrite
+    // a figure already held.
+    sourceTotal: sourceJob?.total_contacts ?? batch.sourceTotal,
     fingerprint: freshFp,
     sourceFingerprint: batch.sourceFingerprint,
     // Stamp what this revision was built from. The fingerprint is what later

@@ -53,7 +53,13 @@ export interface BatchDoc {
    *  the dispatched count on its own field is what lets the worker tell "an
    *  empty campaign" apart from "a campaign whose records we could not read",
    *  and what lets the UI label the two numbers separately. Absent on documents
-   *  written before this field existed. */
+   *  written before this field existed, and absent — rather than 0 — whenever
+   *  upstream does not report a count, because 0 is a claim and would both blank
+   *  the header and disarm the guard.
+   *
+   *  Read it with `??`, never with a presence test: the driver is not configured
+   *  with `ignoreUndefined`, so an undefined value is stored as BSON null. A
+   *  `$exists: false` filter or a `!== undefined` check will not see those. */
   sourceTotal?: number;
   breakdown: BreakdownSeg[];
   successRate: number;

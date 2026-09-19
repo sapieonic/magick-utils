@@ -201,6 +201,39 @@ describe("bulkJobToBatchDoc", () => {
     expect(refreshed.sourceTotal).toBe(3475);
   });
 
+  // An absent upstream count is not a report of zero. Flooring it to 0 would
+  // blank the Analytics header on a healthy batch and disarm the worker's
+  // empty-pull guard, which reads this field as its last surviving evidence.
+  it("keeps a known dispatched count when upstream omits total_contacts", () => {
+    const base: RawBulkJob = {
+      id: "no-count", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 2290,
+      updated_at: "2026-09-18T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(base, ctx);
+    expect(source.sourceTotal).toBe(2290);
+
+    const committed: BatchDoc = {
+      ...source,
+      total: 2233,
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+      fingerprint: "dataset-fp",
+    };
+    const refreshed = bulkJobToBatchDoc({ ...base, total_contacts: null }, ctx, committed);
+
+    expect(refreshed.sourceTotal).toBe(2290);
+  });
+
+  // With nothing held and nothing reported it must be absent, not 0 — `0` is not
+  // nullish, so it would defeat the documented `sourceTotal ?? total` fallback.
+  it("leaves the dispatched count absent when it has never been reported", () => {
+    const doc = bulkJobToBatchDoc(
+      { id: "never", dispatch_type: "ai_voice_call", status: "processing", total_contacts: null },
+      ctx,
+    );
+    expect(doc.sourceTotal).toBeUndefined();
+  });
+
   it("marks a committed dataset stale when the upstream revision changes", () => {
     const first = bulkJobToBatchDoc({
       id: "job-stale", dispatch_type: "ai_voice_call", status: "processing",
