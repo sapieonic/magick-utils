@@ -38,6 +38,15 @@ A **batch** = one bulk job's result. `selType(batch)` ∈ `ai | ivr | message` g
 you may only multi-select / combine / analyze-together batches of the **same selType**. `typeKey` keeps
 messaging channels distinct for badges (`ai | ivr | whatsapp | telegram | email`).
 
+`BatchDoc.dispatchType` is the upstream job's `dispatch_type` (`ai_voice_call` | `ivr_call` |
+`static_call` | messaging). **Listing records must route by `dispatchType`, not `selType`** — `selType`
+collapses `ivr_call` and `static_call` to `"ivr"`, so it cannot choose a surface. magick-master's
+`/proxy/*` list routes each serve one type: `/proxy/calls` (AI, `calls`), `/proxy/static-calls`
+(static, `calls`), `/proxy/ivr-calls` (IVR, `sessions`), `/proxy/messaging/messages` (`messages`). A
+`job_id` on the wrong surface is a 400. Always send `job_id` (`sourceId`); dropping it to dodge that
+400 lists the whole account. IVR session rows use `id`/`phone`/flat timestamps, not
+`call_id`/`recipient_phone`. See BACKEND.md → *Job-scoped list surfaces*.
+
 `BatchDoc.ingestStatus` is `none | ingesting | ready | stale | error`. **`stale` is readable** — its
 published revision is complete and is what every reader sees, it just has upstream changes waiting.
 Use `isBatchReadable()` from `lib/server/types.ts` rather than comparing to `"ready"`; treating stale as
