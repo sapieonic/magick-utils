@@ -1,3 +1,10 @@
+## [1.3.9](https://github.com/sapieonic/magick-utils/compare/v1.3.8...v1.3.9) (2026-09-20)
+
+
+### Bug Fixes
+
+* **ingest:** route job-scoped reads by dispatch_type ([#39](https://github.com/sapieonic/magick-utils/issues/39)) ([2cc1035](https://github.com/sapieonic/magick-utils/commit/2cc103599238e13f47487d0b4dc94e51524dfe95))
+
 ## [1.3.8](https://github.com/sapieonic/magick-utils/compare/v1.3.7...v1.3.8) (2026-09-19)
 
 
