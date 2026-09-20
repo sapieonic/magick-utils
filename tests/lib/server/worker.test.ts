@@ -363,6 +363,16 @@ describe("processJob resume", () => {
     expect(client.listStaticCalls).not.toHaveBeenCalled();
   });
 
+  it("refuses an unrecognized dispatch_type instead of inferring /proxy/calls from selType", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ai", dispatchType: "ai_voice_call" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "webrtc_call" });
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(/unsupported dispatch_type "webrtc_call"/);
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
+  });
+
   // Status comparison is case- and whitespace-insensitive; without the
   // normalization a padded value reads as unrecognised and silently disarms.
   it("normalizes the job status before classifying it", async () => {

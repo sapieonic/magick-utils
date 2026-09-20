@@ -246,6 +246,35 @@ describe("resolveJobDispatchType", () => {
       /ambiguous/,
     );
   });
+
+  it("rejects a present but unknown job dispatch_type instead of inferring from selType", () => {
+    expect(() =>
+      resolveJobDispatchType(
+        { dispatch_type: "webrtc_call" },
+        { dispatchType: "ai_voice_call", selType: "ai", channel: "voice", batchId: "b1" },
+      ),
+    ).toThrow(/unsupported dispatch_type "webrtc_call"/);
+  });
+
+  it("rejects a present but unknown stored dispatchType instead of inferring from selType", () => {
+    expect(() =>
+      resolveJobDispatchType(null, {
+        dispatchType: "webrtc_call",
+        selType: "ai",
+        channel: "voice",
+        batchId: "b1",
+      }),
+    ).toThrow(/unsupported dispatch_type "webrtc_call"/);
+  });
+
+  it("treats blank dispatch_type as absent and falls back", () => {
+    expect(
+      resolveJobDispatchType(
+        { dispatch_type: "  " },
+        { dispatchType: "ivr_call", selType: "ivr", channel: "voice" },
+      ),
+    ).toBe("ivr_call");
+  });
 });
 
 describe("MagickClient job-scoped lists", () => {

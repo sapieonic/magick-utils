@@ -44,7 +44,8 @@ collapses `ivr_call` and `static_call` to `"ivr"`, so it cannot choose a surface
 `/proxy/*` list routes each serve one type: `/proxy/calls` (AI, `calls`), `/proxy/static-calls`
 (static, `calls`), `/proxy/ivr-calls` (IVR, `sessions`), `/proxy/messaging/messages` (`messages`). A
 `job_id` on the wrong surface is a 400. Always send `job_id` (`sourceId`); dropping it to dodge that
-400 lists the whole account. IVR session rows use `id`/`phone`/flat timestamps, not
+400 lists the whole account. A present but unknown `dispatch_type` throws rather than inferring
+`/proxy/calls` from `selType`. IVR session rows use `id`/`phone`/flat timestamps, not
 `call_id`/`recipient_phone`. See BACKEND.md → *Job-scoped list surfaces*.
 
 `BatchDoc.ingestStatus` is `none | ingesting | ready | stale | error`. **`stale` is readable** — its

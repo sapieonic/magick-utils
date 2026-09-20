@@ -348,13 +348,29 @@ export function inferJobDispatchType(
   return null;
 }
 
+/** Present non-empty value: known key, or throw. Empty/absent: null so the
+ *  caller may fall back. A typo or newly added upstream type must not look
+ *  like "missing" and then infer `/proxy/calls` from selType. */
+function knownOrAbsentDispatchType(
+  value: string | null | undefined,
+  batchId?: string,
+): JobDispatchType | null {
+  const key = (value ?? "").toLowerCase().trim();
+  if (!key) return null;
+  if (key in JOB_LIST_SURFACE) return key as JobDispatchType;
+  const id = batchId ? ` for ${batchId}` : "";
+  throw new Error(
+    `cannot choose a magick-master list surface${id}: unsupported dispatch_type "${key}"`,
+  );
+}
+
 export function resolveJobDispatchType(
   job: { dispatch_type?: string | null } | null | undefined,
   batch: { dispatchType?: string | null; selType: string; channel: string; batchId?: string },
 ): JobDispatchType {
   const resolved =
-    normalizeJobDispatchType(job?.dispatch_type) ??
-    normalizeJobDispatchType(batch.dispatchType) ??
+    knownOrAbsentDispatchType(job?.dispatch_type, batch.batchId) ??
+    knownOrAbsentDispatchType(batch.dispatchType, batch.batchId) ??
     inferJobDispatchType(batch.selType, batch.channel);
   if (!resolved) {
     const id = batch.batchId ? ` for ${batch.batchId}` : "";

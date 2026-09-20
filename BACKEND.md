@@ -200,8 +200,10 @@ production list caller. Combine / Analytics / CSV export read Mongo.
 therefore reads `dispatch_type` from the job payload (`getBulkJob`), then `BatchDoc.dispatchType`
 (stamped by the campaigns listing), then infers from `selType`+`channel` only when that is
 unambiguous. An IVR/static batch with no stored type **throws** rather than falling through to
-`/proxy/calls`. Resume fetches the job for this reason even though it still withholds the
-`ingestedSourceUpdatedAt` stamp until offset 0.
+`/proxy/calls`. A *present* but unknown `dispatch_type` (job payload or stored field) also throws —
+it is not treated as missing, so an AI-labelled batch cannot infer `/proxy/calls` and 400. Only
+genuinely absent values fall back. Resume fetches the job for this reason even though it still
+withholds the `ingestedSourceUpdatedAt` stamp until offset 0.
 
 Always send `job_id` (`BatchDoc.sourceId`). Dropping it to dodge a type-mismatch 400 would list the
 whole account, which is the bug master's guard exists to prevent. A BatchDoc with no `sourceId`
