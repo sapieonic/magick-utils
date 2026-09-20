@@ -20,7 +20,13 @@ const repositories = vi.hoisted(() => ({
   replaceBatchRecords: vi.fn(),
   updateClaimedJob: vi.fn(),
 }));
-const client = vi.hoisted(() => ({ listCalls: vi.fn(), listMessages: vi.fn(), getBulkJob: vi.fn() }));
+const client = vi.hoisted(() => ({
+  listCalls: vi.fn(),
+  listIvrCalls: vi.fn(),
+  listStaticCalls: vi.fn(),
+  listMessages: vi.fn(),
+  getBulkJob: vi.fn(),
+}));
 const logFns = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 
 vi.mock("@/lib/server/repositories", () => repositories);
@@ -91,7 +97,11 @@ beforeEach(() => {
   repositories.retireBatchRevision.mockResolvedValue(undefined);
   repositories.deleteSupersededRecordRevisions.mockResolvedValue(0);
   repositories.deleteOrphanedRecordRevisions.mockResolvedValue(0);
-  client.getBulkJob.mockResolvedValue({ id: "source-b1", updated_at: "2026-09-01T09:00:00Z" });
+  client.getBulkJob.mockResolvedValue({
+    id: "source-b1",
+    dispatch_type: "ai_voice_call",
+    updated_at: "2026-09-01T09:00:00Z",
+  });
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
 });
 
@@ -235,13 +245,20 @@ describe("processJob resume", () => {
   // leaves the batch "error" and the reason on the job.
   it("fails the batch when upstream returns no records for a job it reports as dispatched", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 3475 });
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1",
+      dispatch_type: "ivr_call",
+      status: "completed",
+      updated_at: "2026-09-18T10:00:00Z",
+    });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 3475 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).rejects.toThrow(
       /no records returned for b1.*3475 dispatched contacts/,
     );
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
     expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
   });
 
@@ -251,8 +268,13 @@ describe("processJob resume", () => {
   // the guard has to read it or those batches stay silently empty forever.
   it("catches a batch whose total already collapsed to zero, via sourceTotal", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 0, sourceTotal: 3475 });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1",
+      dispatch_type: "ivr_call",
+      status: "completed",
+      updated_at: "2026-09-18T10:00:00Z",
+    });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 0 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 0 }))).rejects.toThrow(
@@ -273,11 +295,17 @@ describe("processJob resume", () => {
   // now that they are a failure for a job that finished dialling.
   it("publishes an empty batch while upstream is still dialling", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "processing", updated_at: "2026-09-18T10:00:00Z" });
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1",
+      dispatch_type: "ivr_call",
+      status: "processing",
+      updated_at: "2026-09-18T10:00:00Z",
+    });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 0 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).resolves.toBeUndefined();
+    expect(client.listCalls).not.toHaveBeenCalled();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ total: 0 }),
       "j1",
@@ -291,38 +319,75 @@ describe("processJob resume", () => {
   // has no calls and would have been stuck in an unclearable "error"), and a
   // detail fetch that failed. All must publish rather than fail.
   it.each([
-    ["an unrecognised status", { id: "source-b1", status: "scheduled", updated_at: "2026-09-18T10:00:00Z" }],
-    ["a cancelled job", { id: "source-b1", status: "cancelled", updated_at: "2026-09-18T10:00:00Z" }],
-    ["a job that failed before dialling", { id: "source-b1", status: "failed", updated_at: "2026-09-18T10:00:00Z" }],
+    ["an unrecognised status", { id: "source-b1", dispatch_type: "ivr_call", status: "scheduled", updated_at: "2026-09-18T10:00:00Z" }],
+    ["a cancelled job", { id: "source-b1", dispatch_type: "ivr_call", status: "cancelled", updated_at: "2026-09-18T10:00:00Z" }],
+    ["a job that failed before dialling", { id: "source-b1", dispatch_type: "ivr_call", status: "failed", updated_at: "2026-09-18T10:00:00Z" }],
   ])("does not fail an empty batch on %s", async (_label, bulkJob) => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
     client.getBulkJob.mockResolvedValue(bulkJob);
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 0 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).resolves.toBeUndefined();
+    expect(client.listCalls).not.toHaveBeenCalled();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalled();
   });
 
   it("does not fail an empty batch when the job detail could not be fetched", async () => {
-    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
+    // selType cannot tell ivr_call from static_call, so the listing's stored
+    // dispatchType is what chooses the surface when the detail fetch fails.
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"),
+      selType: "ivr",
+      dispatchType: "ivr_call",
+      total: 3475,
+    });
     client.getBulkJob.mockRejectedValue(new Error("upstream 500"));
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 0 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).resolves.toBeUndefined();
+    expect(client.listCalls).not.toHaveBeenCalled();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalled();
+  });
+
+  it("refuses to list an IVR batch when dispatch_type cannot be determined", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
+    client.getBulkJob.mockRejectedValue(new Error("upstream 500"));
+
+    await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).rejects.toThrow(
+      /cannot choose a magick-master list surface/,
+    );
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unrecognized dispatch_type instead of inferring /proxy/calls from selType", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ai", dispatchType: "ai_voice_call" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "webrtc_call" });
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(/unsupported dispatch_type "webrtc_call"/);
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
   });
 
   // Status comparison is case- and whitespace-insensitive; without the
   // normalization a padded value reads as unrecognised and silently disarms.
   it("normalizes the job status before classifying it", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: " Completed ", updated_at: "2026-09-18T10:00:00Z" });
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 0 });
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1",
+      dispatch_type: "ivr_call",
+      status: " Completed ",
+      updated_at: "2026-09-18T10:00:00Z",
+    });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 0 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 3475 }))).rejects.toThrow(/3475 dispatched contacts/);
+    expect(client.listCalls).not.toHaveBeenCalled();
   });
 
   // The messaging branch pages a different endpoint; the guard has to cover it
@@ -331,13 +396,20 @@ describe("processJob resume", () => {
     repositories.getBatch.mockResolvedValue({
       ...batch("b1"), selType: "message", channel: "whatsapp", total: 900,
     });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1",
+      dispatch_type: "whatsapp_message",
+      status: "completed",
+      updated_at: "2026-09-18T10:00:00Z",
+    });
     client.listMessages.mockResolvedValueOnce({ messages: [], total: 900 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await expect(processJob(job({ batchIds: ["b1"], total: 900 }))).rejects.toThrow(
       /no records returned for b1.*900 dispatched contacts.*message batch/,
     );
+    expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
   });
 
   // The other direction: a campaign that genuinely dispatched nothing must
@@ -472,8 +544,9 @@ describe("processJob resume", () => {
     await processJob(job({ batchIds: ["b1"], total: 2, done: 1, cursor: 1, batchIndex: 0 }));
 
     // A rate-limited job can pause for longer than the changes it would be
-    // claiming to have captured.
-    expect(client.getBulkJob).not.toHaveBeenCalled();
+    // claiming to have captured. dispatch_type is still fetched so a resumed
+    // IVR ingest can pick a surface; the *stamp* stays null.
+    expect(client.getBulkJob).toHaveBeenCalledWith("source-b1");
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ ingestedSourceUpdatedAt: null }),
       "j1",
@@ -647,14 +720,117 @@ describe("processJob resume", () => {
   });
 });
 
+describe("processJob dispatch-type routing", () => {
+  it("reads IVR jobs from /proxy/ivr-calls as sessions, with job_id", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "ivr_call" });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [{ id: "sess-1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listIvrCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 1, dispatchType: "ivr_call" }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("reads static-call jobs from /proxy/static-calls as calls, with job_id", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "static_call" });
+    client.listStaticCalls.mockResolvedValueOnce({ calls: [{ id: "st-1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listStaticCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ dispatchType: "static_call" }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("reads messaging jobs with job_id, not the job id stuffed into batch_id", async () => {
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"),
+      selType: "message",
+      channel: "whatsapp",
+    });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "whatsapp_message" });
+    client.listMessages.mockResolvedValueOnce({ messages: [{ id: "m1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+  });
+
+  it("reads telegram jobs through listMessages with job_id", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "message", channel: "telegram" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "telegram_message" });
+    client.listMessages.mockResolvedValueOnce({ messages: [{ id: "m1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+  });
+
+  it("reads email jobs through listMessages with job_id", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "message", channel: "email" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "email_message" });
+    client.listMessages.mockResolvedValueOnce({ messages: [{ id: "m1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+  });
+
+  it("refuses to list without sourceId rather than sending MagickUtils batchId as core batch_id", async () => {
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"),
+      sourceId: "",
+      dispatchType: "ai_voice_call",
+    });
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(/no sourceId/);
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listMessages).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
+    expect(client.getBulkJob).not.toHaveBeenCalled();
+  });
+
+  it("keeps AI jobs on /proxy/calls with job_id", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "c1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
+  });
+});
+
 describe("runClaimedJob empty-pull failure", () => {
   // The commit's user-facing promise: the batch stops reading "Up to date" and
   // the reason reaches the job, where the screen prints it. `processJob` alone
   // cannot show this — the transition happens in runClaimedJob's catch.
   it("fails the job terminally and releases the batch so the screen can say so", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3475 });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
-    client.listCalls.mockResolvedValueOnce({ calls: [], total: 3475 });
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1",
+      dispatch_type: "ivr_call",
+      status: "completed",
+      updated_at: "2026-09-18T10:00:00Z",
+    });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 3475 });
     repositories.getRecordsForRevision.mockResolvedValue([]);
 
     await runClaimedJob(job({ batchIds: ["b1"], total: 3475 }));
@@ -686,10 +862,14 @@ describe("runClaimedJob empty-pull failure", () => {
           : { ...batch("b1"), total: 1 },
       ),
     );
-    client.getBulkJob.mockResolvedValue({ id: "source", status: "completed", updated_at: "2026-09-18T10:00:00Z" });
-    client.listCalls
-      .mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 })
-      .mockResolvedValueOnce({ calls: [], total: 3475 });
+    client.getBulkJob.mockImplementation(async (id: string) => {
+      if (id === "source-b2") {
+        return { id, dispatch_type: "ivr_call", status: "completed", updated_at: "2026-09-18T10:00:00Z" };
+      }
+      return { id, dispatch_type: "ai_voice_call", status: "completed", updated_at: "2026-09-18T10:00:00Z" };
+    });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+    client.listIvrCalls.mockResolvedValueOnce({ sessions: [], total: 3475 });
     repositories.getRecordsForRevision
       .mockResolvedValueOnce([{ recordId: "1", status: "done" }])
       .mockResolvedValue([]);
@@ -790,6 +970,27 @@ describe("runClaimedJob terminal failures", () => {
     repositories.beginBatchIngestion.mockResolvedValue(true);
     repositories.updateClaimedJob.mockResolvedValue(job());
     await runClaimedJob(job({ batchIds: ["b1"] }));
+    expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
+  });
+
+  it("fails a wrong-surface 400 terminally rather than deferring it", async () => {
+    client.listCalls.mockRejectedValueOnce(
+      new MagickApiError(400, "job is ivr_call", "/proxy/calls"),
+    );
+
+    await runClaimedJob(job({ batchIds: ["b1"] }));
+
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({
+        status: "error",
+        error: expect.stringMatching(/400/),
+        leaseUntil: null,
+        leaseId: null,
+      }),
+      { clearCredential: true },
+    );
     expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
   });
 });

@@ -9,7 +9,7 @@ vi.mock("@/lib/server/logger", () => ({
   log: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
-import { MagickClient, parseRetryAfter, type RawBulkJob } from "@/lib/server/magick-client";
+import { MagickClient, parseRetryAfter, resolveJobDispatchType, inferJobDispatchType, JOB_LIST_SURFACE, type RawBulkJob } from "@/lib/server/magick-client";
 
 describe("parseRetryAfter", () => {
   it("parses delta seconds without rounding early", () => {
@@ -202,5 +202,132 @@ describe("MagickClient.batchAnalytics", () => {
     const calls = stubAnalytics({ ok: true, status: 200, body: {} });
     await new MagickClient(ctx).batchAnalytics(["j1"]);
     expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Job-scoped list surfaces
+// ---------------------------------------------------------------------------
+
+describe("resolveJobDispatchType", () => {
+  it("JOB_LIST_SURFACE is the known-type table: path plus row key per dispatch_type", () => {
+    expect(JOB_LIST_SURFACE).toEqual({
+      ai_voice_call: { path: "/proxy/calls", rowsKey: "calls" },
+      static_call: { path: "/proxy/static-calls", rowsKey: "calls" },
+      ivr_call: { path: "/proxy/ivr-calls", rowsKey: "sessions" },
+      whatsapp_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+      telegram_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+      email_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+    });
+  });
+
+  it("prefers the job payload over the stored batch field", () => {
+    expect(
+      resolveJobDispatchType(
+        { dispatch_type: "static_call" },
+        { dispatchType: "ivr_call", selType: "ivr", channel: "voice" },
+      ),
+    ).toBe("static_call");
+  });
+
+  it("uses the stored batch field when the job has no type", () => {
+    expect(
+      resolveJobDispatchType(null, { dispatchType: "ivr_call", selType: "ivr", channel: "voice" }),
+    ).toBe("ivr_call");
+  });
+
+  it("infers AI and messaging from selType, but not IVR", () => {
+    expect(resolveJobDispatchType(null, { selType: "ai", channel: "voice" })).toBe("ai_voice_call");
+    expect(resolveJobDispatchType(null, { selType: "message", channel: "telegram" })).toBe("telegram_message");
+    expect(resolveJobDispatchType(null, { selType: "message", channel: "email" })).toBe("email_message");
+    expect(resolveJobDispatchType(null, { selType: "message", channel: "whatsapp" })).toBe("whatsapp_message");
+    expect(inferJobDispatchType("ivr", "voice")).toBeNull();
+    expect(() => resolveJobDispatchType(null, { selType: "ivr", channel: "voice", batchId: "b1" })).toThrow(
+      /ambiguous/,
+    );
+  });
+
+  it("rejects a present but unknown job dispatch_type instead of inferring from selType", () => {
+    expect(() =>
+      resolveJobDispatchType(
+        { dispatch_type: "webrtc_call" },
+        { dispatchType: "ai_voice_call", selType: "ai", channel: "voice", batchId: "b1" },
+      ),
+    ).toThrow(/unsupported dispatch_type "webrtc_call"/);
+  });
+
+  it("rejects a present but unknown stored dispatchType instead of inferring from selType", () => {
+    expect(() =>
+      resolveJobDispatchType(null, {
+        dispatchType: "webrtc_call",
+        selType: "ai",
+        channel: "voice",
+        batchId: "b1",
+      }),
+    ).toThrow(/unsupported dispatch_type "webrtc_call"/);
+  });
+
+  it("treats blank dispatch_type as absent and falls back", () => {
+    expect(
+      resolveJobDispatchType(
+        { dispatch_type: "  " },
+        { dispatchType: "ivr_call", selType: "ivr", channel: "voice" },
+      ),
+    ).toBe("ivr_call");
+  });
+});
+
+describe("MagickClient job-scoped lists", () => {
+  function stubList(body: unknown) {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => body,
+          text: async () => JSON.stringify(body),
+          headers: { get: () => null },
+        } as unknown as Response;
+      }),
+    );
+    return urls;
+  }
+
+  it("listCalls sends job_id to /proxy/calls", async () => {
+    const urls = stubList({ calls: [], total: 0 });
+    await new MagickClient(ctx).listCalls({ jobId: "job-1", limit: 100, offset: 0 });
+    const u = new URL(urls[0]);
+    expect(u.pathname).toBe("/proxy/calls");
+    expect(u.searchParams.get("job_id")).toBe("job-1");
+    expect(u.searchParams.get("limit")).toBe("100");
+    expect(u.searchParams.has("batch_id")).toBe(false);
+  });
+
+  it("listStaticCalls sends job_id to /proxy/static-calls", async () => {
+    const urls = stubList({ calls: [{ call_id: "c1" }], total: 1 });
+    const out = await new MagickClient(ctx).listStaticCalls({ jobId: "job-1", limit: 100, offset: 0 });
+    expect(new URL(urls[0]).pathname).toBe("/proxy/static-calls");
+    expect(new URL(urls[0]).searchParams.get("job_id")).toBe("job-1");
+    expect(out.calls).toHaveLength(1);
+  });
+
+  it("listIvrCalls sends job_id to /proxy/ivr-calls and reads sessions", async () => {
+    const urls = stubList({ sessions: [{ id: "s1" }], total: 1, calls: [{ call_id: "wrong" }] });
+    const out = await new MagickClient(ctx).listIvrCalls({ jobId: "job-1", limit: 100, offset: 0 });
+    expect(new URL(urls[0]).pathname).toBe("/proxy/ivr-calls");
+    expect(new URL(urls[0]).searchParams.get("job_id")).toBe("job-1");
+    expect(out.sessions).toEqual([{ id: "s1" }]);
+  });
+
+  it("listMessages sends job_id, not the job id as batch_id", async () => {
+    const urls = stubList({ messages: [], total: 0 });
+    await new MagickClient(ctx).listMessages({ jobId: "job-1", limit: 100, offset: 0 });
+    const q = new URL(urls[0]).searchParams;
+    expect(new URL(urls[0]).pathname).toBe("/proxy/messaging/messages");
+    expect(q.get("job_id")).toBe("job-1");
+    expect(q.has("batch_id")).toBe(false);
   });
 });

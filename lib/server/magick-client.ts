@@ -74,10 +74,15 @@ export interface RawCallTimestamps {
 
 export interface RawCall {
   call_id?: string | null;
+  /** IVR sessions are keyed `id`, not `call_id`. Core's `/ivr-calls` list
+   *  returns the session row as-is. */
+  id?: string | null;
   batch_id?: string | null;
   status?: string | null;
   outcome?: string | null;
   recipient_phone?: string | null;
+  /** IVR sessions use `phone` rather than `recipient_phone`. */
+  phone?: string | null;
   recipient_name?: string | null;
   recipient_language?: string | null;
   duration_seconds?: number | null;
@@ -91,6 +96,10 @@ export interface RawCall {
   total_cost_inr?: number | null;
   direction?: string | null;
   timestamps?: RawCallTimestamps | null;
+  /** Flat timestamp fields on IVR session rows (AI calls nest these). */
+  initiated_at?: string | null;
+  answered_at?: string | null;
+  ended_at?: string | null;
   conversation_log?: RawConversationTurn[] | null;
   analysis_status?: string | null;
   call_analysis?: RawCallAnalysis | null;
@@ -194,6 +203,15 @@ export interface CallsListResponse {
   offset: number;
 }
 
+/** Core names the IVR list array `sessions`, not `calls`. Reading `calls` here
+ *  yields `undefined` and looks like an empty campaign. */
+export interface IvrSessionsListResponse {
+  sessions: RawCall[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface MessagesListResponse {
   messages: RawMessage[];
   total: number;
@@ -259,6 +277,10 @@ export interface ListCallsParams {
 export interface ListMessagesParams {
   connectionId?: string;
   batchId?: string;
+  /** Bulk-dispatch job id. Master resolves this to the job's dispatched
+   *  batch ids. Sending the job id as `batchId` is a different filter — core
+   *  batch UUIDs, not job ids — and matches nothing. */
+  jobId?: string;
   status?: string;
   provider?: string;
   limit?: number;
@@ -281,6 +303,84 @@ export interface ExportCallsParams {
 export interface StatsParams {
   startDate?: string;
   endDate?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Per-dispatch-type list surfaces
+// ---------------------------------------------------------------------------
+//
+// magick-master's `/proxy/*` list routes each serve one dispatch_type, and core
+// names the row array differently per route. Sending a job_id to the wrong
+// surface is a 400 (it used to be a silent empty `calls` page). This table is
+// the known-type allowlist; the worker switches exhaustively on the keys and
+// keeps `job_id`.
+
+export const JOB_LIST_SURFACE = {
+  ai_voice_call: { path: "/proxy/calls", rowsKey: "calls" },
+  static_call: { path: "/proxy/static-calls", rowsKey: "calls" },
+  ivr_call: { path: "/proxy/ivr-calls", rowsKey: "sessions" },
+  whatsapp_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+  telegram_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+  email_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+} as const;
+
+export type JobDispatchType = keyof typeof JOB_LIST_SURFACE;
+
+export function normalizeJobDispatchType(
+  value: string | null | undefined,
+): JobDispatchType | null {
+  const key = (value ?? "").toLowerCase().trim();
+  return key in JOB_LIST_SURFACE ? (key as JobDispatchType) : null;
+}
+
+/** Best-effort when the job payload has no dispatch_type. `selType === "ivr"`
+ *  is both `ivr_call` and `static_call`, so it cannot choose a surface. */
+export function inferJobDispatchType(
+  selType: string,
+  channel: string,
+): JobDispatchType | null {
+  if (selType === "message") {
+    if (channel === "telegram") return "telegram_message";
+    if (channel === "email") return "email_message";
+    return "whatsapp_message";
+  }
+  if (selType === "ai") return "ai_voice_call";
+  return null;
+}
+
+/** Present non-empty value: known key, or throw. Empty/absent: null so the
+ *  caller may fall back. A typo or newly added upstream type must not look
+ *  like "missing" and then infer `/proxy/calls` from selType. */
+function knownOrAbsentDispatchType(
+  value: string | null | undefined,
+  batchId?: string,
+): JobDispatchType | null {
+  const key = (value ?? "").toLowerCase().trim();
+  if (!key) return null;
+  if (key in JOB_LIST_SURFACE) return key as JobDispatchType;
+  const id = batchId ? ` for ${batchId}` : "";
+  throw new Error(
+    `cannot choose a magick-master list surface${id}: unsupported dispatch_type "${key}"`,
+  );
+}
+
+export function resolveJobDispatchType(
+  job: { dispatch_type?: string | null } | null | undefined,
+  batch: { dispatchType?: string | null; selType: string; channel: string; batchId?: string },
+): JobDispatchType {
+  const resolved =
+    knownOrAbsentDispatchType(job?.dispatch_type, batch.batchId) ??
+    knownOrAbsentDispatchType(batch.dispatchType, batch.batchId) ??
+    inferJobDispatchType(batch.selType, batch.channel);
+  if (!resolved) {
+    const id = batch.batchId ? ` for ${batch.batchId}` : "";
+    throw new Error(
+      `cannot choose a magick-master list surface${id}: ` +
+        `dispatch_type is missing and selType "${batch.selType}" is ambiguous ` +
+        `(ivr_call vs static_call)`,
+    );
+  }
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +665,7 @@ export class MagickClient {
     }
   }
 
-  // ---- Calls ----
+  // ---- Calls (dispatch_type ai_voice_call; row array `calls`) ----
 
   async listCalls(params: ListCallsParams = {}): Promise<CallsListResponse> {
     const url = buildUrl("/proxy/calls", {
@@ -597,12 +697,39 @@ export class MagickClient {
     const url = buildUrl("/proxy/messaging/messages", {
       connection_id: params.connectionId,
       batch_id: params.batchId,
+      job_id: params.jobId,
       status: params.status,
       provider: params.provider,
       limit: params.limit,
       offset: params.offset,
     });
     return this.withFreshToken(() => getJson<MessagesListResponse>(url, this.headers()));
+  }
+
+  // ---- Static calls (dispatch_type static_call; row array `calls`) ----
+
+  async listStaticCalls(params: ListCallsParams = {}): Promise<CallsListResponse> {
+    const url = buildUrl("/proxy/static-calls", {
+      limit: params.limit,
+      offset: params.offset,
+      status: params.status,
+      batch_id: params.batchId,
+      job_id: params.jobId,
+    });
+    return this.withFreshToken(() => getJson<CallsListResponse>(url, this.headers()));
+  }
+
+  // ---- IVR sessions (dispatch_type ivr_call; row array `sessions`) ----
+
+  async listIvrCalls(params: ListCallsParams = {}): Promise<IvrSessionsListResponse> {
+    const url = buildUrl("/proxy/ivr-calls", {
+      limit: params.limit,
+      offset: params.offset,
+      status: params.status,
+      batch_id: params.batchId,
+      job_id: params.jobId,
+    });
+    return this.withFreshToken(() => getJson<IvrSessionsListResponse>(url, this.headers()));
   }
 
   /** Page through all messages (page size 100) until exhausted. */

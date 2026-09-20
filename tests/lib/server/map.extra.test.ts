@@ -196,6 +196,7 @@ describe("bulkJobToBatchDoc (field mapping + edge cases)", () => {
     expect(doc.name).toBe("job-5");
     expect(doc.provider).toBe("telegram");
     expect(doc.sourceId).toBe("job-5");
+    expect(doc.dispatchType).toBe("telegram_message");
     expect(doc.ingestStatus).toBe("none");
   });
 

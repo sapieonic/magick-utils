@@ -28,8 +28,10 @@ the worker when the backend is configured.
   secure-token endpoint; classifies a failure as permanent (re-login) or transient (retry).
 - `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` — which also
   re-mints and retries once on a 401, see *Token refresh* — with
-  `listCalls`/`iterateCalls`, messages, `listBulkJobs`, `statusSummary`, `batchAnalytics`,
-  `exportCallsCsv`).
+  `listCalls`/`listIvrCalls`/`listStaticCalls`/`listMessages`, `listBulkJobs`, `statusSummary`,
+  `batchAnalytics`, `exportCallsCsv`). `JOB_LIST_SURFACE` is the known-`dispatch_type` allowlist
+  (see *Job-scoped list surfaces*); the worker switches exhaustively on those keys so a new type
+  cannot fall through to `/proxy/calls`.
 - `normalize.ts` — core call/message → `NormalizedRecord`; `buildBatchDoc`; dispatch-type mapping.
 - `map.ts` — `BatchDoc` ↔ frontend `Batch`; bulk-job → `BatchDoc`. **Batch is keyed by the upstream source id.**
 - `db.ts` / `repositories.ts` — cached Mongo client, collections, indexes, tenant-scoped repo functions.
@@ -178,6 +180,42 @@ top-10s merged approximately here. Notes:
   rollup SQL also COALESCEs a legacy top-level shape. Moot while the list carries no blob, but it
   means the "record values win once core projects them" plan above would be correct by accident on
   legacy-shaped rows. Fix `normalize.ts` alongside that core change, not before.
+
+### Job-scoped list surfaces
+
+magick-master's `/proxy/*` list routes each serve **one** `dispatch_type`, and core names the row
+array differently per route. After master's "scope every job-scoped read to the campaign it names"
+change, a `job_id` on the wrong surface is a **400** with `details` (it used to be a silent empty
+`calls` page, which looked like "this campaign has no records"). The ingestion worker is the only
+production list caller. Combine / Analytics / CSV export read Mongo.
+
+| `dispatch_type` | path | row key |
+|-----------------|------|---------|
+| `ai_voice_call` | `/proxy/calls` | `calls` |
+| `static_call` | `/proxy/static-calls` | `calls` |
+| `ivr_call` | `/proxy/ivr-calls` | `sessions` |
+| `whatsapp_message` / `telegram_message` / `email_message` | `/proxy/messaging/messages` | `messages` |
+
+`selType` cannot choose a surface: it collapses `ivr_call` and `static_call` into `"ivr"`. The worker
+therefore reads `dispatch_type` from the job payload (`getBulkJob`), then `BatchDoc.dispatchType`
+(stamped by the campaigns listing), then infers from `selType`+`channel` only when that is
+unambiguous. An IVR/static batch with no stored type **throws** rather than falling through to
+`/proxy/calls`. A *present* but unknown `dispatch_type` (job payload or stored field) also throws —
+it is not treated as missing, so an AI-labelled batch cannot infer `/proxy/calls` and 400. Only
+genuinely absent values fall back. Resume fetches the job for this reason even though it still
+withholds the `ingestedSourceUpdatedAt` stamp until offset 0.
+
+Always send `job_id` (`BatchDoc.sourceId`). Dropping it to dodge a type-mismatch 400 would list the
+whole account, which is the bug master's guard exists to prevent. A BatchDoc with no `sourceId`
+throws rather than sending MagickUtils `batchId` as core `batch_id` — those are different filters
+(job ids vs core batch UUIDs) and matched nothing, which is the bug messaging used to have.
+
+IVR session rows use `id` / `phone` / flat timestamps, not `call_id` / `recipient_phone` / nested
+`timestamps`. `normalizeCall` accepts both; a page of real `sessions` that failed as "no record id"
+would otherwise look like an empty dispatched pull.
+
+`limit` is 1–100; the worker's `PAGE_SIZE` is already 100. CSV `Content-Disposition` is RFC 6266 —
+unused here, because export is Mongo.
 
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as

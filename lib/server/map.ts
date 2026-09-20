@@ -6,6 +6,7 @@ import type { Batch, BreakdownSeg, StatusKey } from "@/lib/types";
 import { isBatchReadable, type BatchDoc, type TenantContext } from "./types";
 import type { RawBulkJob } from "./magick-client";
 import { dispatchTypeToType, normalizeStatus } from "./normalize";
+import { normalizeJobDispatchType } from "./magick-client";
 import { fingerprint, stableJson } from "./fingerprint";
 
 const PREFIX: Record<string, string> = { ai: "AI", ivr: "IVR", whatsapp: "WA", telegram: "TG", email: "EM" };
@@ -275,6 +276,7 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     channel: map.channel,
     callType: map.callType,
     selType: map.selType,
+    dispatchType: normalizeJobDispatchType(job.dispatch_type) ?? existing?.dispatchType,
     provider: (job.provider as string | null | undefined) ?? map.channel,
     date: job.created_at ?? new Date().toISOString(),
     total,

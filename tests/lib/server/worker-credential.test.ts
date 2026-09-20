@@ -28,7 +28,13 @@ const repositories = vi.hoisted(() => ({
   replaceBatchRecords: vi.fn(),
   updateClaimedJob: vi.fn(),
 }));
-const client = vi.hoisted(() => ({ listCalls: vi.fn(), listMessages: vi.fn(), getBulkJob: vi.fn() }));
+const client = vi.hoisted(() => ({
+  listCalls: vi.fn(),
+  listIvrCalls: vi.fn(),
+  listStaticCalls: vi.fn(),
+  listMessages: vi.fn(),
+  getBulkJob: vi.fn(),
+}));
 const constructed = vi.hoisted(() => ({ calls: [] as Array<{ ctx: unknown; options: unknown }> }));
 const token = vi.hoisted(() => ({ mintIdToken: vi.fn() }));
 const logFns = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
@@ -135,7 +141,11 @@ beforeEach(() => {
   repositories.deleteSupersededRecordRevisions.mockResolvedValue(0);
   repositories.deleteOrphanedRecordRevisions.mockResolvedValue(0);
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
-  client.getBulkJob.mockResolvedValue({ id: "source-b1", updated_at: "2026-09-01T09:00:00Z" });
+  client.getBulkJob.mockResolvedValue({
+    id: "source-b1",
+    dispatch_type: "ai_voice_call",
+    updated_at: "2026-09-01T09:00:00Z",
+  });
   client.listCalls.mockResolvedValue({ calls: [{ id: "1" }], total: 1 });
   token.mintIdToken.mockResolvedValue(minted());
 });

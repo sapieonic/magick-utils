@@ -187,12 +187,51 @@ describe("normalizeCall", () => {
     expect(normalizeCall(raw, ctx, opts).timestamp).toBe("2026-01-01T00:00:00Z");
   });
 
-  it("passes ivr fields through", () => {
+  it("passes ivr fields through", async () => {
     const raw = makeRawCall({ dtmf_input: "1#", ivr_path: "menu>sub", completed_node: "end" });
     const rec = normalizeCall(raw, ctx, opts);
     expect(rec.dtmfInput).toBe("1#");
     expect(rec.ivrPath).toBe("menu>sub");
     expect(rec.completedNode).toBe("end");
+  });
+
+  it("reads IVR session identity from id/phone and flat timestamps", () => {
+    const rec = normalizeCall(
+      {
+        id: "sess-1",
+        phone: "+91999",
+        status: "completed",
+        initiated_at: "2026-01-02T10:00:00Z",
+        ended_at: "2026-01-02T10:02:00Z",
+        created_at: "2026-01-02T09:59:00Z",
+        telephony_provider: "plivo",
+        duration_seconds: 120,
+      },
+      ctx,
+      { selType: "ivr", batchId: "IVR-1", fingerprint: "fp" },
+    );
+    expect(rec.recordId).toBe("sess-1");
+    expect(rec.recipientPhone).toBe("+91999");
+    expect(rec.timestamp).toBe("2026-01-02T10:02:00Z");
+    expect(rec.activityTimestamp).toBe("2026-01-02T10:00:00.000Z");
+    expect(rec.provider).toBe("plivo");
+    expect(rec.durationSeconds).toBe(120);
+    expect(rec.selType).toBe("ivr");
+  });
+
+  it("prefers call_id/recipient_phone over IVR session fields when both exist", () => {
+    const rec = normalizeCall(
+      makeRawCall({
+        call_id: "call-1",
+        id: "sess-1",
+        recipient_phone: "+91111",
+        phone: "+92222",
+      }),
+      ctx,
+      opts,
+    );
+    expect(rec.recordId).toBe("call-1");
+    expect(rec.recipientPhone).toBe("+91111");
   });
 
   it("conversationSummary falls back to common.summary", () => {
@@ -426,6 +465,7 @@ describe("buildBatchDoc", () => {
     expect(doc.batchId).toBe("AI-0001");
     expect(doc.sourceId).toBe("src-1");
     expect(doc.provider).toBe("twilio");
+    expect(buildBatchDoc([], ctx, baseOpts({ dispatchType: "ivr_call" })).dispatchType).toBe("ivr_call");
     expect(typeof doc.updatedAt).toBe("string");
   });
 });
@@ -436,6 +476,7 @@ describe("batchDocOptsFromJob", () => {
     expect(opts.channel).toBe("voice");
     expect(opts.callType).toBe("ivr");
     expect(opts.selType).toBe("ivr");
+    expect(opts.dispatchType).toBe("ivr_call");
   });
 
   it("name falls back to id, sourceId from id, provider falls back to channel", () => {
