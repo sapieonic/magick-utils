@@ -28,6 +28,7 @@ describe("bulkJobToBatchDoc", () => {
     expect(seg(doc, "inprogress")).toBe(14);
     expect(seg(doc, "pending")).toBe(0);
     expect(doc.successRate).toBeCloseTo(300 / 404, 9);
+    expect(doc.dispatchType).toBe("ai_voice_call");
   });
 
   it("keeps switched_off / voicemail / in_progress as distinct statuses", () => {

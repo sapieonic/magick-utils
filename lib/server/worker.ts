@@ -23,7 +23,7 @@ import {
   SUPERSEDED_REVISION_GRACE_MS,
   updateClaimedJob,
 } from "./repositories";
-import { MagickApiError, MagickClient, type RawBulkJob } from "./magick-client";
+import { MagickApiError, MagickClient, type RawBulkJob, isMessagingDispatchType, normalizeJobDispatchType, resolveJobDispatchType } from "./magick-client";
 import {
   idTokenNeedsRefresh,
   mintIdToken,
@@ -418,18 +418,23 @@ async function ingestBatch(
   // job would be reading the stamp after its pause, and would then claim to
   // include changes made during that pause. A null stamp simply means the batch
   // never qualifies for a skip, which is the safe direction.
-  // Kept whole rather than reduced to the stamp: `status` is what lets the
-  // empty-pull guard below tell a campaign upstream has not dialled yet from
-  // one whose records we cannot read. Same single fetch either way.
-  const sourceJob = initialOffset === 0 && batch.sourceId
+  //
+  // The same fetch now also supplies `dispatch_type`, which is what chooses
+  // `/proxy/calls` vs `/proxy/ivr-calls` vs `/proxy/static-calls` vs messaging.
+  // Resume used to skip this call, but selType cannot tell ivr_call from
+  // static_call, so a resumed IVR ingest would have no surface to hit. The
+  // stamp is still gated on offset 0 below; a missing `dispatch_type` falls
+  // back to the value the campaigns listing stored on the BatchDoc.
+  const sourceJob = batch.sourceId
     ? await client
         .getBulkJob(batch.sourceId)
         .catch((error) => {
-          log().warn({ error, batchId }, "[worker] source stamp unavailable; refreshes will re-pull this batch");
+          log().warn({ error, batchId }, "[worker] source job unavailable; listing will use the batch's stored dispatch_type");
           return null;
         })
     : null;
-  const sourceUpdatedAt = sourceJob?.updated_at ?? null;
+  const sourceUpdatedAt = initialOffset === 0 ? (sourceJob?.updated_at ?? null) : null;
+  const dispatchType = resolveJobDispatchType(sourceJob, batch);
 
   const revision = jobId;
   const revisionCreatedAt = new Date();
@@ -470,8 +475,15 @@ async function ingestBatch(
   for (;;) {
     let page: NormalizedRecord[];
     let total = 0;
-    if (batch.selType === "message") {
-      const response = await client.listMessages({ batchId: batch.sourceId, limit: PAGE_SIZE, offset });
+    // Always `job_id` when we have the upstream job id. Dropping it to dodge a
+    // type-mismatch 400 would list the whole account, which is the bug master's
+    // guard exists to prevent. `batch_id` is only the fallback for a broken
+    // BatchDoc that has no sourceId.
+    const listParams = batch.sourceId
+      ? { jobId: batch.sourceId, limit: PAGE_SIZE, offset }
+      : { batchId, limit: PAGE_SIZE, offset };
+    if (isMessagingDispatchType(dispatchType)) {
+      const response = await client.listMessages(listParams);
       total = response.total ?? 0;
       const channel = batch.channel as "whatsapp" | "telegram" | "email";
       page = (response.messages ?? []).map((raw) => ({
@@ -479,13 +491,27 @@ async function ingestBatch(
         revision,
         revisionCreatedAt,
       }));
-    } else {
-      const params = batch.sourceId ? { jobId: batch.sourceId } : { batchId };
-      const response = await client.listCalls({ ...params, limit: PAGE_SIZE, offset });
+    } else if (dispatchType === "ivr_call") {
+      const response = await client.listIvrCalls(listParams);
       total = response.total ?? 0;
-      const selType = batch.selType as "ai" | "ivr";
+      page = (response.sessions ?? []).map((raw) => ({
+        ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
+        revision,
+        revisionCreatedAt,
+      }));
+    } else if (dispatchType === "static_call") {
+      const response = await client.listStaticCalls(listParams);
+      total = response.total ?? 0;
       page = (response.calls ?? []).map((raw) => ({
-        ...normalizeCall(raw, ctx, { selType, batchId, fingerprint: batch.fingerprint }),
+        ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
+        revision,
+        revisionCreatedAt,
+      }));
+    } else {
+      const response = await client.listCalls(listParams);
+      total = response.total ?? 0;
+      page = (response.calls ?? []).map((raw) => ({
+        ...normalizeCall(raw, ctx, { selType: "ai", batchId, fingerprint: batch.fingerprint }),
         revision,
         revisionCreatedAt,
       }));
@@ -551,9 +577,9 @@ async function ingestBatch(
   // keeps a still-running, cancelled or unreadable job out of this entirely,
   // because reporting "Sync failed" on a campaign the customer has only just
   // launched, or deliberately cancelled, is a worse bug than the one being
-  // fixed. Note that `sourceJob` is null on a resumed batch (it is fetched only
-  // at offset 0), which disarms the guard there — acceptable, since a resumed
-  // batch has staged rows and so does not reach `records.length === 0`.
+  // fixed. A resumed batch has staged rows and so does not reach
+  // `records.length === 0`; fetching the job on resume (for dispatch_type) does
+  // not change that.
   //
   // Throwing marks a never-ingested batch "error", and — for a batch already
   // poisoned by an earlier empty publish — `failBatchIfOwned` recognises that
@@ -612,6 +638,7 @@ async function ingestBatch(
     channel: batch.channel,
     callType: batch.callType,
     selType: batch.selType,
+    dispatchType: normalizeJobDispatchType(sourceJob?.dispatch_type) ?? batch.dispatchType,
     provider: batch.provider,
     date: batch.date,
     // `total` below is the exact record count; this is the dispatched figure,

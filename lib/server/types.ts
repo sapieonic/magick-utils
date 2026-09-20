@@ -59,6 +59,11 @@ export interface BatchDoc {
   channel: Channel;
   callType: CallType;
   selType: SelType;
+  /** Upstream bulk-job `dispatch_type` (`ai_voice_call` / `ivr_call` /
+   *  `static_call` / `whatsapp_message` / …). `selType` collapses `ivr_call`
+   *  and `static_call` into `"ivr"`, so listing records has to read this to
+   *  pick `/proxy/ivr-calls` vs `/proxy/static-calls`. */
+  dispatchType?: string;
   provider: string;
   date: string; // ISO
   total: number;

@@ -8,6 +8,7 @@
 
 import type { BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
 import type { RawBulkJob, RawCall, RawMessage } from "@/lib/server/magick-client";
+import { normalizeJobDispatchType } from "@/lib/server/magick-client";
 import type { BatchDoc, NormalizedRecord, TenantContext } from "@/lib/server/types";
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,25 @@ function isoTimestamp(value: string | null | undefined): string | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
+/** First non-empty string/number among upstream identity fields. IVR sessions
+ *  are keyed `id`; AI/static calls are keyed `call_id`. */
+function firstId(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" || typeof value === "number") {
+      const s = String(value).trim();
+      if (s) return s;
+    }
+  }
+  return "";
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim() !== "") return value;
+  }
+  return null;
+}
+
 export interface NormalizeCallOpts {
   selType: "ai" | "ivr";
   batchId: string;
@@ -134,9 +154,16 @@ export function normalizeCall(
   const common = raw.call_analysis?.common ?? null;
   const sentiment = common?.overall_sentiment?.label ?? null;
   const keyTopics = Array.isArray(common?.key_topics) ? common?.key_topics ?? null : null;
-  const timestamp = raw.timestamps?.ended_at ?? raw.created_at ?? null;
+  const timestamp = firstString(raw.timestamps?.ended_at, raw.ended_at, raw.created_at);
   const activityTimestamp = isoTimestamp(
-    raw.timestamps?.initiated_at ?? raw.timestamps?.queued_at ?? raw.created_at ?? raw.timestamps?.ended_at,
+    firstString(
+      raw.timestamps?.initiated_at,
+      raw.initiated_at,
+      raw.timestamps?.queued_at,
+      raw.created_at,
+      raw.timestamps?.ended_at,
+      raw.ended_at,
+    ),
   );
   const activityDate = activityTimestamp ? new Date(activityTimestamp) : null;
 
@@ -145,10 +172,10 @@ export function normalizeCall(
     accountId: ctx.accountId,
     batchId: opts.batchId,
     fingerprint: opts.fingerprint,
-    recordId: raw.call_id ?? "",
+    recordId: firstId(raw.call_id, raw.id),
     selType: opts.selType,
     channel: "voice",
-    recipientPhone: raw.recipient_phone ?? null,
+    recipientPhone: firstString(raw.recipient_phone, raw.phone),
     recipientEmail: null,
     status: normalizeStatus(raw.status ?? "", "call"),
     outcome: raw.outcome ?? null,
@@ -270,6 +297,7 @@ export interface BuildBatchDocOpts {
   channel: Channel;
   callType: CallType;
   selType: SelType;
+  dispatchType?: string;
   provider: string;
   date: string; // ISO
   fingerprint: string;
@@ -322,6 +350,7 @@ export function buildBatchDoc(
     channel: opts.channel,
     callType: opts.callType,
     selType: opts.selType,
+    dispatchType: opts.dispatchType,
     provider: opts.provider,
     date: opts.date,
     total,
@@ -358,6 +387,7 @@ export function batchDocOptsFromJob(
     channel: mapping.channel,
     callType: mapping.callType,
     selType: mapping.selType,
+    dispatchType: normalizeJobDispatchType(job.dispatch_type) ?? undefined,
     provider: (job.provider as string | null | undefined) ?? mapping.channel,
     date: job.created_at ?? new Date().toISOString(),
     fingerprint: args.fingerprint,
