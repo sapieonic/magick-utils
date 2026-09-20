@@ -311,8 +311,9 @@ export interface StatsParams {
 //
 // magick-master's `/proxy/*` list routes each serve one dispatch_type, and core
 // names the row array differently per route. Sending a job_id to the wrong
-// surface is a 400 (it used to be a silent empty `calls` page). The worker
-// must pick from this table, keep `job_id`, and read the matching key.
+// surface is a 400 (it used to be a silent empty `calls` page). This table is
+// the known-type allowlist; the worker switches exhaustively on the keys and
+// keeps `job_id`.
 
 export const JOB_LIST_SURFACE = {
   ai_voice_call: { path: "/proxy/calls", rowsKey: "calls" },
@@ -364,10 +365,6 @@ export function resolveJobDispatchType(
     );
   }
   return resolved;
-}
-
-export function isMessagingDispatchType(dispatchType: JobDispatchType): boolean {
-  return JOB_LIST_SURFACE[dispatchType].rowsKey === "messages";
 }
 
 // ---------------------------------------------------------------------------

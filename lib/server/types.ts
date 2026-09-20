@@ -54,7 +54,7 @@ export interface BatchDoc {
   tenantId: string;
   accountId: string;
   batchId: string; // human id e.g. AI-9140 (also the grouping key)
-  sourceId: string; // upstream batch_id / bulk-dispatch job id
+  sourceId: string; // bulk-dispatch job id (`job_id` on `/proxy/*`, not core `batch_id`)
   name: string;
   channel: Channel;
   callType: CallType;

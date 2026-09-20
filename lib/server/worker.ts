@@ -23,7 +23,7 @@ import {
   SUPERSEDED_REVISION_GRACE_MS,
   updateClaimedJob,
 } from "./repositories";
-import { MagickApiError, MagickClient, type RawBulkJob, isMessagingDispatchType, normalizeJobDispatchType, resolveJobDispatchType } from "./magick-client";
+import { MagickApiError, MagickClient, type RawBulkJob, normalizeJobDispatchType, resolveJobDispatchType } from "./magick-client";
 import {
   idTokenNeedsRefresh,
   mintIdToken,
@@ -425,14 +425,22 @@ async function ingestBatch(
   // static_call, so a resumed IVR ingest would have no surface to hit. The
   // stamp is still gated on offset 0 below; a missing `dispatch_type` falls
   // back to the value the campaigns listing stored on the BatchDoc.
-  const sourceJob = batch.sourceId
-    ? await client
-        .getBulkJob(batch.sourceId)
-        .catch((error) => {
-          log().warn({ error, batchId }, "[worker] source job unavailable; listing will use the batch's stored dispatch_type");
-          return null;
-        })
-    : null;
+  //
+  // MagickUtils `batchId` is the bulk-job id, not a core batch UUID. After
+  // master's job-scoped guard, sending it as `batch_id` matches nothing (the
+  // same class of bug messaging used to have). A BatchDoc with no sourceId
+  // cannot be listed correctly — fail it rather than guessing a filter.
+  if (!batch.sourceId) {
+    throw new Error(
+      `cannot list records for ${batchId}: batch has no sourceId (upstream job id)`,
+    );
+  }
+  const sourceJob = await client
+    .getBulkJob(batch.sourceId)
+    .catch((error) => {
+      log().warn({ error, batchId }, "[worker] source job unavailable; listing will use the batch's stored dispatch_type");
+      return null;
+    });
   const sourceUpdatedAt = initialOffset === 0 ? (sourceJob?.updated_at ?? null) : null;
   const dispatchType = resolveJobDispatchType(sourceJob, batch);
 
@@ -475,46 +483,60 @@ async function ingestBatch(
   for (;;) {
     let page: NormalizedRecord[];
     let total = 0;
-    // Always `job_id` when we have the upstream job id. Dropping it to dodge a
-    // type-mismatch 400 would list the whole account, which is the bug master's
-    // guard exists to prevent. `batch_id` is only the fallback for a broken
-    // BatchDoc that has no sourceId.
-    const listParams = batch.sourceId
-      ? { jobId: batch.sourceId, limit: PAGE_SIZE, offset }
-      : { batchId, limit: PAGE_SIZE, offset };
-    if (isMessagingDispatchType(dispatchType)) {
-      const response = await client.listMessages(listParams);
-      total = response.total ?? 0;
-      const channel = batch.channel as "whatsapp" | "telegram" | "email";
-      page = (response.messages ?? []).map((raw) => ({
-        ...normalizeMessage(raw, ctx, { channel, batchId, fingerprint: batch.fingerprint }),
-        revision,
-        revisionCreatedAt,
-      }));
-    } else if (dispatchType === "ivr_call") {
-      const response = await client.listIvrCalls(listParams);
-      total = response.total ?? 0;
-      page = (response.sessions ?? []).map((raw) => ({
-        ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
-        revision,
-        revisionCreatedAt,
-      }));
-    } else if (dispatchType === "static_call") {
-      const response = await client.listStaticCalls(listParams);
-      total = response.total ?? 0;
-      page = (response.calls ?? []).map((raw) => ({
-        ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
-        revision,
-        revisionCreatedAt,
-      }));
-    } else {
-      const response = await client.listCalls(listParams);
-      total = response.total ?? 0;
-      page = (response.calls ?? []).map((raw) => ({
-        ...normalizeCall(raw, ctx, { selType: "ai", batchId, fingerprint: batch.fingerprint }),
-        revision,
-        revisionCreatedAt,
-      }));
+    // Always `job_id`. Dropping it to dodge a type-mismatch 400 would list the
+    // whole account, which is the bug master's guard exists to prevent.
+    const listParams = { jobId: batch.sourceId, limit: PAGE_SIZE, offset };
+    // Exhaustive on JobDispatchType so a seventh key cannot fall through to
+    // `/proxy/calls` and 400. `JOB_LIST_SURFACE` is the allowlist; the worker
+    // still names the typed client method and row key per case.
+    switch (dispatchType) {
+      case "whatsapp_message":
+      case "telegram_message":
+      case "email_message": {
+        const response = await client.listMessages(listParams);
+        total = response.total ?? 0;
+        const channel = batch.channel as "whatsapp" | "telegram" | "email";
+        page = (response.messages ?? []).map((raw) => ({
+          ...normalizeMessage(raw, ctx, { channel, batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
+      }
+      case "ivr_call": {
+        const response = await client.listIvrCalls(listParams);
+        total = response.total ?? 0;
+        page = (response.sessions ?? []).map((raw) => ({
+          ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
+      }
+      case "static_call": {
+        const response = await client.listStaticCalls(listParams);
+        total = response.total ?? 0;
+        page = (response.calls ?? []).map((raw) => ({
+          ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
+      }
+      case "ai_voice_call": {
+        const response = await client.listCalls(listParams);
+        total = response.total ?? 0;
+        page = (response.calls ?? []).map((raw) => ({
+          ...normalizeCall(raw, ctx, { selType: "ai", batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
+      }
+      default: {
+        const unexpected: never = dispatchType;
+        throw new Error(`unsupported magick-master list surface: ${String(unexpected)}`);
+      }
     }
     reportedTotal = Math.max(reportedTotal, total);
     if (page.length === 0) {

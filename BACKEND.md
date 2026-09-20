@@ -29,8 +29,9 @@ the worker when the backend is configured.
 - `magick-client.ts` — typed magick-master client (`authSession`/`authMe`, `MagickClient` — which also
   re-mints and retries once on a 401, see *Token refresh* — with
   `listCalls`/`listIvrCalls`/`listStaticCalls`/`listMessages`, `listBulkJobs`, `statusSummary`,
-  `batchAnalytics`, `exportCallsCsv`). `JOB_LIST_SURFACE` is the per-`dispatch_type` table the worker
-  uses to pick a path and a row key (see *Job-scoped list surfaces*).
+  `batchAnalytics`, `exportCallsCsv`). `JOB_LIST_SURFACE` is the known-`dispatch_type` allowlist
+  (see *Job-scoped list surfaces*); the worker switches exhaustively on those keys so a new type
+  cannot fall through to `/proxy/calls`.
 - `normalize.ts` — core call/message → `NormalizedRecord`; `buildBatchDoc`; dispatch-type mapping.
 - `map.ts` — `BatchDoc` ↔ frontend `Batch`; bulk-job → `BatchDoc`. **Batch is keyed by the upstream source id.**
 - `db.ts` / `repositories.ts` — cached Mongo client, collections, indexes, tenant-scoped repo functions.
@@ -203,9 +204,9 @@ unambiguous. An IVR/static batch with no stored type **throws** rather than fall
 `ingestedSourceUpdatedAt` stamp until offset 0.
 
 Always send `job_id` (`BatchDoc.sourceId`). Dropping it to dodge a type-mismatch 400 would list the
-whole account, which is the bug master's guard exists to prevent. `batch_id` is only the fallback
-for a broken BatchDoc that has no `sourceId`. Messaging used to stuff the bulk-job id into
-`batch_id`; those are different filters (core batch UUIDs vs job ids) and matched nothing.
+whole account, which is the bug master's guard exists to prevent. A BatchDoc with no `sourceId`
+throws rather than sending MagickUtils `batchId` as core `batch_id` — those are different filters
+(job ids vs core batch UUIDs) and matched nothing, which is the bug messaging used to have.
 
 IVR session rows use `id` / `phone` / flat timestamps, not `call_id` / `recipient_phone` / nested
 `timestamps`. `normalizeCall` accepts both; a page of real `sessions` that failed as "no record id"

@@ -2,7 +2,8 @@
 // post-call analysis.
 //
 // WHY THIS EXISTS. Every other series on that tab is derived from the records we
-// ingest, which come from magick-master's `/proxy/calls` → core's calls LIST.
+// ingest, which for AI campaigns come from magick-master's `/proxy/calls` →
+// core's calls LIST (IVR/static/messaging use other `/proxy/*` surfaces).
 // That list projects a column subset which deliberately excludes the heavy
 // `call_analysis` JSONB, and core's response formatter emits
 // `call_analysis: null` rather than omitting the key — so from our side every

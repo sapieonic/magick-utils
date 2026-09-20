@@ -9,7 +9,7 @@ vi.mock("@/lib/server/logger", () => ({
   log: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
-import { MagickClient, parseRetryAfter, resolveJobDispatchType, inferJobDispatchType, type RawBulkJob } from "@/lib/server/magick-client";
+import { MagickClient, parseRetryAfter, resolveJobDispatchType, inferJobDispatchType, JOB_LIST_SURFACE, type RawBulkJob } from "@/lib/server/magick-client";
 
 describe("parseRetryAfter", () => {
   it("parses delta seconds without rounding early", () => {
@@ -210,6 +210,17 @@ describe("MagickClient.batchAnalytics", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveJobDispatchType", () => {
+  it("JOB_LIST_SURFACE is the known-type table: path plus row key per dispatch_type", () => {
+    expect(JOB_LIST_SURFACE).toEqual({
+      ai_voice_call: { path: "/proxy/calls", rowsKey: "calls" },
+      static_call: { path: "/proxy/static-calls", rowsKey: "calls" },
+      ivr_call: { path: "/proxy/ivr-calls", rowsKey: "sessions" },
+      whatsapp_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+      telegram_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+      email_message: { path: "/proxy/messaging/messages", rowsKey: "messages" },
+    });
+  });
+
   it("prefers the job payload over the stored batch field", () => {
     expect(
       resolveJobDispatchType(
@@ -228,6 +239,8 @@ describe("resolveJobDispatchType", () => {
   it("infers AI and messaging from selType, but not IVR", () => {
     expect(resolveJobDispatchType(null, { selType: "ai", channel: "voice" })).toBe("ai_voice_call");
     expect(resolveJobDispatchType(null, { selType: "message", channel: "telegram" })).toBe("telegram_message");
+    expect(resolveJobDispatchType(null, { selType: "message", channel: "email" })).toBe("email_message");
+    expect(resolveJobDispatchType(null, { selType: "message", channel: "whatsapp" })).toBe("whatsapp_message");
     expect(inferJobDispatchType("ivr", "voice")).toBeNull();
     expect(() => resolveJobDispatchType(null, { selType: "ivr", channel: "voice", batchId: "b1" })).toThrow(
       /ambiguous/,

@@ -760,6 +760,43 @@ describe("processJob dispatch-type routing", () => {
     expect(client.listCalls).not.toHaveBeenCalled();
   });
 
+  it("reads telegram jobs through listMessages with job_id", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "message", channel: "telegram" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "telegram_message" });
+    client.listMessages.mockResolvedValueOnce({ messages: [{ id: "m1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+  });
+
+  it("reads email jobs through listMessages with job_id", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "message", channel: "email" });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "email_message" });
+    client.listMessages.mockResolvedValueOnce({ messages: [{ id: "m1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(client.listCalls).not.toHaveBeenCalled();
+  });
+
+  it("refuses to list without sourceId rather than sending MagickUtils batchId as core batch_id", async () => {
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"),
+      sourceId: "",
+      dispatchType: "ai_voice_call",
+    });
+
+    await expect(processJob(job({ batchIds: ["b1"] }))).rejects.toThrow(/no sourceId/);
+    expect(client.listCalls).not.toHaveBeenCalled();
+    expect(client.listMessages).not.toHaveBeenCalled();
+    expect(client.listIvrCalls).not.toHaveBeenCalled();
+    expect(client.listStaticCalls).not.toHaveBeenCalled();
+    expect(client.getBulkJob).not.toHaveBeenCalled();
+  });
+
   it("keeps AI jobs on /proxy/calls with job_id", async () => {
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "c1" }], total: 1 });
 
@@ -923,6 +960,27 @@ describe("runClaimedJob terminal failures", () => {
     repositories.beginBatchIngestion.mockResolvedValue(true);
     repositories.updateClaimedJob.mockResolvedValue(job());
     await runClaimedJob(job({ batchIds: ["b1"] }));
+    expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
+  });
+
+  it("fails a wrong-surface 400 terminally rather than deferring it", async () => {
+    client.listCalls.mockRejectedValueOnce(
+      new MagickApiError(400, "job is ivr_call", "/proxy/calls"),
+    );
+
+    await runClaimedJob(job({ batchIds: ["b1"] }));
+
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({
+        status: "error",
+        error: expect.stringMatching(/400/),
+        leaseUntil: null,
+        leaseId: null,
+      }),
+      { clearCredential: true },
+    );
     expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
   });
 });
