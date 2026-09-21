@@ -80,11 +80,36 @@ const IGNORABLE_INDEX_CODES = new Set([
   11000, // DuplicateKey (concurrent createIndex race)
 ]);
 
-function isIgnorableIndexError(err: unknown): boolean {
+function mongoErrorCode(err: unknown): number | undefined {
   const code = (err as { code?: number } | null)?.code;
+  return typeof code === "number" ? code : undefined;
+}
+
+function mongoErrorMessage(err: unknown): string {
+  return (err as { message?: string } | null)?.message ?? "";
+}
+
+function isIgnorableIndexError(err: unknown): boolean {
+  const code = mongoErrorCode(err);
   if (typeof code === "number" && IGNORABLE_INDEX_CODES.has(code)) return true;
-  const message = (err as { message?: string } | null)?.message ?? "";
-  return /already exists/i.test(message);
+  return /already exists/i.test(mongoErrorMessage(err));
+}
+
+// dropIndex on a collection that does not exist is NamespaceNotFound (26),
+// not IndexNotFound (27). A new dedicated database has no `records` collection
+// until the first ingest, so treating only 27 as expected is what made boot
+// log "startup failed" and skip the worker on a fresh deploy.
+const IGNORABLE_DROP_INDEX_CODES = new Set([
+  26, // NamespaceNotFound — collection (and therefore the index) is absent
+  27, // IndexNotFound — collection exists, this index name does not
+]);
+
+/** True when dropping a legacy index failed because there was nothing to drop. */
+export function isIgnorableDropIndexError(err: unknown): boolean {
+  const code = mongoErrorCode(err);
+  if (typeof code === "number" && IGNORABLE_DROP_INDEX_CODES.has(code)) return true;
+  const message = mongoErrorMessage(err);
+  return /index not found/i.test(message) || /ns not found/i.test(message);
 }
 
 async function safeCreateIndexes(
@@ -116,10 +141,10 @@ export async function ensureIndexes(): Promise<void> {
 
   // Versioned publication supersedes the original unique key. Keeping the old
   // index would reject a staging revision that shares a recordId with the
-  // currently published revision. IndexNotFound is expected on fresh installs.
+  // currently published revision. A missing collection or missing index is
+  // expected on fresh installs — createIndexes below will create the namespace.
   await recordsCol.dropIndex("uniq_tenant_account_batch_record").catch((error: unknown) => {
-    const code = (error as { code?: number } | null)?.code;
-    if (code !== 27 && !/index not found/i.test((error as Error | null)?.message ?? "")) throw error;
+    if (!isIgnorableDropIndexError(error)) throw error;
   });
 
   await Promise.all([
