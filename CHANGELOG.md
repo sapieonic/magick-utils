@@ -1,3 +1,10 @@
+## [1.3.10](https://github.com/sapieonic/magick-utils/compare/v1.3.9...v1.3.10) (2026-09-21)
+
+
+### Bug Fixes
+
+* ignore missing records collection when dropping the legacy index on boot ([#40](https://github.com/sapieonic/magick-utils/issues/40)) ([7defbc4](https://github.com/sapieonic/magick-utils/commit/7defbc497ca6920aa06515172b5712990019cda7))
+
 ## [1.3.9](https://github.com/sapieonic/magick-utils/compare/v1.3.8...v1.3.9) (2026-09-20)
 
 
