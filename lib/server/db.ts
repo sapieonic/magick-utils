@@ -107,7 +107,10 @@ const IGNORABLE_DROP_INDEX_CODES = new Set([
 /** True when dropping a legacy index failed because there was nothing to drop. */
 export function isIgnorableDropIndexError(err: unknown): boolean {
   const code = mongoErrorCode(err);
-  if (typeof code === "number" && IGNORABLE_DROP_INDEX_CODES.has(code)) return true;
+  // A present numeric code is authoritative — do not also fall through to the
+  // message regex, or an auth/server fault whose text happened to mention
+  // "ns not found" would be swallowed.
+  if (typeof code === "number") return IGNORABLE_DROP_INDEX_CODES.has(code);
   const message = mongoErrorMessage(err);
   return /index not found/i.test(message) || /ns not found/i.test(message);
 }

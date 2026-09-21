@@ -44,11 +44,13 @@ function resetMongoCache() {
 
 describe("isIgnorableDropIndexError", () => {
   it("accepts NamespaceNotFound from dropIndex on a missing collection", () => {
+    // Message must not contain "ns not found" — otherwise the regex would hide a
+    // regression that dropped code 26 from the ignorable set.
     expect(
       isIgnorableDropIndexError({
         code: 26,
         codeName: "NamespaceNotFound",
-        message: "ns not found 6a2cf524f8cba6184ce503a0_magickutils-samarthya.records",
+        message: "NamespaceNotFound",
       }),
     ).toBe(true);
   });
@@ -58,7 +60,7 @@ describe("isIgnorableDropIndexError", () => {
       isIgnorableDropIndexError({
         code: 27,
         codeName: "IndexNotFound",
-        message: "index not found with name [uniq_tenant_account_batch_record]",
+        message: "IndexNotFound",
       }),
     ).toBe(true);
   });
@@ -72,6 +74,15 @@ describe("isIgnorableDropIndexError", () => {
       isIgnorableDropIndexError({
         code: 13,
         message: "not authorized on testdb to execute command",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not let a numeric non-26/27 code hide behind an ns-not-found message", () => {
+    expect(
+      isIgnorableDropIndexError({
+        code: 13,
+        message: "not authorized: ns not found testdb.records",
       }),
     ).toBe(false);
   });
@@ -97,7 +108,7 @@ describe("ensureIndexes", () => {
     collections.records.dropIndex.mockRejectedValue({
       code: 26,
       codeName: "NamespaceNotFound",
-      message: "ns not found testdb.records",
+      message: "NamespaceNotFound",
     });
 
     await expect(ensureIndexes()).resolves.toBeUndefined();
@@ -108,7 +119,7 @@ describe("ensureIndexes", () => {
   it("continues when the collection exists but the legacy index is already gone", async () => {
     collections.records.dropIndex.mockRejectedValue({
       code: 27,
-      message: "index not found with name [uniq_tenant_account_batch_record]",
+      message: "IndexNotFound",
     });
 
     await expect(ensureIndexes()).resolves.toBeUndefined();
