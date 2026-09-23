@@ -11,6 +11,7 @@ import { env, isAuthConfigured, isTokenRefreshConfigured } from "@/lib/server/en
 import { mintIdToken, type MintedToken } from "@/lib/server/firebase-token";
 import type { TenantContext } from "@/lib/server/types";
 import { log } from "@/lib/server/logger";
+import { getBrand } from "@/lib/brand";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -475,7 +476,7 @@ async function loggedFetch(url: string, init: RequestInit): Promise<Response> {
 
 async function raw(url: string, headers: Record<string, string>): Promise<Response> {
   const res = await loggedFetch(url, {
-    headers: { ...headers, "x-mgkvc-originator": "magick-analytics" },
+    headers: { ...headers, "x-mgkvc-originator": getBrand().originator },
     cache: "no-store",
   });
   if (!res.ok) {
@@ -506,7 +507,7 @@ async function postJson<T>(
 ): Promise<T> {
   const res = await loggedFetch(url, {
     method: "POST",
-    headers: { ...headers, "Content-Type": "application/json", "x-mgkvc-originator": "magick-analytics" },
+    headers: { ...headers, "Content-Type": "application/json", "x-mgkvc-originator": getBrand().originator },
     body: JSON.stringify(body),
     cache: "no-store",
     ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
@@ -534,7 +535,7 @@ export async function authSession(idToken: string): Promise<AuthSessionResponse>
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      "x-mgkvc-originator": "magick-analytics",
+      "x-mgkvc-originator": getBrand().originator,
     },
     body: JSON.stringify({ id_token: idToken }),
     cache: "no-store",

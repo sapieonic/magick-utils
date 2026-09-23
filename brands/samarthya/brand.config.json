@@ -1,0 +1,27 @@
+{
+  "name": "Samarthya Analytics",
+  "originator": "samarthya-analytics",
+  "shortName": "SA",
+  "company": "Samarthya Connect",
+  "wordmark": { "lead": "Samarthya", "accent": "Analytics" },
+  "byline": "by {company}",
+  "tagline": "Download, merge, and analyze your {company} campaigns.",
+  "loginTagline": "Download, merge, and analyze your {company} call & messaging campaigns — all in one workspace.",
+  "loginHeadline": { "lead": "Turn finished campaigns into ", "accent": "decisions." },
+  "sales": null,
+  "colors": {
+    "accent": "#8f6a30",
+    "accentStrong": "#7a5a28",
+    "accentSoft": "#f8f2e7",
+    "accentMuted": "#e6d4b3",
+    "gradient": ["#946f35", "#86632d", "#7a5a28"],
+    "panel": ["#0d0b08", "#1c1710", "#5a4220"],
+    "highlight": ["#ecd3a4", "#c9a063"]
+  },
+  "style": {
+    "radius": "soft",
+    "elevation": "flat",
+    "gradientAngle": 120,
+    "flatButtons": true
+  }
+}

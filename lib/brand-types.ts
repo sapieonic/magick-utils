@@ -12,6 +12,9 @@ export type Brand = {
   id: string;
   /** Full product name — browser tab title + Topbar fallback. */
   name: string;
+  /** `x-mgkvc-originator` value on every magick-master request — how upstream
+   *  attributes this app's traffic. A header-safe slug. */
+  originator: string;
   /** Compact label (e.g. for tight chrome). */
   shortName: string;
   /** Parent company — used in bylines/copy. */
@@ -26,6 +29,11 @@ export type Brand = {
   loginTagline: string;
   /** Login hero headline, two-tone like the wordmark. */
   loginHeadline: { lead: string; accent: string };
+  /** Compliance claims in the login footer, after "© <year> <company> · ".
+   *  null hides them. A whitelabel must not inherit MagickVoice's
+   *  certifications, so a pack other than the default that omits it shows
+   *  none. */
+  compliance: string | null;
   /** Sales CTA on the login screen; null hides it. Gated by `promotions`. */
   sales: { label: string; href: string } | null;
   /** Opt-in flag for first-party promotional UI (e.g. the sales CTA). A
@@ -35,6 +43,10 @@ export type Brand = {
     accent: string;
     accentStrong: string;
     accentSoft: string;
+    /** Light tint of the accent for a secondary series beside it (e.g. the
+     *  talk-time bars next to the call bars). Derived from `accent` when a
+     *  brand overrides the accent but not this. */
+    accentMuted: string;
     /** Wordmark / button / panel gradient stops (3). */
     gradient: [string, string, string];
     /** Login left-panel radial gradient stops (3). */
@@ -42,16 +54,35 @@ export type Brand = {
     /** Login headline highlight gradient stops (2). */
     highlight: [string, string];
   };
-  style: {
-    /** Accent gradient angle, in degrees. */
-    gradientAngle: number;
-  };
+  style: BrandStyle;
+};
+
+/** Corner-radius feel: a preset, or the base (`rounded-lg`) radius in px — the
+ *  rest of the Tailwind radius scale is derived from it proportionally. */
+export type BrandRadius = "sharp" | "default" | "soft" | number;
+
+/** Accent glow treatment on gradient CTAs: `glow` = the accent-tinted halo,
+ *  `soft` = a neutral shadow, `flat` = none. */
+export type BrandElevation = "flat" | "soft" | "glow";
+
+/** Non-color style levers (same set as the customer UI's brand packs). Every
+ *  field resolves to the original look when a brand omits it. */
+export type BrandStyle = {
+  /** Accent gradient angle, in degrees. */
+  gradientAngle: number;
+  /** Corner radius across the app. Default `default` (Tailwind's own scale). */
+  radius: BrandRadius;
+  /** Accent glow on gradient CTAs. Default `glow`. */
+  elevation: BrandElevation;
+  /** Render gradient CTAs (e.g. "Ask AI") as a solid accent fill. Default false. */
+  flatButtons: boolean;
 };
 
 /** The default MagickVoice brand. Also the fail-closed fallback. */
 export const DEFAULT_BRAND: Brand = {
   id: "magickvoice",
   name: "MagickUtils",
+  originator: "magick-analytics",
   shortName: "MU",
   company: "MagickVoice",
   wordmark: { lead: "Magick", accent: "Utils" },
@@ -59,15 +90,17 @@ export const DEFAULT_BRAND: Brand = {
   tagline: "Download, merge, and analyze your MagickVoice campaigns.",
   loginTagline: "Download, merge, and analyze your MagickVoice call & messaging campaigns — all in one workspace.",
   loginHeadline: { lead: "Turn finished campaigns into ", accent: "decisions." },
+  compliance: "SOC 2 Type II · DPDP compliant",
   sales: { label: "Talk to sales", href: "#" },
   promotions: true,
   colors: {
     accent: "#4f46e5",
     accentStrong: "#4338ca",
     accentSoft: "#eef2ff",
+    accentMuted: "#c7d2fe",
     gradient: ["#8b3fd6", "#6366f1", "#3b82f6"],
     panel: ["#1e1b4b", "#312e81", "#4338ca"],
     highlight: ["#c4b5fd", "#93c5fd"],
   },
-  style: { gradientAngle: 135 },
+  style: { gradientAngle: 135, radius: "default", elevation: "glow", flatButtons: false },
 };

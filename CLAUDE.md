@@ -141,6 +141,14 @@ doc. See BACKEND.md → *Sentiment and key topics*.
   `pageSlots()` (`lib/pagination.ts`); a row of several hundred page buttons overflows its card with no
   way to reach what it hides.
 - Client components that use hooks/state/recharts/handlers start with `"use client";`.
+- The UI is whitelabeled at runtime (`BRAND` env → `brands/<id>/`, see `brands/README.md`). Accent
+  surfaces read brand tokens (`var(--accent)`, `--accent-soft`, `--accent-muted`, `--brand-grad`,
+  `--cta-bg`, `--shadow-accent`) — never hardcode an indigo/violet hex for one, or it stays indigo
+  under every other brand. Categorical colors (type/status/series in `lib/data.ts`) are not brand.
+  Company-specific fields — `originator` (the `x-mgkvc-originator` header magick-master attributes
+  traffic by) and `compliance` (login-footer claims) — must never fall back to MagickVoice's for a
+  whitelabel, including when a pack fails to load; that's why they live in `DEFAULT_BRAND` and not
+  in the copyable `brands/magickvoice` pack.
 - Money always goes through `fmtMoney`/`fmtMoneyFull(inr, currency)` with `currency` from `useApp()`.
 - Navigation: `useRouter()` from `next/navigation`; set `analyzeTargets`/`combineTargets` via `useApp()`
   before pushing to `/analytics` or `/combine`.

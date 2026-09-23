@@ -116,7 +116,7 @@ export function ConversationTab({
             className="lg:col-span-2"
             title="Call duration & talk-time"
             subtitle="Distribution across length buckets"
-            action={dur && <Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "#c7d2fe", l: "Talk-time" }]} />}
+            action={dur && <Legend items={[{ c: "var(--accent)", l: "Calls" }, { c: "var(--accent-muted)", l: "Talk-time" }]} />}
           >
             {dur ? (
               <DurationChart data={dur} />
@@ -234,7 +234,7 @@ function DurationChart({ data }: { data: { bucket: string; calls: number; talk: 
           />
           <Tooltip content={<ChartTip />} cursor={{ fill: "rgba(148,163,184,0.08)" }} />
           <Bar dataKey="calls" fill="var(--accent)" radius={[5, 5, 0, 0]} barSize={20} />
-          <Bar dataKey="talk" fill="#c7d2fe" radius={[5, 5, 0, 0]} barSize={20} />
+          <Bar dataKey="talk" fill="var(--accent-muted)" radius={[5, 5, 0, 0]} barSize={20} />
         </BarChart>
       </ResponsiveContainer>
     </div>

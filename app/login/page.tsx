@@ -120,7 +120,7 @@ export default function LoginPage() {
             ))}
           </div>
         </div>
-        <div className="relative text-white/40 text-xs">© 2026 {brand.company} · SOC 2 Type II · DPDP compliant</div>
+        <div className="relative text-white/40 text-xs">© 2026 {brand.company}{brand.compliance && ` · ${brand.compliance}`}</div>
       </div>
 
       {/* right form */}

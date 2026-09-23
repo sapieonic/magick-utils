@@ -526,8 +526,8 @@ export default function Page() {
       {!chatOpen && (
         <button
           onClick={() => setChatOpen(true)}
-          className="fade-up fixed bottom-6 right-6 z-30 flex items-center gap-2 rounded-full py-3 pl-4 pr-5 text-[14px] font-bold text-white shadow-[0_8px_24px_-6px_rgba(79,70,229,0.6)] transition-transform hover:scale-[1.03] active:scale-95"
-          style={{ background: "var(--brand-grad)" }}
+          className="fade-up fixed bottom-6 right-6 z-30 flex items-center gap-2 rounded-full py-3 pl-4 pr-5 text-[14px] font-bold text-white transition-transform hover:scale-[1.03] active:scale-95"
+          style={{ background: "var(--cta-bg)", boxShadow: "var(--shadow-accent)" }}
           title="Ask AI about this campaign"
         >
           <Icon name="Sparkles" size={18} />
