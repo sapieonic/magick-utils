@@ -214,7 +214,14 @@ docker compose --env-file .env up -d    # restart only — no --build needed
 ```
 
 An unknown/empty `BRAND` fails closed to the default MagickVoice look rather than
-erroring. See `brands/README.md` for the config schema.
+erroring — but a non-empty unknown id still reports upstream as `<id>-analytics`
+(`x-mgkvc-originator`), never as MagickVoice, and shows neither MagickVoice's
+compliance claims nor its sales CTA. The shipped `samarthya` pack sends
+`samarthya-analytics`. See `brands/README.md` for the config schema.
+
+The compose bind-mount **hides** the image's own `brands/`, so the host checkout
+must contain every pack a deployment uses — a host that predates
+`brands/samarthya/` runs `BRAND=samarthya` with the default look.
 
 ## 5. Configure Nginx
 
