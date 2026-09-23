@@ -10,7 +10,7 @@ deployment and point that brand's domain at it; **no rebuild per brand.**
 | id            | Product            | Notes                                                    |
 | ------------- | ------------------ | -------------------------------------------------------- |
 | `magickvoice` | MagickUtils        | Default + fail-closed fallback. Promotions on.           |
-| `samarthya`   | Samarthya Analytics | Mirrors the customer UI's `samarthya` pack (logo, gold accent, soft/flat style). Accent and gradient darkened (`#8f6a30`, `#946f35`→`#7a5a28`) for white-text contrast on this light UI. Originator `samarthya-analytics`; no compliance claims. |
+| `samarthya`   | Samarthya Analytics | Mirrors the customer UI's `samarthya` pack (logo, gold accent, soft/flat style). Accent and gradient darkened (`#8a6630` — 4.75:1 even at hover — and `#946f35`→`#7a5a28`) for white-text contrast on this light UI. Originator `samarthya-analytics`; no compliance claims. |
 
 ## Structure
 
@@ -28,8 +28,9 @@ default brand (fail-closed, resolved in `lib/brand.ts`). Copy strings may use
 
 Two fields are **company-specific and never fall back to MagickVoice's** for a
 non-default brand: `originator` (defaults to `<id>-analytics`) and `compliance`
-(defaults to none). A broken or missing pack keeps that rule too — it gets the
-MagickVoice *look*, but not its upstream attribution. That is also why neither
+(defaults to none), plus `promotions` (defaults to off). A broken or missing pack
+keeps that rule too — it gets the MagickVoice *look*, but not its upstream
+attribution, certifications, or sales CTA. That is also why neither
 appears in `brands/magickvoice/brand.config.json`: MagickVoice's values are
 baked into `DEFAULT_BRAND`, so a copied pack carries nothing to forget.
 
@@ -86,7 +87,9 @@ falls back to the default look:
 The UI is light-only, and both `accent` (primary buttons, toggles, checkboxes)
 and every `gradient` stop (avatar and workspace initials, white-icon tiles, the
 "Ask AI" button) are **backgrounds for white text** — each should clear 4.5:1
-against white. A brand color too light for that (e.g. a bright gold) belongs in
+against white. For `accent` that includes the primary-button hover, which
+lightens the fill by 6% (`hover:brightness-[1.06]`): a color just over 4.5:1 at
+rest dips under it on hover. A brand color too light for that (e.g. a bright gold) belongs in
 `highlight`, which only sits on the dark login panel, with darker shades as
 `accent`/`gradient`.
 
@@ -113,7 +116,7 @@ default `magickvoice` brand sets it `true`.
    `"promotions": false` and `"sales": null` unless the brand really has
    MagickVoice's promos — the copy inherits `true` from the magickvoice pack.
    Add `originator` if upstream should see something other than `acme-analytics`
-   (each pack's must be unique; a test enforces it), and `compliance` only for
+   (each pack's `originator` must be unique; a test enforces it), and `compliance` only for
    claims that brand actually holds.
 3. Replace `brands/acme/logo.png` with the brand's logo (also the favicon).
 4. Set `BRAND=acme` in the deployment env and restart.

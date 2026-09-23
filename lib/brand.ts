@@ -44,9 +44,11 @@ function loadBrand(id: string): Brand {
     return resolveBrand(id, raw);
   } catch (err) {
     console.error(`[brand] failed to load brand "${id}", falling back to "${DEFAULT_BRAND.id}":`, err instanceof Error ? err.message : err);
-    // The default LOOK, but not the default's attribution — a broken pack must
-    // not start reporting its traffic upstream as MagickVoice's.
-    return { ...DEFAULT_BRAND, id, originator: resolveBrand(id, {}).originator };
+    // Resolve an empty config rather than spreading DEFAULT_BRAND: that gives
+    // the default LOOK, but none of MagickVoice's company-specific fields — a
+    // broken pack must not report its traffic upstream as MagickVoice's, claim
+    // its certifications, or show its sales CTA.
+    return resolveBrand(id, {});
   }
 }
 

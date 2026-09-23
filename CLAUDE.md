@@ -146,7 +146,7 @@ doc. See BACKEND.md → *Sentiment and key topics*.
   `--cta-bg`, `--shadow-accent`) — never hardcode an indigo/violet hex for one, or it stays indigo
   under every other brand. Categorical colors (type/status/series in `lib/data.ts`) are not brand.
   Company-specific fields — `originator` (the `x-mgkvc-originator` header magick-master attributes
-  traffic by) and `compliance` (login-footer claims) — must never fall back to MagickVoice's for a
+  traffic by), `compliance` (login-footer claims) and `promotions` — must never fall back to MagickVoice's for a
   whitelabel, including when a pack fails to load; that's why they live in `DEFAULT_BRAND` and not
   in the copyable `brands/magickvoice` pack.
 - Money always goes through `fmtMoney`/`fmtMoneyFull(inr, currency)` with `currency` from `useApp()`.

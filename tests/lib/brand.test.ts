@@ -157,12 +157,15 @@ describe("resolveBrand — originator", () => {
 describe("getBrand — a pack that fails to load", () => {
   afterEach(() => vi.unstubAllEnvs());
 
-  it("gets the default look but NOT the default's upstream attribution", () => {
+  it("gets the default look but none of MagickVoice's company-specific fields", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubEnv("BRAND", "no-such-brand");
     const b = getBrand();
     expect(b.name).toBe(DEFAULT_BRAND.name);
+    expect(b.colors).toEqual(DEFAULT_BRAND.colors);
     expect(b.originator).toBe("no-such-brand-analytics");
+    expect(b.compliance).toBeNull();
+    expect(b.promotions).toBe(false);
     expect(error).toHaveBeenCalled();
     error.mockRestore();
   });
