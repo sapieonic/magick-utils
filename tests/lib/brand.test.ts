@@ -1,5 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { resolveBrand, hexToRgba, brandStyleVars } from "@/lib/brand";
+import { readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { resolveBrand, hexToRgba, brandStyleVars, mixWithWhite, brandSidebarWidth, getBrand } from "@/lib/brand";
 import { DEFAULT_BRAND } from "@/lib/brand-types";
 
 describe("hexToRgba", () => {
@@ -33,8 +35,16 @@ describe("brandStyleVars — default-brand fidelity", () => {
     expect(vars["--login-glow"]).toContain("rgba(59, 130, 246, 0.45)");
     expect(vars["--login-highlight"]).toBe("linear-gradient(90deg, #c4b5fd, #93c5fd)");
   });
+  it("keeps the original accent glow, gradient CTA, and talk-time tint", () => {
+    expect(vars["--shadow-accent"]).toBe("0 8px 24px -6px rgba(79, 70, 229, 0.6)");
+    expect(vars["--cta-bg"]).toBe("var(--brand-grad)");
+    expect(vars["--accent-muted"]).toBe("#c7d2fe");
+  });
+  it("leaves Tailwind's radius scale alone", () => {
+    expect(Object.keys(vars).filter((k) => k.startsWith("--radius"))).toEqual([]);
+  });
   it("honors a custom gradient angle", () => {
-    const v = brandStyleVars({ ...DEFAULT_BRAND, style: { gradientAngle: 90 } }) as Record<string, string>;
+    const v = brandStyleVars({ ...DEFAULT_BRAND, style: { ...DEFAULT_BRAND.style, gradientAngle: 90 } }) as Record<string, string>;
     expect(v["--brand-grad"]).toBe("linear-gradient(90deg, #8b3fd6 0%, #6366f1 48%, #3b82f6 100%)");
   });
 });
@@ -77,5 +87,163 @@ describe("resolveBrand — merge, tokens, fail-closed", () => {
     expect(b.name).toBe(DEFAULT_BRAND.name);
     expect(b.promotions).toBe(false);
     expect(b.style.gradientAngle).toBe(DEFAULT_BRAND.style.gradientAngle);
+  });
+});
+
+describe("brandStyleVars — style levers", () => {
+  const withStyle = (style: Partial<typeof DEFAULT_BRAND.style>) =>
+    brandStyleVars({ ...DEFAULT_BRAND, style: { ...DEFAULT_BRAND.style, ...style } }) as Record<string, string>;
+
+  it("scales the whole Tailwind radius scale from the base radius", () => {
+    const soft = withStyle({ radius: "soft" }); // 14px base
+    expect(soft["--radius-lg"]).toBe("14px");
+    expect(soft["--radius-xl"]).toBe("21px");
+    expect(soft["--radius-2xl"]).toBe("28px");
+    expect(withStyle({ radius: "sharp" })["--radius-2xl"]).toBe("4px");
+    expect(withStyle({ radius: 4 })["--radius-lg"]).toBe("4px");
+  });
+
+  it("maps elevation to the accent glow", () => {
+    expect(withStyle({ elevation: "flat" })["--shadow-accent"]).toBe("none");
+    expect(withStyle({ elevation: "soft" })["--shadow-accent"]).not.toContain("79, 70, 229");
+  });
+
+  it("renders gradient CTAs solid under flatButtons", () => {
+    expect(withStyle({ flatButtons: true })["--cta-bg"]).toBe("var(--accent)");
+  });
+});
+
+describe("resolveBrand — style levers", () => {
+  it("defaults every lever to the original look", () => {
+    expect(resolveBrand("acme", {}).style).toEqual(DEFAULT_BRAND.style);
+  });
+
+  it("accepts valid levers", () => {
+    const s = resolveBrand("acme", { style: { radius: "soft", elevation: "flat", flatButtons: true } }).style;
+    expect(s).toMatchObject({ radius: "soft", elevation: "flat", flatButtons: true });
+    expect(resolveBrand("acme", { style: { radius: 12 } }).style.radius).toBe(12);
+  });
+
+  it("drops malformed levers instead of throwing", () => {
+    const s = resolveBrand("acme", { style: { radius: "round", elevation: "neon", flatButtons: "yes" } }).style;
+    expect(s).toEqual(DEFAULT_BRAND.style);
+    expect(resolveBrand("acme", { style: { radius: 500 } }).style.radius).toBe("default");
+    expect(resolveBrand("acme", { style: { radius: -1 } }).style.radius).toBe("default");
+  });
+});
+
+describe("resolveBrand — originator", () => {
+  it("uses a configured slug", () => {
+    expect(resolveBrand("acme", { originator: "acme-insights" }).originator).toBe("acme-insights");
+  });
+  it("derives <id>-analytics rather than inheriting the default's attribution", () => {
+    expect(resolveBrand("acme", {}).originator).toBe("acme-analytics");
+    expect(resolveBrand("acme", { originator: "Not A Header!" }).originator).toBe("acme-analytics");
+  });
+  it("falls back to the default only when the id is not header-safe either", () => {
+    expect(resolveBrand("../x", {}).originator).toBe(DEFAULT_BRAND.originator);
+  });
+  it("keeps magick-analytics for the default brand", () => {
+    expect(resolveBrand("magickvoice", {}).originator).toBe("magick-analytics");
+  });
+  it("warns when a configured originator is rejected", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    resolveBrand("acme", { originator: "Acme Analytics" });
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+});
+
+describe("getBrand — a pack that fails to load", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("gets the default look but none of MagickVoice's company-specific fields", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubEnv("BRAND", "no-such-brand");
+    const b = getBrand();
+    expect(b.name).toBe(DEFAULT_BRAND.name);
+    expect(b.colors).toEqual(DEFAULT_BRAND.colors);
+    expect(b.originator).toBe("no-such-brand-analytics");
+    expect(b.compliance).toBeNull();
+    expect(b.promotions).toBe(false);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+  });
+});
+
+describe("resolveBrand — compliance", () => {
+  it("keeps the default brand's claims", () => {
+    expect(resolveBrand("magickvoice", {}).compliance).toBe(DEFAULT_BRAND.compliance);
+  });
+  it("never lends them to a whitelabel", () => {
+    expect(resolveBrand("acme", {}).compliance).toBeNull();
+    expect(resolveBrand("acme", { compliance: "  " }).compliance).toBeNull();
+  });
+  it("uses a brand's own claims, and null hides them even on the default", () => {
+    expect(resolveBrand("acme", { compliance: "ISO 27001" }).compliance).toBe("ISO 27001");
+    expect(resolveBrand("magickvoice", { compliance: null }).compliance).toBeNull();
+  });
+});
+
+describe("brandSidebarWidth", () => {
+  const withWordmark = (lead: string, accent: string) => ({ ...DEFAULT_BRAND, wordmark: { lead, accent } });
+  it("keeps the original 248px for the default brand", () => {
+    expect(brandSidebarWidth(DEFAULT_BRAND)).toBe(248);
+    expect((brandStyleVars(DEFAULT_BRAND) as Record<string, string>)["--sidebar-width"]).toBe("248px");
+  });
+  it("widens for a long wordmark, within the cap", () => {
+    const w = brandSidebarWidth(withWordmark("Samarthya", "Analytics"));
+    expect(w).toBeGreaterThan(248);
+    expect(w).toBeLessThanOrEqual(320);
+    expect(brandSidebarWidth(withWordmark("A".repeat(40), "B".repeat(40)))).toBe(320);
+  });
+});
+
+describe("resolveBrand — accentMuted", () => {
+  it("derives a tint of a recolored accent rather than inheriting indigo", () => {
+    expect(resolveBrand("acme", { colors: { accent: "#000000" } }).colors.accentMuted).toBe(mixWithWhite("#000000", 0.7));
+    expect(mixWithWhite("#000000", 0.7)).toBe("#b3b3b3");
+  });
+  it("keeps the default tint when the accent is untouched, and honors an explicit one", () => {
+    expect(resolveBrand("acme", {}).colors.accentMuted).toBe("#c7d2fe");
+    expect(resolveBrand("acme", { colors: { accent: "#000000", accentMuted: "#123456" } }).colors.accentMuted).toBe("#123456");
+  });
+});
+
+describe("shipped brand packs", () => {
+  const dir = path.join(process.cwd(), "brands");
+  const ids = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+
+  it.each(ids)("%s has a logo and a config that resolves without falling back", (id) => {
+    expect(() => readFileSync(path.join(dir, id, "logo.png"))).not.toThrow();
+    const raw = JSON.parse(readFileSync(path.join(dir, id, "brand.config.json"), "utf8"));
+    const b = resolveBrand(id, raw);
+    expect(b.name).toBe(raw.name);
+    expect(b.colors.accent).toBe(raw.colors.accent);
+    if (raw.style) expect(b.style).toMatchObject(raw.style);
+  });
+
+  it("every pack has its own upstream originator", () => {
+    const originators = ids.map((id) => resolveBrand(id, JSON.parse(readFileSync(path.join(dir, id, "brand.config.json"), "utf8"))).originator);
+    expect(new Set(originators).size).toBe(originators.length);
+  });
+
+  it("the magickvoice pack carries no company-specific fields to copy into a new brand", () => {
+    const raw = JSON.parse(readFileSync(path.join(dir, "magickvoice", "brand.config.json"), "utf8"));
+    expect(raw).not.toHaveProperty("originator");
+    expect(raw).not.toHaveProperty("compliance");
+  });
+
+  it("the samarthya pack sends samarthya-analytics and claims no certifications", () => {
+    const b = resolveBrand("samarthya", JSON.parse(readFileSync(path.join(dir, "samarthya", "brand.config.json"), "utf8")));
+    expect(b.name).toBe("Samarthya Analytics");
+    expect(b.originator).toBe("samarthya-analytics");
+    expect(b.compliance).toBeNull();
+    expect(b.promotions).toBe(false);
+  });
+
+  it("the magickvoice pack matches the baked-in default", () => {
+    const raw = JSON.parse(readFileSync(path.join(dir, "magickvoice", "brand.config.json"), "utf8"));
+    expect(resolveBrand("magickvoice", raw)).toEqual(DEFAULT_BRAND);
   });
 });

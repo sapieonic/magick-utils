@@ -155,7 +155,7 @@ export default function WorkspacePage() {
   };
 
   return (
-    <div className="min-h-screen w-full flex items-center justify-center p-6 bg-[#f6f7f9]" style={{ backgroundImage: "radial-gradient(60% 50% at 50% -5%, #eef2ff 0%, transparent 60%)" }}>
+    <div className="min-h-screen w-full flex items-center justify-center p-6 bg-[#f6f7f9]" style={{ backgroundImage: "radial-gradient(60% 50% at 50% -5%, var(--accent-soft) 0%, transparent 60%)" }}>
       <div className="w-full max-w-[480px] fade-up">
         <div className="flex justify-center mb-7">
           <Logo size={42} />

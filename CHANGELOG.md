@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/sapieonic/magick-utils/compare/v1.3.10...v1.4.0) (2026-09-23)
+
+
+### Features
+
+* **brand:** add the Samarthya Analytics brand pack and cusui style levers ([#41](https://github.com/sapieonic/magick-utils/issues/41)) ([7c12581](https://github.com/sapieonic/magick-utils/commit/7c125816e9abdc491f21abe13a68fd2707d332dc)), closes [#17](https://github.com/sapieonic/magick-utils/issues/17) [#8f6a30](https://github.com/sapieonic/magick-utils/issues/8f6a30) [#946f35](https://github.com/sapieonic/magick-utils/issues/946f35) [#7a5a28](https://github.com/sapieonic/magick-utils/issues/7a5a28) [#b88f50](https://github.com/sapieonic/magick-utils/issues/b88f50) [#8f6a30](https://github.com/sapieonic/magick-utils/issues/8f6a30) [#8a6630](https://github.com/sapieonic/magick-utils/issues/8a6630)
+
 ## [1.3.10](https://github.com/sapieonic/magick-utils/compare/v1.3.9...v1.3.10) (2026-09-21)
 
 

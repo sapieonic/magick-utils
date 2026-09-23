@@ -7,6 +7,13 @@
   --accent-soft: #eef2ff;
   --accent-ring: rgba(79, 70, 229, 0.35);
   --brand-grad: linear-gradient(135deg, #8b3fd6 0%, #6366f1 48%, #3b82f6 100%);
+  --accent-muted: #c7d2fe;
+  /* Accent halo on gradient CTAs; the brand's style.elevation can mute it. */
+  --shadow-accent: 0 8px 24px -6px rgba(79, 70, 229, 0.6);
+  /* Fill of gradient CTAs; style.flatButtons swaps it for solid --accent. */
+  --cta-bg: var(--brand-grad);
+  /* Expanded sidebar width; widened for long brand wordmarks. */
+  --sidebar-width: 248px;
 }
 
 @theme inline {

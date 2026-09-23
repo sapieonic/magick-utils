@@ -542,7 +542,7 @@ export default function CampaignsScreen() {
 
       {/* bulk action bar */}
       {selected.size > 0 && (
-        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 lg:pl-[124px] px-4 w-full max-w-2xl fade-up">
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 lg:pl-[calc(var(--sidebar-width)/2)] px-4 w-full max-w-2xl fade-up">
           <div className="flex items-center gap-3 rounded-2xl bg-slate-900 text-white px-3 py-2.5 shadow-2xl">
             <span
               className="inline-flex items-center justify-center h-8 min-w-8 px-2 rounded-lg text-white text-sm font-bold"
