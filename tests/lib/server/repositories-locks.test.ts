@@ -32,6 +32,7 @@ import {
   deleteOrphanedRecordRevisionsEverywhere,
   deleteSupersededRecordRevisions,
   failBatchIfOwned,
+  keepPublishedRevisionIfOwned,
   retireBatchRevision,
   SUPERSEDED_REVISION_GRACE_MS,
   IngestionConflictError,
@@ -243,6 +244,39 @@ describe("batch worker ownership", () => {
 
       expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
     }
+  });
+
+  // A failure after a pull that left a shortfall on record: the kept revision
+  // may hold every record, but it is behind, and "ready" would let the next
+  // refresh prove it unchanged and never retry it.
+  it("resolves a failure over a batch with a recorded shortfall to stale", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+      total: 8232, sourceTotal: 8232, ingestedListedTotal: 8232,
+      shortPull: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "x" },
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
+  });
+
+  it("keeps the published revision after a short pull only while this lease owns the batch", async () => {
+    const shortPull = { listed: 3, received: 2, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" };
+    batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 }).mockResolvedValueOnce({ matchedCount: 0 });
+
+    await expect(keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull)).resolves.toBe(true);
+    await expect(keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull)).resolves.toBe(false);
+
+    const [filter, update] = batchDb.updateOne.mock.calls[0];
+    expect(filter).toEqual({ tenantId: "t1", accountId: "a1", batchId: "b1", ingestJobId: "j1", ingestLeaseId: "lease-1" });
+    // Readable, flagged, released — and nothing about the revision itself moves.
+    expect(update.$set).toEqual(expect.objectContaining({ ingestStatus: "stale", shortPull }));
+    expect(update.$set).not.toHaveProperty("publishedRevision");
+    expect(update.$set).not.toHaveProperty("total");
+    expect(update.$unset).toEqual({ ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" });
   });
 
   it("restores ready over a stamped-complete revision even when contacts exceed rows", async () => {

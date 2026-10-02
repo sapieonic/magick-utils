@@ -20,7 +20,7 @@ import {
   IVR_HANGUP_NODE_KEYS,
   SHORT_CALL_SECONDS,
 } from "@/lib/server/dashboard-quality";
-import { isBatchReadable, isEmptyDispatchedPull, publishedRevisionMayBeShort } from "@/lib/server/types";
+import { isBatchReadable, isEmptyDispatchedPull, needsCompletenessRepull } from "@/lib/server/types";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -180,16 +180,15 @@ export async function failBatchIfOwned(
   // the source has moved past what the published revision was built from, so
   // the next refresh still knows there is something to pull.
   //
-  // Likewise when the published revision itself cannot be shown complete —
-  // typically a revision an older build published short, which the refresh
-  // that just failed was trying to replace. Keeping it readable is right (its
-  // records are real, and the worker refusing a short pull is not evidence
-  // they are wrong); calling it "ready" is not, because a ready batch whose job
-  // upstream never touches again is skipped by every later refresh.
+  // Likewise when the published revision may be incomplete, or the batch's
+  // last pull came back short (`needsCompletenessRepull`) — typically a
+  // revision an older build published short. Keeping it readable is right (its
+  // records are real); calling it "ready" is not, because a ready batch whose
+  // job upstream never touches again is skipped by every later refresh.
   const readableStatus =
     current.ingestedSourceFingerprint &&
     current.ingestedSourceFingerprint === current.sourceFingerprint &&
-    !publishedRevisionMayBeShort(current)
+    !needsCompletenessRepull(current)
       ? "ready"
       : "stale";
   // ...unless what is published is the empty-pull failure itself. A revision
@@ -214,6 +213,34 @@ export async function failBatchIfOwned(
       $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
     },
   );
+}
+
+/** Leave the published revision in place after a pull that came back short,
+ *  while this exact worker lease still owns the batch.
+ *
+ *  The counterpart of `publishBatchIfOwned` for the one outcome where the pull
+ *  completed but was worse than what readers already see: an earlier revision
+ *  holding more records stays published, untouched, and the batch is marked
+ *  "stale" with the shortfall recorded — readable, explicitly flagged, and never
+ *  skipped by a refresh, so a pull against a fixed upstream replaces it. The
+ *  rest of the job carries on; nothing about this batch is a failure. */
+export async function keepPublishedRevisionIfOwned(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  jobId: string,
+  leaseId: string,
+  shortPull: NonNullable<BatchDoc["shortPull"]>,
+): Promise<boolean> {
+  const col = await batches();
+  const result = await col.updateOne(
+    { tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId },
+    {
+      $set: { ingestStatus: "stale", shortPull, updatedAt: nowIso() },
+      $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
+    },
+  );
+  return result.matchedCount === 1;
 }
 
 export async function listBatches(

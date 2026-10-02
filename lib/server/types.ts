@@ -1,7 +1,7 @@
 // Shared server-side contracts. The data layer, magick-master client, ingestion
 // worker, and route handlers all agree on these shapes.
 
-import type { BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
+import type { BatchShortfall, BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
 import type { AppTimezone } from "@/lib/timezone";
 
 /** Whether a batch has a complete published revision that readers can be served.
@@ -46,28 +46,25 @@ export function isEmptyDispatchedPull(recordCount: number, dispatched: number | 
  *
  *  More unique records than `listedTotal` is not a fault — rows can only have
  *  been added between the COUNT and the pages — and an absent total is no
- *  claim. Callers must still gate on the job having finished dialling: while it
- *  is running both numbers legitimately move. */
+ *  claim. Callers must still gate on the job having stopped adding rows: while
+ *  it is still dispatching, both numbers legitimately move. */
 export function isIncompletePaginatedPull(uniqueRecords: number, listedTotal: number | null | undefined): boolean {
   return (listedTotal ?? 0) > uniqueRecords;
 }
 
 /** Whether a batch's PUBLISHED revision cannot be shown to hold every record.
  *
- *  A batch this is true of stays readable — its records are the best we have —
- *  but it must not read "ready": the campaigns listing and failure cleanup both
- *  resolve it to "stale", and `/api/ingest`'s refresh path never skips a stale
- *  batch. That is the whole recovery path for revisions published short by a
- *  build that did not refuse to (the 8,038-of-8,232 Combine), and for a refresh
- *  the worker refused to publish: without it, a terminal job whose `updated_at`
- *  never moves is "proven unchanged", every refresh no-ops, and the short data
- *  is served forever even after upstream pagination is fixed.
+ *  A per-revision judgement, read off the stamps that revision was published
+ *  with. Revisions that recorded their list total are judged against it
+ *  exactly. Older ones fall back to the dispatched contact count, which can run
+ *  ahead of the rows for healthy reasons (rejected batches, suppressed numbers)
+ *  — so a legitimately short legacy batch is flagged too, costs one re-pull, and
+ *  is then judged exactly from the stamp that pull writes.
  *
- *  Revisions that recorded their list total are judged against it exactly.
- *  Older ones fall back to the dispatched contact count, which can run ahead of
- *  the rows for healthy reasons (rejected batches, suppressed numbers) — so a
- *  legitimately short legacy batch is flagged too, costs one re-pull on the next
- *  refresh, and is then judged exactly from the stamp that pull writes. */
+ *  This decides whether a re-pull is worth trying, never what a reader is
+ *  told: the fallback is too loose to put in front of a customer, so the
+ *  reader-facing statement is `BatchDoc.shortPull`, which only the worker
+ *  writes and only from an exact comparison. */
 export function publishedRevisionMayBeShort(
   batch: Pick<BatchDoc, "total" | "sourceTotal" | "ingestedListedTotal">,
 ): boolean {
@@ -75,6 +72,57 @@ export function publishedRevisionMayBeShort(
     return isIncompletePaginatedPull(batch.total, batch.ingestedListedTotal);
   }
   return isIncompletePaginatedPull(batch.total, batch.sourceTotal);
+}
+
+/** Whether a batch should be re-pulled for completeness rather than trusted as
+ *  "ready" — its published revision may be short, or its latest pull came back
+ *  short and a fuller earlier revision was kept in its place.
+ *
+ *  One predicate for every place that has to agree, for the reason
+ *  `isEmptyDispatchedPull` is shared: the campaigns listing and failure cleanup
+ *  resolve such a batch to "stale" instead of "ready", the refresh path never
+ *  skips it, and a merge re-pulls it once. Without it a terminal job whose
+ *  `updated_at` never moves is "proven unchanged", every refresh no-ops, and a
+ *  short revision is served forever even after upstream pagination is fixed.
+ *  It converges: the first complete pull clears `shortPull` and stamps an exact
+ *  `ingestedListedTotal`, after which this is false and the batch reads ready. */
+export function needsCompletenessRepull(
+  batch: Pick<BatchDoc, "total" | "sourceTotal" | "ingestedListedTotal" | "shortPull">,
+): boolean {
+  return batch.shortPull != null || publishedRevisionMayBeShort(batch);
+}
+
+/** What the worker records when a pull of a job that has stopped adding rows
+ *  returns fewer unique records than the list surface counted.
+ *
+ *  Against core builds that page over a non-unique `created_at`, rows sharing a
+ *  timestamp are lost DETERMINISTICALLY — the same rows on every pass, with no
+ *  writes at all — so this is not a transient to retry through; it is a fact
+ *  about the upstream that the reader has to be told. */
+export interface PullShortfall extends BatchShortfall {
+  /** Records the list surface counted (`COUNT(*)` over the rows it pages). */
+  listed: number;
+  /** Unique records the pull actually returned. */
+  received: number;
+  /** True when an earlier revision holding more records was kept instead of
+   *  publishing this pull; false when the short pull itself is what readers
+   *  now see. Either way `BatchDoc.total` is the served record count. */
+  keptPrevious: boolean;
+}
+
+/** A non-fatal outcome a job reports alongside `status: "done"`. Today only an
+ *  incomplete upstream pull, which must not fail the other batches of the job
+ *  nor take a usable revision offline, but must not be silent either. */
+export interface JobWarning {
+  kind: "incomplete_upstream";
+  batchId: string;
+  name: string;
+  listed: number;
+  received: number;
+  keptPrevious: boolean;
+  /** Records readers are served for the batch after this job. */
+  served: number;
+  message: string;
 }
 
 /** The authenticated tenant/account context derived from the session cookie. */
@@ -154,15 +202,23 @@ export interface BatchDoc {
    * pages) during the pull that built the published revision. It is what makes
    * "is the published revision complete?" answerable after the fact: `total`
    * alone cannot say, and `sourceTotal` is a contact count, a different
-   * population. Absent — or BSON null — on revisions published before it
-   * existed, and when the surface reported no total; read it with
+   * population. When the surface reported no total it is the pull's own
+   * record count (no claim of loss was made). Absent — or BSON null — only on
+   * revisions published before it existed; read it with
    * `publishedRevisionMayBeShort`, which falls back to `sourceTotal` then. */
   ingestedListedTotal?: number | null;
+  /** Set by the worker when the latest pull of a job that had stopped adding
+   * rows came back with fewer unique records than upstream's list counted; null
+   * once a pull is complete. The one reader-facing statement that the served
+   * data is (or may be behind) incomplete — see PullShortfall. Absent on
+   * documents written before it existed. */
+  shortPull?: PullShortfall | null;
   /** Immutable record revision currently visible to readers. Older documents
    * without this field use the legacy unversioned record set. */
   publishedRevision?: string;
   /** "stale" = a published revision is still readable, but upstream has moved
-   * on since it was ingested. Readable like "ready"; a refresh will re-pull. */
+   * on since it was ingested, or the revision may be incomplete
+   * (`needsCompletenessRepull`). Readable like "ready"; a refresh will re-pull. */
   ingestStatus: "none" | "ingesting" | "ready" | "stale" | "error";
   /** Current worker ownership, used for conditional revision publication. */
   ingestJobId?: string;
@@ -276,6 +332,8 @@ export interface Job {
   leaseId?: string | null;
   fingerprint?: string;
   error?: string | null;
+  /** Non-fatal per-batch outcomes of a job that still finished `done`. */
+  warnings?: JobWarning[];
   result?: unknown; // e.g. merge → { columns, rowCount }; insights → Insight
   createdAt: string;
   updatedAt: string;

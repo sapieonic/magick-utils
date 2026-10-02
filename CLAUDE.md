@@ -49,7 +49,8 @@ collapses `ivr_call` and `static_call` to `"ivr"`, so it cannot choose a surface
 `call_id`/`recipient_phone`. See BACKEND.md → *Job-scoped list surfaces*.
 
 `BatchDoc.ingestStatus` is `none | ingesting | ready | stale | error`. **`stale` is readable** — its
-published revision is complete and is what every reader sees, it just has upstream changes waiting.
+published revision is what every reader sees; it just has upstream changes waiting, or may be
+incomplete (an explicit `shortPull` says so to readers).
 Use `isBatchReadable()` from `lib/server/types.ts` rather than comparing to `"ready"`; treating stale as
 un-ingested is what produced intermittent 409s. See BACKEND.md → *Batch freshness*.
 
@@ -75,13 +76,18 @@ revision back to `ready`/`stale` — a batch already poisoned by an older build 
 Only a job that PROVABLY finished dialling arms the worker's guard; a still-running, cancelled or
 unreadable job must stay exempt, or healthy campaigns get an `error` no click can clear.
 
-A pull of a provably-finished job that returns fewer **unique** records than the list surface's own
-`total` (a COUNT over the same rows) is likewise refused after `MAX_PULL_ATTEMPTS` re-pulls, never
-published: upstream paginates over a non-unique `created_at`, so tied rows reshuffle into duplicates and
-silent gaps while the raw count looks complete. Compare against the list's `total`, never
-`total_contacts`. A refused refresh keeps the old revision readable but `stale`, not `ready` —
-`publishedRevisionMayBeShort` is what keeps a short revision re-pullable instead of "proven unchanged"
-forever. See BACKEND.md → *Pull completeness*.
+A pull whose job has stopped adding rows but which returns fewer **unique** records than the list
+surface's own `total` (a COUNT over the same rows) is an **incomplete upstream pull**, and it fails
+nothing. Upstream pages over a non-unique `created_at`, and Postgres's top-N heapsort loses tied rows
+*deterministically* — same rows every pass, no writes needed — so re-pulling against an unfixed core is
+pure load; the worker makes one pass. It then keeps a readable revision holding MORE records (batch
+`stale`) or publishes the short pull (batch `stale`), records `BatchDoc.shortPull`, and finishes the job
+`done` with a `JobWarning` while the job's other batches publish normally. `shortPull` is the only
+reader-facing statement of the gap (Analytics notice, Combine label) — never derive one from
+`publishedRevisionMayBeShort`'s loose legacy fallback. `needsCompletenessRepull` is the shared predicate
+(listing, `failBatchIfOwned`, refresh, and a merge re-pulls once); the first complete pull clears the flag.
+Compare against the list's `total`, never `total_contacts`. Core's `id` tiebreak should deploy first,
+but Utils is safe in either order. See BACKEND.md → *Pull completeness*.
 
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see

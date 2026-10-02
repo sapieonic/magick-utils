@@ -354,6 +354,16 @@ describe("buildBatchDoc", () => {
     expect(buildBatchDoc([makeRecord()], ctx, baseOpts()).sourceTotal).toBeUndefined();
   });
 
+  // `publishBatchIfOwned` is a `$set`: an omitted key would leave the previous
+  // shortfall on the document after a complete pull, and the batch would never
+  // read ready again.
+  it("writes an explicit null shortPull so a complete publish clears a previous one", () => {
+    const doc = buildBatchDoc([makeRecord()], ctx, baseOpts());
+    expect(doc).toHaveProperty("shortPull", null);
+    const flagged = { listed: 3, received: 1, keptPrevious: false, detectedAt: "x" };
+    expect(buildBatchDoc([makeRecord()], ctx, baseOpts({ shortPull: flagged })).shortPull).toEqual(flagged);
+  });
+
   it("breakdown uses fixed order and only known keys", () => {
     const recs = [
       makeRecord({ status: "failed" }),

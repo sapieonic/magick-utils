@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { bulkJobIsUnchangedSince, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
+import { batchDocToBatch, bulkJobIsUnchangedSince, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
 import type { RawBulkJob } from "@/lib/server/magick-client";
 import type { BatchDoc, TenantContext } from "@/lib/server/types";
 
@@ -220,6 +220,44 @@ describe("bulkJobToBatchDoc", () => {
     expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 470, ingestedListedTotal: 480 }).ingestStatus).toBe("stale");
     // The stamp is carried through the listing for the next decision.
     expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 480, ingestedListedTotal: 480 }).ingestedListedTotal).toBe(480);
+  });
+
+  // The worker's record of a short pull survives every listing, keeps the
+  // batch stale however complete the stamps look (the kept revision may hold
+  // every record and still be behind), and reaches the frontend shape.
+  it("carries a recorded shortfall through the listing and reads it stale", () => {
+    const job: RawBulkJob = {
+      id: "kept", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 3,
+      updated_at: "2026-09-30T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const shortPull = { listed: 3, received: 2, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" };
+    const committed: BatchDoc = {
+      ...source, total: 3, ingestStatus: "stale", ingestedSourceFingerprint: source.sourceFingerprint,
+      ingestedListedTotal: 3, publishedRevision: "revision-1", shortPull,
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.shortPull).toEqual(shortPull);
+    expect(batchDocToBatch(refreshed).shortfall).toEqual(shortPull);
+    // Cleared by a complete publish, the same listing reads ready again.
+    const cleared = bulkJobToBatchDoc(job, ctx, { ...committed, shortPull: null });
+    expect(cleared.ingestStatus).toBe("ready");
+    expect(batchDocToBatch(cleared).shortfall).toBeNull();
+  });
+
+  // The loose legacy fallback schedules a re-pull but is never shown to a
+  // customer: it flags healthy partially-failed campaigns.
+  it("never derives a reader-facing shortfall from the legacy contact-count fallback", () => {
+    const job: RawBulkJob = { id: "legacy", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 8232 };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source, total: 8038, ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(batchDocToBatch(refreshed).shortfall).toBeNull();
   });
 
   // A zero-record commit used to pull `total` down to 0 and take the dispatched

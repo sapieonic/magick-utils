@@ -3,7 +3,7 @@
 // (used by the campaigns listing before any records are ingested).
 
 import type { Batch, BreakdownSeg, StatusKey } from "@/lib/types";
-import { isBatchReadable, publishedRevisionMayBeShort, type BatchDoc, type TenantContext } from "./types";
+import { isBatchReadable, needsCompletenessRepull, type BatchDoc, type TenantContext } from "./types";
 import type { RawBulkJob } from "./magick-client";
 import { dispatchTypeToType, normalizeStatus } from "./normalize";
 import { normalizeJobDispatchType } from "./magick-client";
@@ -44,6 +44,10 @@ export function batchDocToBatch(doc: BatchDoc): Batch {
     avgDuration: doc.avgDuration,
     avgTalkTime: doc.avgTalkTime,
     ingestStatus: doc.ingestStatus,
+    // Only ever the worker's exact judgement, never `publishedRevisionMayBeShort`'s
+    // legacy fallback — that one flags healthy partially-failed campaigns and
+    // is fit to schedule a re-pull, not to put a warning in front of a customer.
+    shortfall: doc.shortPull ?? null,
   };
 }
 
@@ -298,6 +302,10 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     ingestedSourceFingerprint: existing?.ingestedSourceFingerprint,
     ingestedSourceUpdatedAt: existing?.ingestedSourceUpdatedAt,
     ingestedListedTotal: existing?.ingestedListedTotal,
+    // The worker's record of a short pull is about the PUBLISHED revision (or
+    // the one kept in its place), not about this listing, so it survives every
+    // listing until a pull is complete.
+    shortPull: existing?.shortPull ?? null,
     publishedRevision: existing?.publishedRevision,
     // "stale" keeps the published revision readable — analytics and exports
     // keep working off it — while marking that a refresh has something to pull.
@@ -305,12 +313,18 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     // carried forward, so a source that moves and then moves back resolves to
     // "ready" again instead of latching stale until someone forces a re-pull.
     //
-    // A published revision that cannot be shown to hold every record is stale
-    // too, whatever the fingerprint says: "ready" would let the refresh path
-    // prove it unchanged and skip it forever (see publishedRevisionMayBeShort).
+    // A batch whose published revision may be incomplete, or whose latest pull
+    // came back short, is stale too, whatever the fingerprint says: "ready"
+    // would let the refresh path prove it unchanged and skip it forever (see
+    // needsCompletenessRepull).
     ingestStatus: ingested
       ? sourceChanged ||
-        publishedRevisionMayBeShort({ total, sourceTotal: dispatchedTotal, ingestedListedTotal: existing?.ingestedListedTotal })
+        needsCompletenessRepull({
+          total,
+          sourceTotal: dispatchedTotal,
+          ingestedListedTotal: existing?.ingestedListedTotal,
+          shortPull: existing?.shortPull,
+        })
         ? "stale"
         : "ready"
       : existing?.ingestStatus ?? "none",

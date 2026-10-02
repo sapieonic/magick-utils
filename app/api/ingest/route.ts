@@ -17,7 +17,7 @@ import {
 import {
   isBatchReadable,
   isEmptyDispatchedPull,
-  publishedRevisionMayBeShort,
+  needsCompletenessRepull,
   type BatchDoc,
   type Job,
   type JobType,
@@ -77,13 +77,15 @@ async function refreshableBatchIds(
         // costs one redundant ingestion that the worker reclaims itself; the
         // latch costs the customer their refresh, permanently.
         if (batch.ingestStatus === "stale") return batchId;
-        // Same reasoning for a published revision that cannot be shown to hold
-        // every record — the listing marks those stale too, but this must not
-        // depend on a listing having rewritten the document since it was
-        // published. It is how a revision published short (by an older build,
-        // or while its job was still running) gets re-pulled once upstream
-        // pagination is fixed, instead of being "proven unchanged" forever.
-        if (publishedRevisionMayBeShort(batch)) return batchId;
+        // Same reasoning for a batch that may be incomplete — the listing marks
+        // those stale too, but this must not depend on a listing having
+        // rewritten the document since it was published. It is how a short
+        // revision (published by an older build, by a running job, or flagged
+        // by the worker) gets re-pulled once upstream pagination is fixed,
+        // instead of being "proven unchanged" forever. Against an unfixed
+        // upstream the re-pull is short again and the worker keeps whichever
+        // revision holds more, so this costs upstream load, never data.
+        if (needsCompletenessRepull(batch)) return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
           if (bulkJobIsUnchangedSince(job, batch.ingestedSourceUpdatedAt)) {
@@ -168,7 +170,19 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // the customer got a green "Up to date" over an empty screen with no way to
     // clear it. Treating it as incomplete puts it back in front of the worker,
     // which decides — and now says so.
-    return !isEmptyDispatchedPull(counts[index], doc.sourceTotal);
+    if (isEmptyDispatchedPull(counts[index], doc.sourceTotal)) return false;
+    // A merge re-pulls a batch that may be incomplete, once — the merge job
+    // visits each of its batches exactly once and never retries a short pull.
+    // Without this the customer's re-export after upstream pagination is fixed
+    // would still stream the short revision, because only Analytics' "Refresh
+    // data" sends `refresh`. Safe against an unfixed upstream: a pull that comes
+    // back short again never replaces a revision holding more records, and the
+    // CSV is still produced from whatever is served. A plain Analytics load
+    // does NOT re-pull — it serves the flagged data and its Refresh button is
+    // the deliberate re-pull; re-pulling on every page view would be a full
+    // upstream re-page per visit for as long as upstream stays unfixed.
+    if (type === "merge" && needsCompletenessRepull(doc)) return false;
+    return true;
   });
   let batchIds: string[];
   try {

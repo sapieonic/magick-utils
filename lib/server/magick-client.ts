@@ -386,17 +386,21 @@ export function resolveJobDispatchType(
 
 /** Oldest-first ordering for the three CALL list surfaces, sent on every page.
  *
- *  Core pages these lists with `LIMIT/OFFSET` over `created_at`, which is NOT
- *  unique: a dispatch chunk is one multi-row INSERT, so its rows share a
- *  timestamp to the microsecond and Postgres may return them in a different
- *  order on every request. Pages then overlap and skip rows while the fetched
- *  count still equals `total` — measured as an 8,232-call campaign ingesting
- *  8,038 unique rows. Core's fix is a unique `id` tiebreak on the same ordering;
- *  until it is deployed this request changes nothing about the ties. What
- *  ascending order DOES buy, independently: a row added while a running job is
- *  being paged lands in the unfetched tail instead of shifting every later page
- *  by one. The worker's completeness check (`ingestBatch`) is the guard that
- *  actually holds; this is mitigation.
+ *  Core pages these lists with `LIMIT/OFFSET` ordered by `created_at`, which is
+ *  NOT unique: a dispatch chunk is one multi-row INSERT, so its rows share a
+ *  timestamp to the microsecond. Postgres sorts each page with a top-N heapsort
+ *  bounded by OFFSET+LIMIT, and the order it leaves among tied rows changes with
+ *  that bound — so consecutive pages overlap and skip tied rows while the
+ *  fetched count still equals `total`. The loss is DETERMINISTIC, not a race:
+ *  measured on Postgres 16 with no writes at all, 3,600 tied rows paged 100 at a
+ *  time came back as 3,584 unique, identical on every pass. Concurrent UPDATEs
+ *  are a secondary cause. Core's fix appends a unique `id` tiebreak to the
+ *  ordering; until it is deployed this request changes nothing about the ties
+ *  and re-pulling recovers nothing. What ascending order DOES buy,
+ *  independently: a row added while a running job is being paged lands in the
+ *  unfetched tail instead of shifting every later page by one. The worker's
+ *  completeness check (`ingestBatch`) is what makes the loss visible; this is
+ *  mitigation.
  *
  *  Verified per surface against the services' sources: magick-master forwards
  *  the query string verbatim on `/proxy/calls`, `/proxy/static-calls` and
@@ -404,8 +408,9 @@ export function resolveJobDispatchType(
  *  and core's validators for all three allow-list `sort_by=created_at` with
  *  `sort_order=asc|desc` on their `/search` routes. Messaging is deliberately
  *  NOT sent it: core's `messageQuerySchema` has no sort fields (an unknown key is
- *  stripped, not refused) and its repositories hard-code `created_at DESC`, so
- *  the parameter would be silently ignored and only read as if it worked. */
+ *  stripped, not refused), so its fixed newest-first order — `created_at DESC`,
+ *  with the same `id` tiebreak on core's fix branch — cannot be changed from
+ *  here, and the parameter would only read as if it worked. */
 const CALL_LIST_ORDER = { sort_by: "created_at", sort_order: "asc" } as const;
 
 // ---------------------------------------------------------------------------

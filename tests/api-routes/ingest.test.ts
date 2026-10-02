@@ -350,16 +350,82 @@ describe("POST /api/ingest", () => {
     expect(createJob).toHaveBeenCalledTimes(1);
   });
 
-  // But a plain load still serves it: the records are real, and blocking a
-  // Combine on them until upstream is fixed would trade a short CSV for none.
-  it("does not force a re-pull of a possibly-short ready batch outside a refresh", async () => {
+  // Same for a batch the worker flagged, even before a listing has resolved it
+  // to stale: a refresh must reach it, or it never converges once upstream is
+  // fixed.
+  it("refreshes a batch with a recorded shortfall, even when its job is untouched", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
-      total: 8038, sourceTotal: 8232, selType: "ai", ingestStatus: "stale",
+      total: 8232, sourceTotal: 8232, ingestedListedTotal: 8232, selType: "ai", ingestStatus: "ready",
+      shortPull: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" },
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(8232);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  // A merge re-pulls it, once: otherwise the customer's re-export after the
+  // upstream fix would still stream the short revision, since only Analytics'
+  // Refresh sends `refresh`. Safe against an unfixed upstream — a short re-pull
+  // never replaces a fuller revision (see the worker tests).
+  it.each([
+    ["an unstamped revision below its contact count", { total: 8038, sourceTotal: 8232 }],
+    ["a stamped-short revision", { total: 8038, sourceTotal: 8232, ingestedListedTotal: 8232 }],
+    [
+      "a batch whose last pull was short and kept a fuller revision",
+      { total: 8232, sourceTotal: 8232, ingestedListedTotal: 8232,
+        shortPull: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" } },
+    ],
+  ])("re-pulls %s on a merge", async (_label, shape) => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      selType: "ai", ingestStatus: "stale", sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      ...shape,
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(shape.total);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String), ready: false });
+    expect(createJob).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createJob).mock.calls[0][0]).toMatchObject({ type: "merge", batchIds: ["b1"] });
+  });
+
+  // A plain Analytics load serves the flagged data instead: re-pulling on every
+  // page view would be a full upstream re-page per visit for as long as the
+  // upstream stays unfixed. Its Refresh button is the deliberate re-pull.
+  it("does not re-pull a possibly-short batch on a plain (non-refresh) ingest", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 8038, sourceTotal: 8232, selType: "ai", ingestStatus: "stale", ingestedListedTotal: 8232,
+      shortPull: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" },
       sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
     } as never);
     vi.mocked(countRecords).mockResolvedValue(8038);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  // ...and a merge of a batch with nothing to doubt does not re-pull at all.
+  it("does not re-pull a stamped-complete batch on a merge", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 359, sourceTotal: 369, ingestedListedTotal: 359, shortPull: null, selType: "ai",
+      ingestStatus: "ready", sourceId: "job-1",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(359);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
@@ -367,10 +433,9 @@ describe("POST /api/ingest", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
-  // A batch the worker refused for incompleteness on its FIRST pull has no
-  // published revision and is left "error". `counts === doc.total` cannot
-  // re-score it complete, because an unreadable batch is never complete.
-  it("re-enqueues a batch errored by an incomplete first pull", async () => {
+  // A batch with nothing readable (a failed first pull) is never scored
+  // complete: `counts === doc.total` cannot re-score an unreadable batch.
+  it("re-enqueues a batch whose first pull failed", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({

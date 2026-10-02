@@ -15,6 +15,7 @@ import {
   failBatchIfOwned,
   getBatch,
   getRecordsForRevision,
+  keepPublishedRevisionIfOwned,
   publishBatchIfOwned,
   releaseIngestionLocks,
   renewIngestionLocks,
@@ -35,26 +36,20 @@ import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { fingerprint } from "./fingerprint";
 import {
+  isBatchReadable,
   isEmptyDispatchedPull,
   isIncompletePaginatedPull,
   type Job,
+  type JobWarning,
   type NormalizedRecord,
+  type PullShortfall,
   type TenantContext,
 } from "./types";
+import { shortfallMessage } from "@/lib/shortfall";
 import { logger, log } from "./logger";
 import { runWithRequestContext } from "./observability/request-context";
 
 const PAGE_SIZE = 100;
-/** Passes a short pull of a finished job gets before the batch is refused (see
- *  the completeness check in `ingestBatch`). Every pass re-pages the whole job,
- *  so this multiplies upstream load on exactly the batches that are already
- *  misbehaving — three is enough for passes to union over a reshuffle, and few
- *  enough not to turn one bad campaign into a rate-limit storm. Bounded per
- *  run: a resume after a deferral starts the count again. */
-export const MAX_PULL_ATTEMPTS = 3;
-/** Pause between those passes, long enough for upstream writes in flight
- *  (status callbacks reordering heap tuples) to settle. */
-export const PULL_RETRY_DELAY_MS = 2_000;
 const IDLE_DELAY_MS = 2500;
 const DEFAULT_RETRY_AFTER_MS = 30_000;
 const LEASE_MS = 60_000;
@@ -306,9 +301,12 @@ export async function processJob(job: Job) {
   let completedDone = startBatch > 0
     ? await countRecords(ctx.tenantId, ctx.accountId, job.batchIds.slice(0, startBatch))
     : 0;
+  // Carried from the claimed document so a run resumed after a deferral still
+  // reports the shortfalls an earlier run of the same job found.
+  let warnings: JobWarning[] = [...(job.warnings ?? [])];
   for (let batchIndex = startBatch; batchIndex < job.batchIds.length; batchIndex += 1) {
     const batchId = job.batchIds[batchIndex];
-    done = await ingestBatch(
+    const outcome = await ingestBatch(
       client,
       ctx,
       job.jobId,
@@ -318,15 +316,39 @@ export async function processJob(job: Job) {
       job.cursor ?? 0,
       completedDone,
     );
+    done = outcome.done;
     completedDone = done;
     job.cursor = 0;
+    // One entry per batch: a batch re-ingested on resume replaces what an
+    // earlier run said about it, including clearing it if this pull was whole.
+    const hadWarning = warnings.some((warning) => warning.batchId === batchId);
+    if (outcome.warning || hadWarning) {
+      warnings = [
+        ...warnings.filter((warning) => warning.batchId !== batchId),
+        ...(outcome.warning ? [outcome.warning] : []),
+      ];
+      // Written now rather than only at completion, so a deferral later in the
+      // job cannot lose it.
+      if (!(await updateClaimedJob(job.jobId, leaseId, { warnings }))) {
+        throw new Error("job lease lost while recording a batch warning");
+      }
+    }
   }
 
   const result = job.type === "merge" ? { rowCount: done } : undefined;
   const completed = await updateClaimedJob(
     job.jobId,
     leaseId,
-    { status: "done", done, cursor: 0, batchIndex: job.batchIds.length, leaseUntil: null, leaseId: null, result },
+    {
+      status: "done",
+      done,
+      cursor: 0,
+      batchIndex: job.batchIds.length,
+      leaseUntil: null,
+      leaseId: null,
+      result,
+      ...(warnings.length ? { warnings } : {}),
+    },
     // A merge that finished in thirty seconds must not leave a non-expiring
     // refresh token sitting in Mongo until the retention sweep gets to it.
     { clearCredential: true },
@@ -391,6 +413,29 @@ function jobFinishedDialling(job: RawBulkJob | null): boolean {
   return DIALLED_JOB_STATUSES.has((job?.status ?? "").toLowerCase().trim());
 }
 
+/** Bulk-job statuses after which upstream inserts no more rows for the job, so
+ *  the list surface's COUNT and its pages describe one fixed row set and a
+ *  unique count below the COUNT is loss, not lag.
+ *
+ *  Wider than `DIALLED_JOB_STATUSES` on purpose, and only possible because a
+ *  short pull no longer fails anything. The empty-pull guard throws, so it
+ *  arms only on proof the job dialled; this one flags, keeps or publishes —
+ *  readable either way — so the question it needs answered is narrower: will
+ *  more rows appear? A cancelled or failed job's rows are as fixed as a
+ *  completed one's, and exempting them would leave the same tie loss silent on
+ *  exactly those campaigns. Still-dispatching, unrecognised or unreadable jobs
+ *  stay exempt: the COUNT may genuinely be running ahead of the pages. */
+const ROWS_SETTLED_JOB_STATUSES: ReadonlySet<string> = new Set([
+  ...DIALLED_JOB_STATUSES,
+  "failed",
+  "cancelled",
+  "canceled",
+]);
+
+function jobStoppedAddingRows(job: RawBulkJob | null): boolean {
+  return ROWS_SETTLED_JOB_STATUSES.has((job?.status ?? "").toLowerCase().trim());
+}
+
 async function ingestBatch(
   client: MagickClient,
   ctx: TenantContext,
@@ -400,7 +445,7 @@ async function ingestBatch(
   batchIndex: number,
   initialOffset: number,
   completedDone: number,
-): Promise<number> {
+): Promise<{ done: number; warning?: JobWarning }> {
   const batch = await getBatch(ctx.tenantId, ctx.accountId, batchId);
   if (!batch) throw new Error(`batch ${batchId} not found (list campaigns first)`);
 
@@ -502,213 +547,238 @@ async function ingestBatch(
   // the same WHERE the pages come from. Undefined until a page reports one.
   let listedTotal: number | undefined;
   let offset = initialOffset;
-  let records: NormalizedRecord[] = [];
-  let duplicateRows = 0;
-  for (let attempt = 1; ; attempt += 1) {
-    // Rows fetched and unique ids seen in THIS pass, for the duplicate report.
-    // The first pass includes what a resumed run had already staged.
-    let passFetched = offset;
-    const passIds = attempt === 1 ? new Set(expectedRecordIds) : new Set<string>();
-    for (;;) {
-      let page: NormalizedRecord[];
-      let pageTotal: number | null | undefined;
-      // Always `job_id`. Dropping it to dodge a type-mismatch 400 would list the
-      // whole account, which is the bug master's guard exists to prevent.
-      const listParams = { jobId: batch.sourceId, limit: PAGE_SIZE, offset };
-      // Exhaustive on JobDispatchType so a seventh key cannot fall through to
-      // `/proxy/calls` and 400. `JOB_LIST_SURFACE` is the allowlist; the worker
-      // still names the typed client method and row key per case.
-      switch (dispatchType) {
-        case "whatsapp_message":
-        case "telegram_message":
-        case "email_message": {
-          const response = await client.listMessages(listParams);
-          pageTotal = response.total;
-          const channel = batch.channel as "whatsapp" | "telegram" | "email";
-          page = (response.messages ?? []).map((raw) => ({
-            ...normalizeMessage(raw, ctx, { channel, batchId, fingerprint: batch.fingerprint }),
-            revision,
-            revisionCreatedAt,
-          }));
-          break;
-        }
-        case "ivr_call": {
-          const response = await client.listIvrCalls(listParams);
-          pageTotal = response.total;
-          page = (response.sessions ?? []).map((raw) => ({
-            ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
-            revision,
-            revisionCreatedAt,
-          }));
-          break;
-        }
-        case "static_call": {
-          const response = await client.listStaticCalls(listParams);
-          pageTotal = response.total;
-          page = (response.calls ?? []).map((raw) => ({
-            ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
-            revision,
-            revisionCreatedAt,
-          }));
-          break;
-        }
-        case "ai_voice_call": {
-          const response = await client.listCalls(listParams);
-          pageTotal = response.total;
-          page = (response.calls ?? []).map((raw) => ({
-            ...normalizeCall(raw, ctx, { selType: "ai", batchId, fingerprint: batch.fingerprint }),
-            revision,
-            revisionCreatedAt,
-          }));
-          break;
-        }
-        default: {
-          const unexpected: never = dispatchType;
-          throw new Error(`unsupported magick-master list surface: ${String(unexpected)}`);
-        }
-      }
-      reportedTotal = Math.max(reportedTotal, pageTotal ?? 0);
-      if (typeof pageTotal === "number" && Number.isFinite(pageTotal)) {
-        listedTotal = Math.max(listedTotal ?? 0, pageTotal);
-      }
-      if (page.length === 0) {
+  for (;;) {
+    let page: NormalizedRecord[];
+    let pageTotal: number | null | undefined;
+    // Always `job_id`. Dropping it to dodge a type-mismatch 400 would list the
+    // whole account, which is the bug master's guard exists to prevent.
+    const listParams = { jobId: batch.sourceId, limit: PAGE_SIZE, offset };
+    // Exhaustive on JobDispatchType so a seventh key cannot fall through to
+    // `/proxy/calls` and 400. `JOB_LIST_SURFACE` is the allowlist; the worker
+    // still names the typed client method and row key per case.
+    switch (dispatchType) {
+      case "whatsapp_message":
+      case "telegram_message":
+      case "email_message": {
+        const response = await client.listMessages(listParams);
+        pageTotal = response.total;
+        const channel = batch.channel as "whatsapp" | "telegram" | "email";
+        page = (response.messages ?? []).map((raw) => ({
+          ...normalizeMessage(raw, ctx, { channel, batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
         break;
       }
-      const missingRecordIds = page.filter(
-        (record) => typeof record.recordId !== "string" || record.recordId.trim().length === 0,
-      ).length;
-      if (missingRecordIds > 0) {
-        throw new Error(
-          `invalid upstream records for ${batchId}: ${missingRecordIds} of ${page.length} records at offset ${offset} have no record id`,
-        );
+      case "ivr_call": {
+        const response = await client.listIvrCalls(listParams);
+        pageTotal = response.total;
+        page = (response.sessions ?? []).map((raw) => ({
+          ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
       }
-      // Repeated source ids represent the same session. Keep the latest payload
-      // for each id while retaining the raw page length for upstream pagination.
-      const uniquePage = [...new Map(page.map((record) => [record.recordId, record])).values()];
-      for (const record of uniquePage) {
-        expectedRecordIds.add(record.recordId);
-        passIds.add(record.recordId);
+      case "static_call": {
+        const response = await client.listStaticCalls(listParams);
+        pageTotal = response.total;
+        page = (response.calls ?? []).map((raw) => ({
+          ...normalizeCall(raw, ctx, { selType: "ivr", batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
       }
-      await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, uniquePage);
-      offset += page.length;
-      passFetched += page.length;
-      const checkpoint = await checkpointJob(jobId, leaseId, {
-        done: completedDone + expectedRecordIds.size,
-        cursor: offset,
-        batchIndex,
-        leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
-      });
-      if (!checkpoint) throw new Error("job lease lost while checkpointing");
-      await renewIngestionLocks(jobId);
-      if (page.length < PAGE_SIZE) break;
+      case "ai_voice_call": {
+        const response = await client.listCalls(listParams);
+        pageTotal = response.total;
+        page = (response.calls ?? []).map((raw) => ({
+          ...normalizeCall(raw, ctx, { selType: "ai", batchId, fingerprint: batch.fingerprint }),
+          revision,
+          revisionCreatedAt,
+        }));
+        break;
+      }
+      default: {
+        const unexpected: never = dispatchType;
+        throw new Error(`unsupported magick-master list surface: ${String(unexpected)}`);
+      }
     }
+    reportedTotal = Math.max(reportedTotal, pageTotal ?? 0);
+    if (typeof pageTotal === "number" && Number.isFinite(pageTotal)) {
+      listedTotal = Math.max(listedTotal ?? 0, pageTotal);
+    }
+    if (page.length === 0) {
+      break;
+    }
+    const missingRecordIds = page.filter(
+      (record) => typeof record.recordId !== "string" || record.recordId.trim().length === 0,
+    ).length;
+    if (missingRecordIds > 0) {
+      throw new Error(
+        `invalid upstream records for ${batchId}: ${missingRecordIds} of ${page.length} records at offset ${offset} have no record id`,
+      );
+    }
+    // Repeated source ids represent the same session. Keep the latest payload
+    // for each id while retaining the raw page length for upstream pagination.
+    const uniquePage = [...new Map(page.map((record) => [record.recordId, record])).values()];
+    for (const record of uniquePage) expectedRecordIds.add(record.recordId);
+    await replaceBatchRecords(ctx.tenantId, ctx.accountId, batchId, uniquePage);
+    offset += page.length;
+    const checkpoint = await checkpointJob(jobId, leaseId, {
+      done: completedDone + expectedRecordIds.size,
+      cursor: offset,
+      batchIndex,
+      leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
+    });
+    if (!checkpoint) throw new Error("job lease lost while checkpointing");
+    await renewIngestionLocks(jobId);
+    if (page.length < PAGE_SIZE) break;
+  }
 
-    records = await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision);
-    // Compare Mongo's unique staged rows with the unique source identities that
-    // should exist. Raw pages may legitimately repeat a session id.
-    if (records.length !== expectedRecordIds.size) {
-      throw new Error(
-        `incomplete ingestion for ${batchId}: stored ${records.length} of ${expectedRecordIds.size} unique records fetched`,
-      );
-    }
-    // Clamped: a run resumed mid-way through a re-pull seeds `passIds` with the
-    // union of earlier passes, which can exceed the rows this pass has fetched.
-    duplicateRows = Math.max(0, passFetched - passIds.size);
-    if (duplicateRows > 0) {
-      log().warn(
-        { batchId, fetchedRows: passFetched, uniqueRecords: passIds.size, duplicateRows, attempt },
-        "[worker] duplicate upstream record ids deduplicated",
-      );
-    }
-    // Upstream says this campaign dispatched contacts, and pagination returned
-    // nothing at all. Publishing that as a complete revision is what puts a green
-    // "Up to date" over an empty Analytics screen: the batch looks ingested, the
-    // only evidence sits in a warning nobody reads, and the failure then conceals
-    // itself — the empty revision commits, `total` collapses to the ingested 0,
-    // and the next run has no figure left to notice the gap with. `sourceTotal`
-    // is read alongside `reportedTotal` for exactly that reason: it survives a
-    // commit, so a batch already poisoned by an earlier empty publish is still
-    // caught here.
-    //
-    // Only for a job we can prove finished dialling: `jobFinishedDialling`
-    // keeps a still-running, cancelled or unreadable job out of this entirely,
-    // because reporting "Sync failed" on a campaign the customer has only just
-    // launched, or deliberately cancelled, is a worse bug than the one being
-    // fixed. A resumed batch has staged rows and so does not reach
-    // `records.length === 0`; fetching the job on resume (for dispatch_type) does
-    // not change that. It is checked before the completeness guard below and is
-    // not retried: a blackout is a read-path fault, not a pagination one.
-    //
-    // Throwing marks a never-ingested batch "error", and — for a batch already
-    // poisoned by an earlier empty publish — `failBatchIfOwned` recognises that
-    // its published revision is this same fault and errors it too rather than
-    // resolving it back to "ready". Any other published revision stays readable,
-    // because a failed refresh has not invalidated the good data behind it.
-    const dispatched = Math.max(reportedTotal, batch.sourceTotal ?? 0);
-    if (isEmptyDispatchedPull(records.length, dispatched) && jobFinishedDialling(sourceJob)) {
-      log().error(
-        {
-          batchId,
-          selType: batch.selType,
-          channel: batch.channel,
-          dispatched,
-          sourceId: batch.sourceId,
-          sourceStatus: sourceJob?.status ?? null,
-        },
-        "[worker] upstream returned no records for a batch it reports as dispatched",
-      );
-      throw new Error(
-        `no records returned for ${batchId}: upstream reports ${dispatched} dispatched contacts ` +
-          `but returned no records for this ${batch.selType} batch`,
-      );
-    }
-    // Completeness: fewer UNIQUE records than the list surface itself counts.
-    // Core pages its lists with LIMIT/OFFSET over a non-unique `created_at`, so
-    // tied rows reshuffle between page reads — duplicates on one page, silent
-    // omissions on another, while the fetched row count still equals `total`.
-    // Deduping hides the duplicates and publishing then hides the loss: an
-    // 8,232-call campaign was served as 8,038 rows under a green label, in every
-    // CSV and chart built from it. So a short pull of a job that has finished
-    // dialling (rows no longer appear, so the COUNT is not running ahead) is
-    // re-pulled — into the SAME revision, so passes union and each one can only
-    // shrink the gap — and if it is still short it is refused rather than
-    // published. The previous published revision, if any, stays served; the
-    // job carries the error; `failBatchIfOwned` resolves the batch to "error"
-    // (nothing published) or "stale" (so the next refresh is not skipped).
-    //
-    // Not keyed on duplicates: duplicates with a complete union are harmless,
-    // and a loss can occur with none on the final pass. Not applied to a running
-    // job, whose COUNT and pages legitimately move apart: that one publishes
-    // with the warning below and is re-pulled once it finishes (its `updated_at`
-    // moves, so the refresh is not skippable). More unique records than the
-    // total is not loss and never throws.
-    const finished = jobFinishedDialling(sourceJob);
-    if (!(finished && isIncompletePaginatedPull(records.length, listedTotal))) break;
-    const shortfall = {
+  const records = await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision);
+  // Compare Mongo's unique staged rows with the unique source identities that
+  // should exist. Raw pages may legitimately repeat a session id.
+  if (records.length !== expectedRecordIds.size) {
+    throw new Error(
+      `incomplete ingestion for ${batchId}: stored ${records.length} of ${expectedRecordIds.size} unique records fetched`,
+    );
+  }
+  const duplicateRows = offset - expectedRecordIds.size;
+  if (duplicateRows > 0) {
+    log().warn(
+      { batchId, fetchedRows: offset, uniqueRecords: records.length, duplicateRows },
+      "[worker] duplicate upstream record ids deduplicated",
+    );
+  }
+  // Upstream says this campaign dispatched contacts, and pagination returned
+  // nothing at all. Publishing that as a complete revision is what puts a green
+  // "Up to date" over an empty Analytics screen: the batch looks ingested, the
+  // only evidence sits in a warning nobody reads, and the failure then conceals
+  // itself — the empty revision commits, `total` collapses to the ingested 0,
+  // and the next run has no figure left to notice the gap with. `sourceTotal`
+  // is read alongside `reportedTotal` for exactly that reason: it survives a
+  // commit, so a batch already poisoned by an earlier empty publish is still
+  // caught here.
+  //
+  // Only for a job we can prove finished dialling: `jobFinishedDialling`
+  // keeps a still-running, cancelled or unreadable job out of this entirely,
+  // because reporting "Sync failed" on a campaign the customer has only just
+  // launched, or deliberately cancelled, is a worse bug than the one being
+  // fixed. A resumed batch has staged rows and so does not reach
+  // `records.length === 0`; fetching the job on resume (for dispatch_type) does
+  // not change that. It is checked before the completeness decision below.
+  //
+  // Throwing marks a never-ingested batch "error", and — for a batch already
+  // poisoned by an earlier empty publish — `failBatchIfOwned` recognises that
+  // its published revision is this same fault and errors it too rather than
+  // resolving it back to "ready". Any other published revision stays readable,
+  // because a failed refresh has not invalidated the good data behind it.
+  const dispatched = Math.max(reportedTotal, batch.sourceTotal ?? 0);
+  if (isEmptyDispatchedPull(records.length, dispatched) && jobFinishedDialling(sourceJob)) {
+    log().error(
+      {
+        batchId,
+        selType: batch.selType,
+        channel: batch.channel,
+        dispatched,
+        sourceId: batch.sourceId,
+        sourceStatus: sourceJob?.status ?? null,
+      },
+      "[worker] upstream returned no records for a batch it reports as dispatched",
+    );
+    throw new Error(
+      `no records returned for ${batchId}: upstream reports ${dispatched} dispatched contacts ` +
+        `but returned no records for this ${batch.selType} batch`,
+    );
+  }
+  // Completeness: fewer UNIQUE records than the list surface itself counts.
+  //
+  // Core pages its lists with LIMIT/OFFSET ordered by a non-unique `created_at`
+  // (a dispatch chunk is one multi-row INSERT, so its rows share a timestamp).
+  // Postgres then sorts each page with a top-N heapsort whose bound is
+  // OFFSET+LIMIT, so the order among tied rows differs from one page request to
+  // the next — and that loses rows DETERMINISTICALLY, with no writes at all:
+  // measured on Postgres 16, 3,600 tied rows paged 100 at a time came back as
+  // 3,584 unique, identical on every pass, and the union of three passes was
+  // still 3,584. Concurrent UPDATEs (status callbacks) are a secondary cause.
+  // The raw row count still equals `total`, so deduping hides the duplicates
+  // and publishing then hides the loss: an 8,232-call campaign was served as
+  // 8,038 rows under a green label. Re-pulling cannot fix that, so this makes
+  // ONE pass and decides what to serve.
+  //
+  // Only for a job whose row set has stopped growing (`jobStoppedAddingRows`):
+  // while upstream is still dispatching, the COUNT and the pages legitimately
+  // move apart, so a short pull there is published as before, stamped short
+  // (so the next refresh re-pulls it) and flagged nowhere.
+  //
+  // Not keyed on duplicates: duplicates with a complete set are harmless, and
+  // loss can occur on a pass with none. More unique records than the total is
+  // not loss — rows can only have been added between the COUNT and the pages.
+  //
+  // A short pull fails nothing. If readers are already served a revision that
+  // holds MORE records, that one is kept, the batch is marked stale with the
+  // shortfall recorded, and the job moves on to its other batches. Otherwise —
+  // a first-ever pull, or a refresh over a revision no fuller than this one —
+  // the short pull is published, flagged with the same record, because a
+  // partial dataset with "N of M" on it beats no dataset for a customer who
+  // cannot be made to wait for an upstream deploy. Either way the job reports a
+  // warning, `BatchDoc.shortPull` puts the shortfall in front of every reader,
+  // and `needsCompletenessRepull` keeps the batch re-pullable; the first
+  // complete pull clears it.
+  let shortPull: PullShortfall | null = null;
+  let shortfallWarning: JobWarning | undefined;
+  if (jobStoppedAddingRows(sourceJob) && isIncompletePaginatedPull(records.length, listedTotal)) {
+    const listed = listedTotal ?? 0;
+    // `batch.total` is the served revision's record count once one is
+    // readable. Strictly greater: on a tie the fresh pull wins, since it holds
+    // as many records with newer statuses. The empty-pull fault revision has a
+    // total of 0 and so can never be kept over anything.
+    const keptPrevious = isBatchReadable(batch) && batch.total > records.length;
+    shortPull = { listed, received: records.length, keptPrevious, detectedAt: new Date().toISOString() };
+    const shortfallLog = {
       jobId,
       batchId,
       sourceId: batch.sourceId,
       dispatchType,
       sourceStatus: sourceJob?.status ?? null,
-      listedTotal,
+      listedTotal: listed,
       uniqueRecords: records.length,
-      missingRecords: (listedTotal ?? 0) - records.length,
+      missingRecords: listed - records.length,
       duplicateRows,
-      attempt,
-      maxAttempts: MAX_PULL_ATTEMPTS,
+      servedRecords: keptPrevious ? batch.total : records.length,
+      keptPrevious,
     };
-    if (attempt >= MAX_PULL_ATTEMPTS) {
-      log().error(shortfall, "[worker] paginated pull still short of upstream's total; refusing to publish");
-      throw new Error(
-        `incomplete upstream data for ${batchId}: upstream lists ${listedTotal} records but returned ` +
-          `${records.length} unique ones after ${attempt} attempts (${shortfall.missingRecords} missing, ` +
-          `${duplicateRows} duplicated). Nothing was published, so any previously loaded data for this ` +
-          `batch is unchanged. Try again later.`,
-      );
+    const warning: JobWarning = {
+      kind: "incomplete_upstream",
+      batchId,
+      name: batch.name ?? batchId,
+      listed,
+      received: records.length,
+      keptPrevious,
+      served: keptPrevious ? batch.total : records.length,
+      message: shortfallMessage(batch.name ?? batchId, shortPull),
+    };
+    if (keptPrevious) {
+      log().warn(shortfallLog, "[worker] paginated pull came back short of upstream's total; keeping the fuller published revision");
+      if (!(await keepPublishedRevisionIfOwned(ctx.tenantId, ctx.accountId, batchId, jobId, leaseId, shortPull))) {
+        throw new Error("job lease lost while keeping the published revision");
+      }
+      // The staged copy is never going to be published. Guarded for the one
+      // case where it already is (a resumed job re-reading its own revision).
+      if (batch.publishedRevision !== revision) {
+        await deleteBatchRevisionRecords(ctx.tenantId, ctx.accountId, batchId, revision).catch((error) => {
+          log().warn({ error, batchId }, "[worker] unpublished short revision cleanup deferred to the orphan sweep");
+        });
+      }
+      const done = completedDone + batch.total;
+      const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
+      if (!transitioned) throw new Error("job lease lost during batch transition");
+      return { done, warning };
     }
-    log().warn(shortfall, "[worker] paginated pull came back short of upstream's total; re-pulling");
-    await sleep(PULL_RETRY_DELAY_MS);
-    offset = 0;
+    log().warn(shortfallLog, "[worker] paginated pull came back short of upstream's total; publishing it flagged incomplete");
+    shortfallWarning = warning;
   }
   if (reportedTotal !== records.length) {
     log().warn(
@@ -786,10 +856,19 @@ async function ingestBatch(
     ingestedSourceUpdatedAt: sourceUpdatedAt,
     // What the list surface counted for this pull, so the published revision
     // can later be judged complete or not (publishedRevisionMayBeShort). A
-    // finished job only reaches here when it is not short; a running one may.
-    ingestedListedTotal: listedTotal,
+    // surface that reported no total made no claim of loss, so the pull is
+    // stamped with what it returned rather than left unstamped: unstamped
+    // falls back to the contact count, which a partially-failed campaign never
+    // reaches, and the batch would then be re-pulled on every merge forever.
+    ingestedListedTotal: listedTotal ?? records.length,
+    // Null on a complete pull, which is what clears a previous flag.
+    shortPull,
     publishedRevision: revision,
-    ingestStatus: "ready",
+    // A revision that may be short reads "stale" from the moment it is
+    // published rather than waiting for the next listing to say so: readable,
+    // and never skipped by a refresh.
+    ingestStatus:
+      shortPull || isIncompletePaginatedPull(records.length, listedTotal) ? "stale" : "ready",
     total: records.length,
   });
   // Prove ownership immediately before publication. The conditional batch
@@ -833,5 +912,5 @@ async function ingestBatch(
   const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
   if (!transitioned) throw new Error("job lease lost during batch transition");
   log().info({ batchId, records: records.length, durationMs: Date.now() - startedAt }, "[worker] batch ingested");
-  return done;
+  return { done, warning: shortfallWarning };
 }
