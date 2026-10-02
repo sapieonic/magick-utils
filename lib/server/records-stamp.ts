@@ -23,7 +23,7 @@ import { fingerprint, stableJson } from "./fingerprint";
  *
  * `null` whenever master reports `records_updated_at` as unknown (`null` or
  * absent: an older master or core, a failed read, a batch with no settled
- * stamp, a surface that does not compute it — messaging, today). Null never
+ * stamp, or an older core that does not compute it on that surface). Null never
  * matches anything, including another null.
  *
  * The literal version tag keeps a future change in what this covers from ever

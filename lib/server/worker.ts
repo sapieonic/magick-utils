@@ -509,9 +509,11 @@ async function ingestBatch(
   // page leaves it behind and the next refresh re-pulls. Reading it after the
   // pull would be the one unsafe order: a write landing between our last page
   // and that read would be in the stamp but not in the records, and the next
-  // refresh would skip it forever. A value master served from its few-second
-  // cache is only ever OLDER than the truth, which errs toward a redundant
-  // re-pull. Only a pull that starts at offset 0 gets one: a resumed job would
+  // refresh would skip it forever. Master serves this from a few-second cache:
+  // a cached value is never newer than the truth, so what we stamp here cannot
+  // claim a change we did not pull — but the COMPARING read in the ingest route
+  // can see an older value too, and skip a write made in the last few seconds
+  // until the next refresh. Bounded by master's cache TTL, not zero. Only a pull that starts at offset 0 gets one: a resumed job would
   // be reading the stamp after its pause, and would then claim to include
   // changes made during that pause. A null stamp simply means the batch never
   // qualifies for a skip, which is the safe direction.
