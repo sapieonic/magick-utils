@@ -458,4 +458,58 @@ describe("Analytics page incomplete upstream data", () => {
     expect(await screen.findByText(/Ingestion failed: upstream 500/)).toBeInTheDocument();
     expect(screen.getByText("8,038")).toBeInTheDocument();
   });
+  // A job can record a short pull and then fail on a later batch. The warning
+  // still describes data the charts serve, so the error must not swallow it.
+  it("surfaces a shortfall warning from a job that then failed", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: "job-1", total: 10, done: 0, ready: false });
+    vi.mocked(getJob).mockResolvedValue(
+      job({
+        status: "error", error: "upstream 500", batchIds: ["b1"],
+        warnings: [{
+          kind: "incomplete_upstream", batchId: "b1", name: "Campaign one", listed: 8232, received: 8038,
+          keptPrevious: false, served: 8038,
+          message: 'Upstream returned 8,038 of 8,232 records for "Campaign one"; only those records are included.',
+        }],
+      }),
+    );
+    render(<Page />);
+
+    expect(await screen.findByText(/Ingestion failed: upstream 500/)).toBeInTheDocument();
+    expect(await screen.findByText("Upstream returned incomplete data")).toBeInTheDocument();
+    expect(screen.getByText(/Upstream returned 8,038 of 8,232 records for "Campaign one"/)).toBeInTheDocument();
+  });
+
+  // ...and a failed job reached only some batches, so the listing still
+  // speaks for the ones it did not, even though they are in `batchIds`.
+  it("keeps listing shortfalls for batches a failed job did not report on", async () => {
+    mockCampaigns({
+      batches: [{ ...campaign, shortfall: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "x" } }],
+      source: "live",
+    });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: "job-1", total: 10, done: 0, ready: false });
+    vi.mocked(getJob).mockResolvedValue(job({ status: "error", error: "upstream 500", batchIds: ["b1"], warnings: [] }));
+    render(<Page />);
+
+    expect(await screen.findByText(/Ingestion failed: upstream 500/)).toBeInTheDocument();
+    expect(screen.getByText(/previously loaded data, which holds more records, was kept/)).toBeInTheDocument();
+  });
+
+  // Two campaigns may share a name, and so a message; keyed by message, React
+  // collapsed them into one row (with a duplicate-key warning).
+  it("lists one row per batch even when two shortfall messages are identical", async () => {
+    appState.analyzeTargets = ["b1", "b2"];
+    const shortfall = { listed: 8232, received: 8038, keptPrevious: false, detectedAt: "x" };
+    mockCampaigns({
+      batches: [{ ...campaign, shortfall }, { ...campaign, id: "b2", batchId: "AI-2", shortfall }],
+      source: "live",
+    });
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<Page />);
+
+    expect(await screen.findByText("Upstream returned incomplete data")).toBeInTheDocument();
+    expect(screen.getAllByText(/Upstream returned 8,038 of 8,232 records for "Campaign one"/)).toHaveLength(2);
+    expect(consoleError.mock.calls.some((call) => String(call[0]).includes("same key"))).toBe(false);
+    consoleError.mockRestore();
+  });
 });

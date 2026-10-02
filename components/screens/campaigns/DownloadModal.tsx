@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Button, Icon, JobProgress, Modal } from "@/components/ui";
 import { fmtNum, selType } from "@/lib/data";
 import { createIngestJob, downloadCsv, getJob } from "@/lib/api";
+import { resolveExportFacts, type ExportFacts } from "@/lib/export-facts";
 import type { Batch } from "@/lib/types";
 import { ColumnPicker, relevantGroups } from "./ColumnPicker";
 
@@ -25,6 +26,26 @@ export function DownloadModal({
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  // What the prepared CSV actually holds, read back once preparation finishes.
+  // Until then (and in demo mode, or if the read fails) the listing's figure
+  // stands in — which for a batch never ingested is its dispatched contact
+  // count, not a row count, so it must not be the final word.
+  const [facts, setFacts] = useState<ExportFacts | null>(null);
+
+  useEffect(() => {
+    if (phase !== "done") return;
+    let alive = true;
+    resolveExportFacts([campaign.id])
+      .then((resolved) => {
+        if (alive && resolved) setFacts(resolved);
+      })
+      .catch(() => {
+        // keep the estimate
+      });
+    return () => {
+      alive = false;
+    };
+  }, [phase, campaign.id]);
 
   useEffect(() => {
     if (phase !== "working" || !jobId) return;
@@ -68,6 +89,7 @@ export function DownloadModal({
   const prepare = async () => {
     setError(null);
     setProg(0);
+    setFacts(null);
     setPhase("working");
     try {
       const result = await createIngestJob([campaign.id], "merge");
@@ -98,6 +120,9 @@ export function DownloadModal({
 
   const total = campaign.total;
   const rows = Math.round((prog / 100) * total);
+  const exportedRows = facts?.rows ?? total;
+  const missing = facts?.missing ?? 0;
+  const kept = facts?.kept ?? 0;
 
   return (
     <Modal
@@ -174,9 +199,29 @@ export function DownloadModal({
             <Icon name="FileSpreadsheet" size={28} />
           </div>
           <div className="text-[15px] font-bold text-slate-800">{campaign.batchId}.csv</div>
-          <div className="text-sm text-slate-400 mt-1">
-            {fmtNum(total)} rows · {selected.size} columns · ~{((total * selected.size * 0.018) / 1024).toFixed(1)} MB
+          <div className="text-sm text-slate-400 mt-1" data-testid="download-row-count">
+            {fmtNum(exportedRows)} rows
+            {missing > 0 && (
+              <span className="font-semibold text-amber-700"> — {fmtNum(missing)} fewer than upstream lists</span>
+            )}{" "}
+            · {selected.size} columns · ~{((exportedRows * selected.size * 0.018) / 1024).toFixed(1)} MB
           </div>
+          {/* Never silent: a short CSV under "Export complete" is the defect
+              this exists to prevent. Same two facts Combine states. */}
+          {(missing > 0 || kept > 0) && (
+            <div
+              role="status"
+              className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-left text-[12.5px] text-amber-800"
+            >
+              <Icon name="TriangleAlert" size={14} className="mt-0.5 shrink-0" />
+              <span>
+                Upstream returned incomplete data.
+                {missing > 0 && ` The file is missing ${fmtNum(missing)} records upstream lists for this campaign.`}
+                {kept > 0 && " This campaign could not be refreshed, so the file holds the records loaded earlier."}{" "}
+                Download again later to re-pull.
+              </span>
+            </div>
+          )}
           <div className="mt-4 inline-flex items-center gap-1.5 text-[13px] font-semibold text-emerald-600">
             <Icon name="CircleCheck" size={15} /> Export complete
           </div>

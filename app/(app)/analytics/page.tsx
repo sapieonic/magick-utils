@@ -155,13 +155,14 @@ export default function Page() {
   // 8,232 records under "Up to date" is the defect this exists to prevent. The
   // job that just ran is authoritative for the batches it pulled — its pull may
   // have closed the gap the listing reported — and the listing for the rest.
-  const shortfalls = useMemo<string[]>(() => {
+  // Keyed by batch id: two batches can share a name, and so a message.
+  const shortfalls = useMemo<Array<{ batchId: string; message: string }>>(() => {
     const warnings = jobOutcome?.warnings ?? [];
     const covered = new Set([...(jobOutcome?.batchIds ?? []), ...warnings.map((w) => w.batchId)]);
     const fromListing = targets
       .filter((t) => t.shortfall && !covered.has(t.id))
-      .map((t) => shortfallMessage(t.name, t.shortfall!));
-    return [...warnings.map((w) => w.message), ...fromListing];
+      .map((t) => ({ batchId: t.id, message: shortfallMessage(t.name, t.shortfall!) }));
+    return [...warnings.map((w) => ({ batchId: w.batchId, message: w.message })), ...fromListing];
   }, [jobOutcome, targets]);
 
   const [tab, setTab] = useState("overview");
@@ -252,6 +253,12 @@ export default function Page() {
             return;
           }
           if (job.status === "error") {
+            // A job can find a short pull and THEN fail on a later batch. The
+            // warning was written as it happened and still describes data the
+            // charts below serve, so it is surfaced here too — but with no
+            // `batchIds`, because a failed job did not reach every batch and
+            // must not hide what the listing says about the ones it skipped.
+            setJobOutcome({ warnings: job.warnings ?? [], batchIds: null });
             writeAnalyticsJob(idsKey, null);
             setIngestError(job.error || "Ingestion failed");
             setIngest(100);
@@ -545,8 +552,8 @@ export default function Page() {
           <div>
             <div className="font-semibold">Upstream returned incomplete data</div>
             <ul className="mt-1 space-y-0.5">
-              {shortfalls.map((message) => (
-                <li key={message}>{message}</li>
+              {shortfalls.map(({ batchId, message }, index) => (
+                <li key={`${batchId}:${index}`}>{message}</li>
               ))}
             </ul>
           </div>

@@ -31,9 +31,8 @@ import {
   isJobNotFound,
   jobProgressPercent,
   listCampaigns,
-  listCampaignsByIds,
 } from "@/lib/api";
-import { selectionShortfall } from "@/lib/shortfall";
+import { resolveExportFacts } from "@/lib/export-facts";
 import { useApp } from "@/lib/store";
 import { formatAppClock } from "@/lib/timezone";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
@@ -63,33 +62,6 @@ type PreparedExport = {
    *  is what the CSV holds for them. */
   keptBatches?: number;
 };
-
-type ExportFacts = { rows: number; missing: number; kept: number };
-
-/** The exact row count of a prepared export, and how it falls short of
- *  upstream, or null when it cannot be stated.
- *
- *  Once a batch is readable its `total` IS its published record count (the
- *  ingest route re-pulls any batch whose stored count disagrees), and the CSV
- *  streams exactly those records. The merge job's own `result.rowCount` is not
- *  usable here: it counts only the batches that job re-pulled, so a selection
- *  that was partly ingested already would be under-reported. Every batch must
- *  come back readable, or the figure would quietly describe a subset.
- *
- *  Read after the merge finished, so each batch's `shortfall` reflects the pull
- *  that merge just made — a merge re-pulls any batch that may be incomplete. */
-async function resolveExportFacts(batchIds: string[]): Promise<ExportFacts | null> {
-  const { batches, source } = await listCampaignsByIds(batchIds);
-  if (source !== "live") return null;
-  const selected: Batch[] = [];
-  for (const id of batchIds) {
-    const found = batches.find((batch) => batch.id === id);
-    if (!found || (found.ingestStatus !== "ready" && found.ingestStatus !== "stale")) return null;
-    selected.push(found);
-  }
-  const { missing, kept } = selectionShortfall(selected);
-  return { rows: selected.reduce((sum, batch) => sum + batch.total, 0), missing, kept };
-}
 
 function readPrepared(): PreparedExport | null {
   if (typeof window === "undefined") return null;
