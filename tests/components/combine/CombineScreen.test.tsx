@@ -80,6 +80,54 @@ describe("CombineScreen — completed download flow", () => {
     expect(listCampaignsByIds).toHaveBeenCalledWith(["b1", "b2"]);
   });
 
+  // The incident: a short batch under a green "Download ready" with nothing to
+  // say rows were missing. The label must name the gap.
+  it("warns when a selected batch's served revision is known short", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    vi.mocked(listCampaignsByIds).mockResolvedValue({
+      batches: [
+        { ...batch("b1"), total: 8038, ingestStatus: "stale",
+          shortfall: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" } },
+        { ...batch("b2"), total: 0 },
+      ],
+      source: "live",
+    });
+    render(<CombineScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
+    expect(await screen.findByText(/8,038 rows/)).toBeInTheDocument();
+    expect(screen.getByText(/194 fewer than upstream lists/)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/Upstream returned incomplete data\. The file is missing 194 records/);
+  });
+
+  it("says when a batch could not be refreshed and the file holds earlier data", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    vi.mocked(listCampaignsByIds).mockResolvedValue({
+      batches: [
+        // The kept revision holds every record upstream lists; only the latest
+        // pull was short. Nothing is missing, but the file is not current.
+        { ...batch("b1"), total: 8232, ingestStatus: "stale",
+          shortfall: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" } },
+        batch("b2"),
+      ],
+      source: "live",
+    });
+    render(<CombineScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
+    expect(await screen.findByRole("status")).toHaveTextContent(/1 batch could not be refreshed/);
+    expect(screen.queryByText(/fewer than upstream lists/)).not.toBeInTheDocument();
+  });
+
+  it("shows no warning for a complete selection", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    render(<CombineScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
+    expect(await screen.findByText(/combined_export_2_batches\.csv · 20 rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/Upstream returned incomplete data/)).not.toBeInTheDocument();
+  });
+
   it("keeps the estimate when a selected batch is not readable yet", async () => {
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
     vi.mocked(listCampaignsByIds).mockResolvedValue({

@@ -33,6 +33,7 @@ import {
   listCampaigns,
   listCampaignsByIds,
 } from "@/lib/api";
+import { selectionShortfall } from "@/lib/shortfall";
 import { useApp } from "@/lib/store";
 import { formatAppClock } from "@/lib/timezone";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
@@ -55,26 +56,39 @@ type PreparedExport = {
   batchCount: number;
   /** Rows the CSV will actually hold, resolved once preparation finished. */
   exportedRows?: number;
+  /** Records the CSV lacks against upstream's own count, for batches whose
+   *  served revision is known short. */
+  missingRows?: number;
+  /** Batches whose latest pull came back short, so an earlier, fuller revision
+   *  is what the CSV holds for them. */
+  keptBatches?: number;
 };
 
-/** The exact row count of a prepared export, or null when it cannot be stated.
+type ExportFacts = { rows: number; missing: number; kept: number };
+
+/** The exact row count of a prepared export, and how it falls short of
+ *  upstream, or null when it cannot be stated.
  *
  *  Once a batch is readable its `total` IS its published record count (the
  *  ingest route re-pulls any batch whose stored count disagrees), and the CSV
  *  streams exactly those records. The merge job's own `result.rowCount` is not
  *  usable here: it counts only the batches that job re-pulled, so a selection
  *  that was partly ingested already would be under-reported. Every batch must
- *  come back readable, or the figure would quietly describe a subset. */
-async function resolveExportedRows(batchIds: string[]): Promise<number | null> {
+ *  come back readable, or the figure would quietly describe a subset.
+ *
+ *  Read after the merge finished, so each batch's `shortfall` reflects the pull
+ *  that merge just made — a merge re-pulls any batch that may be incomplete. */
+async function resolveExportFacts(batchIds: string[]): Promise<ExportFacts | null> {
   const { batches, source } = await listCampaignsByIds(batchIds);
   if (source !== "live") return null;
-  let rows = 0;
+  const selected: Batch[] = [];
   for (const id of batchIds) {
     const found = batches.find((batch) => batch.id === id);
     if (!found || (found.ingestStatus !== "ready" && found.ingestStatus !== "stale")) return null;
-    rows += found.total;
+    selected.push(found);
   }
-  return rows;
+  const { missing, kept } = selectionShortfall(selected);
+  return { rows: selected.reduce((sum, batch) => sum + batch.total, 0), missing, kept };
 }
 
 function readPrepared(): PreparedExport | null {
@@ -148,11 +162,13 @@ export function CombineScreen() {
   useEffect(() => {
     if (!needsExportedRows) return;
     let alive = true;
-    resolveExportedRows(preparedIds.split(","))
-      .then((rows) => {
-        if (!alive || rows == null) return;
+    resolveExportFacts(preparedIds.split(","))
+      .then((facts) => {
+        if (!alive || facts == null) return;
         setPrepared((current) =>
-          current && current.batchIds.join(",") === preparedIds ? { ...current, exportedRows: rows } : current,
+          current && current.batchIds.join(",") === preparedIds
+            ? { ...current, exportedRows: facts.rows, missingRows: facts.missing, keptBatches: facts.kept }
+            : current,
         );
       })
       .catch(() => {
@@ -661,7 +677,32 @@ export function CombineScreen() {
                     <div className="text-[13px] text-slate-500 mb-3">
                       combined_export_{prepared?.batchCount ?? campaigns.length}_batches.csv ·{" "}
                       {fmtNum(prepared?.exportedRows ?? prepared?.totalRows ?? totalRows)} rows
+                      {(prepared?.missingRows ?? 0) > 0 && (
+                        <span className="font-semibold text-amber-700">
+                          {" "}— {fmtNum(prepared!.missingRows!)} fewer than upstream lists
+                        </span>
+                      )}
                     </div>
+                    {/* Never silent: a short CSV under a green "ready" is the
+                        defect this exists to prevent. Two separate facts — rows
+                        missing from the file, and batches whose latest pull was
+                        short so the file holds earlier data for them. */}
+                    {((prepared?.missingRows ?? 0) > 0 || (prepared?.keptBatches ?? 0) > 0) && (
+                      <div
+                        role="status"
+                        className="mb-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-[12.5px] text-amber-800"
+                      >
+                        <Icon name="TriangleAlert" size={14} className="mt-0.5 shrink-0" />
+                        <span>
+                          Upstream returned incomplete data.
+                          {(prepared?.missingRows ?? 0) > 0 &&
+                            ` The file is missing ${fmtNum(prepared!.missingRows!)} records upstream lists for these campaigns.`}
+                          {(prepared?.keptBatches ?? 0) > 0 &&
+                            ` ${fmtNum(prepared!.keptBatches!)} ${prepared!.keptBatches === 1 ? "batch" : "batches"} could not be refreshed, so the file holds the records loaded earlier.`}
+                          {" "}Generate again later to re-pull.
+                        </span>
+                      </div>
+                    )}
                     <div className="flex gap-2">
                       <Button
                         className="flex-1"
