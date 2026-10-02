@@ -98,6 +98,9 @@ describe("CombineScreen — completed download flow", () => {
     expect(await screen.findByText(/8,038 rows/)).toBeInTheDocument();
     expect(screen.getByText(/194 fewer than upstream lists/)).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(/Upstream returned incomplete data\. The file is missing 194 records/);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /Generate again after 15 minutes to re-pull, or use Refresh data in Analytics to re-pull now\./,
+    );
   });
 
   it("says when a batch could not be refreshed and the file holds earlier data", async () => {

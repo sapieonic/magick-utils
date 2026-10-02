@@ -16,6 +16,32 @@ export interface ShortfallFacts {
 
 const fmt = (n: number) => n.toLocaleString("en-US");
 
+/** How long after a short pull was last observed a MERGE serves the flagged
+ *  revision instead of re-pulling it.
+ *
+ *  Against a core that pages over a non-unique `created_at`, the loss is
+ *  deterministic, so a re-pull inside this window returns the same short set
+ *  and buys nothing but upstream load — a full re-page of every flagged batch
+ *  on each Generate or per-campaign download, from one host against master's
+ *  global per-IP limit (~83 page requests for an 8k-record selection). Fifteen
+ *  minutes is long enough that clicking Generate again does not re-page, and
+ *  short enough that a re-export soon after core's fix lands is still re-pulled
+ *  without anyone having to know to press Refresh. An explicit Analytics
+ *  Refresh ignores it: that is the customer asking for exactly this work.
+ *
+ *  Lives here, not in lib/server, because the download surfaces quote it
+ *  (`repullHint`) and must not promise a re-pull sooner than a merge does one. */
+export const SHORT_PULL_REPULL_COOLDOWN_MS = 15 * 60_000;
+
+/** What a customer can do about an incomplete download, in words that agree
+ *  with what the merge will actually do: within the cooldown another download
+ *  or Generate serves the same flagged data, so "try again later" without a
+ *  time sends them round a loop; Analytics' Refresh data ignores the cooldown. */
+export function repullHint(action: "Download" | "Generate"): string {
+  const minutes = Math.round(SHORT_PULL_REPULL_COOLDOWN_MS / 60_000);
+  return `${action} again after ${minutes} minutes to re-pull, or use Refresh data in Analytics to re-pull now.`;
+}
+
 /** Says what happened, what readers now see because of it, and what closes it. */
 export function shortfallMessage(name: string, shortfall: ShortfallFacts): string {
   const head = `Upstream returned ${fmt(shortfall.received)} of ${fmt(shortfall.listed)} records for "${name}"`;

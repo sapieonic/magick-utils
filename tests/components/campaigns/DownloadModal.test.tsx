@@ -103,6 +103,12 @@ describe("DownloadModal", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       /Upstream returned incomplete data\. The file is missing 194 records upstream lists for this campaign\./,
     );
+    // Within the merge cooldown another download serves the same data, so the
+    // copy names the wait and the control that skips it — never a bare "later".
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /Download again after 15 minutes to re-pull, or use Refresh data in Analytics to re-pull now\./,
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent(/again later/);
   });
 
   it("says when the file holds an earlier revision because the latest pull was short", async () => {

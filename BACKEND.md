@@ -39,6 +39,8 @@ the worker when the backend is configured.
 - `call-analysis.ts` — fills the Conversation tab's Sentiment and Key topics from core's rollup,
   because the records cannot carry them (see *Sentiment and key topics* below).
 - `fingerprint.ts` — stable hashes for cache keys / change detection.
+- `record-fingerprint.ts` — content fingerprint of a record set (`BatchDoc.fingerprint`); covers every
+  reader-visible field (see *Pull completeness*).
 - `llm/` — `getLLM()` factory + `OpenAICompatibleProvider` (DeepSeek/Kimi/OpenRouter/vLLM/Ollama) and
   `AnthropicProvider`; `complete`/`stream`/`structured` (Zod-validated, retry-on-parse-fail). `INSIGHT_SCHEMA`.
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
@@ -274,7 +276,30 @@ duplicate dataset per merge, download or Refresh to change nothing a reader can 
 Generate for the selection that surfaced this). A tie is keyed on the content fingerprint rather than
 the count alone because a finished job's rows can still change (statuses, receipts, costs, post-call
 fields); a tie that carries such a change is published, and once upstream stops changing the next tie
-is identical and writes nothing. `keptPrevious` stays `false` there — readers see exactly this pull's
+is identical and writes nothing.
+
+**What the content fingerprint covers** (`recordsContentFingerprint`, `lib/server/record-fingerprint.ts`):
+every field of every record — every export column, everything aggregates/analytics/chat/insights read,
+and the whole `raw` payload — except storage metadata that differs between two copies of identical data:
+`revision`, `revisionCreatedAt`, `retiredAt`, the per-record `fingerprint` stamp, and Mongo's `_id`. It
+is a canonical serialization of the record (keys sorted at every level, `null`/`undefined`/absent treated
+as one value as a Mongo round trip does, Dates as instants, array order kept), hashed per record and
+order-independent across records. The exclusions are an explicit table,
+`NORMALIZED_RECORD_FIELD_ROLES`, which `satisfies` keeps exhaustive over `NormalizedRecord`: a new field
+fails `tsc` until it is classified, and a key the table has never heard of is fingerprinted rather than
+dropped. It used to be a hand-picked field list (status, costs, durations, sentiment, topics, reply
+text), which left out `recordingUrl`, `transcript`, `conversationSummary`, `outcome`, `timestamp`,
+receipts, IVR fields and more — so a recording or transcript arriving after the campaign finished made
+the next short tie read "identical", kept the batch stale and stamped it current. Covering `raw` whole
+has one cost: a per-request value in an upstream list row (a signed URL, a "now") would make every tie
+publish again — wasted storage, never stale data; exclude such a key by name in that table.
+
+The formula change makes every batch's stored `fingerprint` (written by the old formula) unequal to its
+next pull's, so each flagged batch **publishes once more** on its first short re-pull after the deploy
+and matches from then on; the dataset-keyed aggregate and insight caches for those selections recompute
+once with it. Nothing else compares this value: `datasetFingerprint` only folds it into cache keys, and
+the listing only preserves it. The source-freshness skip uses `ingestedSourceFingerprint` /
+`ingestedSourceUpdatedAt`, which this does not touch, so no refresh/skip loop can result. `keptPrevious` stays `false` there — readers see exactly this pull's
 records — so nothing reports "earlier data" for it. A first pull is published rather than
 refused because a brand-new customer would otherwise see nothing at all until core deploys, while a
 partial dataset labelled "N of M" is both usable and honest. Keeping a fuller revision beats replacing
@@ -291,7 +316,10 @@ warnings for the batches it pulled and the listing for the rest — including wa
 went on to fail on a later batch, since those still describe data the charts serve. Combine's "Download
 ready" label and the per-campaign download's "Your CSV is ready" state the rows the file lacks against
 upstream's count ("8,038 rows — 194 fewer than upstream lists") and, separately, whether the file holds
-earlier data because the latest pull could not refresh it. The CSV itself carries no marker.
+earlier data because the latest pull could not refresh it, and when another download or Generate
+will actually re-pull (`repullHint`, quoting `SHORT_PULL_REPULL_COOLDOWN_MS`) or that Analytics'
+Refresh data does so now — "try again later" with no time sent customers round the cooldown. The CSV
+itself carries no marker.
 
 **Convergence.** `needsCompletenessRepull` (`shortPull` set, or `publishedRevisionMayBeShort`) is the
 shared predicate, and every place that has to agree uses it: the campaigns listing and

@@ -5,6 +5,7 @@ import { Button, Icon, JobProgress, Modal } from "@/components/ui";
 import { fmtNum, selType } from "@/lib/data";
 import { createIngestJob, downloadCsv, getJob } from "@/lib/api";
 import { resolveExportFacts, type ExportFacts } from "@/lib/export-facts";
+import { repullHint } from "@/lib/shortfall";
 import type { Batch } from "@/lib/types";
 import { ColumnPicker, relevantGroups } from "./ColumnPicker";
 
@@ -218,7 +219,7 @@ export function DownloadModal({
                 Upstream returned incomplete data.
                 {missing > 0 && ` The file is missing ${fmtNum(missing)} records upstream lists for this campaign.`}
                 {kept > 0 && " This campaign could not be refreshed, so the file holds the records loaded earlier."}{" "}
-                Download again later to re-pull.
+                {repullHint("Download")}
               </span>
             </div>
           )}

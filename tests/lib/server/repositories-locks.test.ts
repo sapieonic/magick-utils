@@ -280,7 +280,8 @@ describe("batch worker ownership", () => {
   });
 
   // An identical short re-pull passes the stamps a publish would have written;
-  // an absent stamp must leave the published revision's own value alone.
+  // an undefined stamp leaves the published value alone, an explicit null is
+  // written (a resumed pull cannot vouch for its source timestamp).
   it("writes only the defined built-from stamps when keeping a revision", async () => {
     const shortPull = { listed: 3, received: 2, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" };
     batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 });

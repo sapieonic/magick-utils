@@ -982,12 +982,11 @@ describe("processJob incomplete upstream pull", () => {
       // A fuller kept revision was built from an earlier pull: no stamps from this one.
       undefined,
     );
-    // The staged copy is removed: once when staging began, once after the keep.
+    // The staged copy is removed: once when staging began, once after the keep
+    // (through the variant that re-reads the batch before deleting).
     const b1Deletes = repositories.deleteBatchRevisionRecords.mock.calls.filter((call) => call[2] === "b1");
-    expect(b1Deletes).toEqual([
-      ["t1", "a1", "b1", "j1"],
-      ["t1", "a1", "b1", "j1"],
-    ]);
+    expect(b1Deletes).toEqual([["t1", "a1", "b1", "j1"]]);
+    expect(repositories.deleteUnpublishedBatchRevision).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
     expect(repositories.retireBatchRevision).not.toHaveBeenCalledWith("t1", "a1", "b1", expect.anything());
     // b2 is published normally, with nothing flagged.
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledTimes(1);
@@ -1095,11 +1094,11 @@ describe("processJob incomplete upstream pull", () => {
     // The fresh observation re-arms the merge cooldown.
     const recorded = repositories.keepPublishedRevisionIfOwned.mock.calls[0][5];
     expect(recorded.detectedAt).not.toBe("2026-10-01T00:00:00Z");
-    // Staged copy dropped: once when staging began, once after the keep.
-    expect(repositories.deleteBatchRevisionRecords.mock.calls).toEqual([
-      ["t1", "a1", "b1", "j1"],
-      ["t1", "a1", "b1", "j1"],
-    ]);
+    // Staged copy dropped: unconditionally when staging began, then after the
+    // keep through the variant that re-reads the batch first, so a revision
+    // published since `batch` was read can never be deleted from its readers.
+    expect(repositories.deleteBatchRevisionRecords.mock.calls).toEqual([["t1", "a1", "b1", "j1"]]);
+    expect(repositories.deleteUnpublishedBatchRevision.mock.calls).toEqual([["t1", "a1", "b1", "j1"]]);
     expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
       "j1",
       "lease-1",
@@ -1114,6 +1113,71 @@ describe("processJob incomplete upstream pull", () => {
       expect.objectContaining({ batchId: "b1", unchanged: true }),
       expect.stringMatching(/identical to the published revision; nothing written/),
     );
+  });
+
+  // The skip is only safe if the fingerprint sees everything a reader can: a
+  // recording, a transcript or an outcome that arrives after the campaign
+  // finished changes no status and no cost, and a hand-picked field list that
+  // omitted them kept such a batch stale and stamped it current.
+  it.each([
+    ["recordingUrl", "/api/v1/calls/2/recording"],
+    ["transcript", "agent: hello\nuser: yes"],
+    ["outcome", "promise_to_pay"],
+    ["conversationSummary", "Agreed to pay"],
+    ["deliveredAt", "2026-10-01T00:01:00Z"],
+  ])("publishes a short tie that differs only in %s", async (field, value) => {
+    const before = [
+      { recordId: "1", status: "done", recordingUrl: null, transcript: null, outcome: null },
+      { recordId: "2", status: "done", recordingUrl: null, transcript: null, outcome: null },
+    ];
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue(before);
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+    const publishedFp = repositories.publishBatchIfOwned.mock.calls[0][0].fingerprint as string;
+    vi.clearAllMocks();
+
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 2, fingerprint: publishedFp, ingestStatus: "stale",
+      publishedRevision: "old-rev", shortPull: { listed: 3, received: 2, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" },
+    });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue([before[0], { ...before[1], [field]: value }]);
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned.mock.calls[0][0].fingerprint).not.toBe(publishedFp);
+  });
+
+  // Two copies of identical data never agree on their storage metadata: each
+  // pull stages a new revision, Mongo gives each copy its own _id, and every
+  // record carries the batch fingerprint as of the pull that wrote it. None of
+  // that may break the match, or the skip never fires.
+  it("still writes nothing for an identical tie whose copies differ only in storage metadata", async () => {
+    const content = { status: "done", recordingUrl: "/r", transcript: "t", outcome: "o" };
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue([
+      { _id: "oid-a1", recordId: "1", revision: "rev-a", revisionCreatedAt: new Date(1), fingerprint: "fp", ...content },
+      { _id: "oid-a2", recordId: "2", revision: "rev-a", revisionCreatedAt: new Date(1), fingerprint: "fp", ...content },
+    ]);
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+    const publishedFp = repositories.publishBatchIfOwned.mock.calls[0][0].fingerprint as string;
+    vi.clearAllMocks();
+
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 2, fingerprint: publishedFp, ingestStatus: "stale", publishedRevision: "old-rev",
+    });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue([
+      // Reverse order, new ids/revision/stamp, and null where the first copy
+      // had nothing — what a Mongo round trip of undefined produces.
+      { _id: "oid-b2", recordId: "2", revision: "rev-b", revisionCreatedAt: new Date(2), fingerprint: publishedFp, ...content, dtmfInput: null },
+      { _id: "oid-b1", recordId: "1", revision: "rev-b", revisionCreatedAt: new Date(2), fingerprint: publishedFp, ...content },
+    ]);
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledTimes(1);
   });
 
   // Never-ingested batches cannot be "unchanged": there is nothing readable,

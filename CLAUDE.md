@@ -81,7 +81,8 @@ surface's own `total` (a COUNT over the same rows) is an **incomplete upstream p
 nothing. Upstream pages over a non-unique `created_at`, and Postgres's top-N heapsort loses tied rows
 *deterministically* — same rows every pass, no writes needed — so re-pulling against an unfixed core is
 pure load; the worker makes one pass. It then keeps a readable revision holding MORE records, or one
-IDENTICAL to the pull (same count and content fingerprint — the usual case on a re-pull, so nothing is
+IDENTICAL to the pull (same count and content fingerprint, which covers every reader-visible field —
+`record-fingerprint.ts`; the usual case on a re-pull, so nothing is
 written but the flag), or else publishes the short pull; the batch reads `stale` either way, the worker records
 `BatchDoc.shortPull`, and the job finishes `done` with a `JobWarning` while its other batches publish
 normally. `shortPull` is the only reader-facing statement of the gap (Analytics notice, Combine label,

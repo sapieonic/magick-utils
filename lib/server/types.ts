@@ -3,6 +3,7 @@
 
 import type { BatchShortfall, BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
 import type { AppTimezone } from "@/lib/timezone";
+import { SHORT_PULL_REPULL_COOLDOWN_MS } from "@/lib/shortfall";
 
 /** Whether a batch has a complete published revision that readers can be served.
  *  "stale" qualifies: its records are complete and are what every reader sees,
@@ -92,19 +93,10 @@ export function needsCompletenessRepull(
   return batch.shortPull != null || publishedRevisionMayBeShort(batch);
 }
 
-/** How long after a short pull was last observed a MERGE serves the flagged
- *  revision instead of re-pulling it.
- *
- *  Against a core that pages over a non-unique `created_at`, the loss is
- *  deterministic, so a re-pull inside this window returns the same short set
- *  and buys nothing but upstream load — a full re-page of every flagged batch
- *  on each Generate or per-campaign download, from one host against master's
- *  global per-IP limit (~83 page requests for an 8k-record selection). Fifteen
- *  minutes is long enough that clicking Generate again does not re-page, and
- *  short enough that a re-export soon after core's fix lands is still re-pulled
- *  without anyone having to know to press Refresh. An explicit Analytics
- *  Refresh ignores it: that is the customer asking for exactly this work. */
-export const SHORT_PULL_REPULL_COOLDOWN_MS = 15 * 60_000;
+// SHORT_PULL_REPULL_COOLDOWN_MS is defined in the client-safe `lib/shortfall`
+// so the screens that tell a customer when a re-pull will happen read the same
+// number the merge obeys; re-exported here for server callers.
+export { SHORT_PULL_REPULL_COOLDOWN_MS };
 
 /** Whether a batch's latest short pull was observed within the cooldown, so a
  *  merge should serve it as-is rather than re-page upstream. False when there is

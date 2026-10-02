@@ -34,7 +34,7 @@ import {
 } from "./firebase-token";
 import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
-import { fingerprint } from "./fingerprint";
+import { recordsContentFingerprint } from "./record-fingerprint";
 import {
   isBatchReadable,
   isEmptyDispatchedPull,
@@ -762,28 +762,11 @@ async function ingestBatch(
   // Content fingerprint of exactly what this pull would publish. Computed before
   // the completeness decision because that decision uses it: a short pull whose
   // fingerprint equals the published revision's is the same dataset, and is not
-  // written again (see `unchanged` below).
-  const freshFp = fingerprint([
-    records.length,
-    ...records
-      .sort((a, b) => a.recordId.localeCompare(b.recordId))
-      .map((r) =>
-        JSON.stringify([
-          r.recordId,
-          r.status,
-          r.activityTimestamp,
-          r.raw?.status,
-          r.totalCostInr,
-          r.telephonyCostInr,
-          r.aiCostInr,
-          r.sentiment,
-          r.keyTopics,
-          r.durationSeconds,
-          r.talkTimeSeconds,
-          r.replyText,
-        ]),
-      ),
-  ]);
+  // written again (see `unchanged` below). It covers every field of every
+  // record except storage metadata (see record-fingerprint.ts) — a hand-picked
+  // field list here once left out recording URLs, transcripts and outcomes, so
+  // a recording that arrived after the campaign finished was never delivered.
+  const freshFp = recordsContentFingerprint(records);
   let shortPull: PullShortfall | null = null;
   let shortfallWarning: JobWarning | undefined;
   if (jobStoppedAddingRows(sourceJob) && isIncompletePaginatedPull(records.length, listedTotal)) {
@@ -860,9 +843,13 @@ async function ingestBatch(
         throw new Error("job lease lost while keeping the published revision");
       }
       // The staged copy is never going to be published. Guarded for the one
-      // case where it already is (a resumed job re-reading its own revision).
+      // case where it already is (a resumed job re-reading its own revision):
+      // the in-memory `batch` is a fast path, and `deleteUnpublishedBatchRevision`
+      // re-reads the batch before deleting, so a revision that became the
+      // published one after `batch` was read can never be deleted from under
+      // its readers.
       if (batch.publishedRevision !== revision) {
-        await deleteBatchRevisionRecords(ctx.tenantId, ctx.accountId, batchId, revision).catch((error) => {
+        await deleteUnpublishedBatchRevision(ctx.tenantId, ctx.accountId, batchId, revision).catch((error) => {
           log().warn({ error, batchId }, "[worker] unpublished short revision cleanup deferred to the orphan sweep");
         });
       }

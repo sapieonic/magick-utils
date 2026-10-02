@@ -33,6 +33,7 @@ import {
   listCampaigns,
 } from "@/lib/api";
 import { resolveExportFacts } from "@/lib/export-facts";
+import { repullHint } from "@/lib/shortfall";
 import { useApp } from "@/lib/store";
 import { formatAppClock } from "@/lib/timezone";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
@@ -671,7 +672,7 @@ export function CombineScreen() {
                             ` The file is missing ${fmtNum(prepared!.missingRows!)} records upstream lists for these campaigns.`}
                           {(prepared?.keptBatches ?? 0) > 0 &&
                             ` ${fmtNum(prepared!.keptBatches!)} ${prepared!.keptBatches === 1 ? "batch" : "batches"} could not be refreshed, so the file holds the records loaded earlier.`}
-                          {" "}Generate again later to re-pull.
+                          {" "}{repullHint("Generate")}
                         </span>
                       </div>
                     )}

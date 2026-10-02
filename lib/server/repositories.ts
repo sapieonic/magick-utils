@@ -220,7 +220,8 @@ export async function failBatchIfOwned(
  *  revision's (same count, same content fingerprint), so the published revision
  *  genuinely describes the state this pull observed. A strictly fuller kept
  *  revision gets none: it was built from an earlier pull, and stamping it with
- *  this one's listed total or source markers would misdescribe it. */
+ *  this one's listed total or source markers would misdescribe it. A key left
+ *  `undefined` is not written; a `null` is (see `keepPublishedRevisionIfOwned`). */
 export type KeptRevisionStamps = Partial<
   Pick<BatchDoc, "ingestedListedTotal" | "ingestedSourceFingerprint" | "ingestedSourceUpdatedAt" | "sourceTotal">
 >;
@@ -245,8 +246,13 @@ export async function keepPublishedRevisionIfOwned(
   stamps: KeptRevisionStamps = {},
 ): Promise<boolean> {
   const col = await batches();
-  // Only defined stamps are written: an absent one must leave the published
-  // revision's value alone rather than null it.
+  // `undefined` means "not passed" and leaves the published revision's value
+  // alone; an explicit `null` IS written. The distinction is deliberate and
+  // mirrors the publish path: a resumed pull stamps `ingestedSourceUpdatedAt:
+  // null` because it cannot say which upstream state its pages describe, and
+  // nulling the stamp is what stops a later refresh from proving the batch
+  // unchanged off a timestamp this pull never verified. Skipping the null would
+  // keep the older stamp beside this pull's fingerprint — the unsafe direction.
   const defined = Object.fromEntries(
     Object.entries(stamps).filter(([, value]) => value !== undefined),
   ) as KeptRevisionStamps;
