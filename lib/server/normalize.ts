@@ -304,6 +304,9 @@ export interface BuildBatchDocOpts {
   sourceFingerprint?: string;
   ingestedSourceFingerprint?: string;
   ingestedSourceUpdatedAt?: string | null;
+  /** The list surface's own `total` for the pull that built this revision (see
+   *  BatchDoc.ingestedListedTotal). */
+  ingestedListedTotal?: number;
   publishedRevision?: string;
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
@@ -366,6 +369,7 @@ export function buildBatchDoc(
     sourceFingerprint: opts.sourceFingerprint,
     ingestedSourceFingerprint: opts.ingestedSourceFingerprint,
     ingestedSourceUpdatedAt: opts.ingestedSourceUpdatedAt,
+    ingestedListedTotal: opts.ingestedListedTotal,
     publishedRevision: opts.publishedRevision,
     ingestStatus: opts.ingestStatus ?? "ready",
     updatedAt: new Date().toISOString(),

@@ -222,6 +222,42 @@ describe("batch worker ownership", () => {
     expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("error");
   });
 
+  // A refresh the worker refused because the pull came back short: the
+  // revision behind it may be one an older build published short. It stays
+  // readable — "error" would take real records offline — but not "ready", or the
+  // next refresh proves the terminal job unchanged and never retries it.
+  it("resolves a failed refresh over a possibly-short published revision to stale, not ready", async () => {
+    for (const shortDoc of [
+      { total: 8038, sourceTotal: 8232 }, // pre-stamp revision: judged by the contact count
+      { total: 470, sourceTotal: 470, ingestedListedTotal: 480 }, // stamped short
+    ]) {
+      batchDb.updateOne.mockClear();
+      batchDb.findOne.mockResolvedValue({
+        tenantId: "t1", accountId: "a1", batchId: "b1",
+        publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+        ...shortDoc,
+      });
+      batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+      await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+      expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
+    }
+  });
+
+  it("restores ready over a stamped-complete revision even when contacts exceed rows", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+      total: 359, sourceTotal: 369, ingestedListedTotal: 359,
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("ready");
+  });
+
   it("still restores a genuinely empty campaign's published revision", async () => {
     // Zero records and zero dispatched contacts is a real, complete batch. An
     // absent `sourceTotal` (every document written before the field existed)

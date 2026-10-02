@@ -331,3 +331,50 @@ describe("MagickClient job-scoped lists", () => {
     expect(q.has("batch_id")).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// List ordering (pagination mitigation)
+// ---------------------------------------------------------------------------
+
+describe("MagickClient list ordering", () => {
+  /** Capture the one URL a list call requests. */
+  function capture() {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url);
+        return { ok: true, status: 200, json: async () => ({ total: 0 }) } as unknown as Response;
+      }),
+    );
+    return urls;
+  }
+
+  // master forwards these query params verbatim on all three call surfaces, and
+  // core's validators allow-list `sort_by=created_at` on each.
+  it.each([
+    ["listCalls", "/proxy/calls"],
+    ["listStaticCalls", "/proxy/static-calls"],
+    ["listIvrCalls", "/proxy/ivr-calls"],
+  ] as const)("asks %s for oldest-first pages", async (method, path) => {
+    const urls = capture();
+    await new MagickClient(ctx)[method]({ jobId: "job-1", limit: 100, offset: 200 });
+    const url = new URL(urls[0]);
+    expect(url.pathname).toBe(path);
+    expect(url.searchParams.get("sort_by")).toBe("created_at");
+    expect(url.searchParams.get("sort_order")).toBe("asc");
+    expect(url.searchParams.get("job_id")).toBe("job-1");
+    expect(url.searchParams.get("offset")).toBe("200");
+  });
+
+  // Core's messaging list has no sort fields (an unknown key is stripped) and
+  // hard-codes newest-first, so sending one would only look as if it worked.
+  it("does not send sort params to the messaging list, which ignores them", async () => {
+    const urls = capture();
+    await new MagickClient(ctx).listMessages({ jobId: "job-1", limit: 100, offset: 0 });
+    const url = new URL(urls[0]);
+    expect(url.pathname).toBe("/proxy/messaging/messages");
+    expect(url.searchParams.has("sort_by")).toBe(false);
+    expect(url.searchParams.has("sort_order")).toBe(false);
+  });
+});

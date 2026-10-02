@@ -329,6 +329,61 @@ describe("POST /api/ingest", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
+  // The Samarthya shape: a revision published SHORT by a build that did not
+  // refuse to (8,038 of 8,232), still "ready" in Mongo, on a terminal job whose
+  // `updated_at` never moves again. Proving it unchanged would skip every
+  // refresh forever, so the fix to upstream pagination could never reach it.
+  it("refreshes a ready batch whose published revision may be short, even when untouched", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 8038, sourceTotal: 8232, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(8038);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  // But a plain load still serves it: the records are real, and blocking a
+  // Combine on them until upstream is fixed would trade a short CSV for none.
+  it("does not force a re-pull of a possibly-short ready batch outside a refresh", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 8038, sourceTotal: 8232, selType: "ai", ingestStatus: "stale",
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(8038);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  // A batch the worker refused for incompleteness on its FIRST pull has no
+  // published revision and is left "error". `counts === doc.total` cannot
+  // re-score it complete, because an unreadable batch is never complete.
+  it("re-enqueues a batch errored by an incomplete first pull", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 0, sourceTotal: 0, selType: "ai", ingestStatus: "error", sourceId: "job-1",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(0);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
   // The IVR blackout, as it exists in Mongo after a build that published the
   // empty pull: ingestStatus "ready", publishedRevision set, and `total` already
   // collapsed to 0 by the commit. `counts === doc.total` is then `0 === 0`, so

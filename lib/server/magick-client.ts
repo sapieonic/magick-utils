@@ -384,6 +384,30 @@ export function resolveJobDispatchType(
   return resolved;
 }
 
+/** Oldest-first ordering for the three CALL list surfaces, sent on every page.
+ *
+ *  Core pages these lists with `LIMIT/OFFSET` over `created_at`, which is NOT
+ *  unique: a dispatch chunk is one multi-row INSERT, so its rows share a
+ *  timestamp to the microsecond and Postgres may return them in a different
+ *  order on every request. Pages then overlap and skip rows while the fetched
+ *  count still equals `total` — measured as an 8,232-call campaign ingesting
+ *  8,038 unique rows. Core's fix is a unique `id` tiebreak on the same ordering;
+ *  until it is deployed this request changes nothing about the ties. What
+ *  ascending order DOES buy, independently: a row added while a running job is
+ *  being paged lands in the unfetched tail instead of shifting every later page
+ *  by one. The worker's completeness check (`ingestBatch`) is the guard that
+ *  actually holds; this is mitigation.
+ *
+ *  Verified per surface against the services' sources: magick-master forwards
+ *  the query string verbatim on `/proxy/calls`, `/proxy/static-calls` and
+ *  `/proxy/ivr-calls` (only `job_id`/`batch_id` are rewritten into the body),
+ *  and core's validators for all three allow-list `sort_by=created_at` with
+ *  `sort_order=asc|desc` on their `/search` routes. Messaging is deliberately
+ *  NOT sent it: core's `messageQuerySchema` has no sort fields (an unknown key is
+ *  stripped, not refused) and its repositories hard-code `created_at DESC`, so
+ *  the parameter would be silently ignored and only read as if it worked. */
+const CALL_LIST_ORDER = { sort_by: "created_at", sort_order: "asc" } as const;
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -670,6 +694,7 @@ export class MagickClient {
 
   async listCalls(params: ListCallsParams = {}): Promise<CallsListResponse> {
     const url = buildUrl("/proxy/calls", {
+      ...CALL_LIST_ORDER,
       limit: params.limit,
       offset: params.offset,
       status: params.status,
@@ -711,6 +736,7 @@ export class MagickClient {
 
   async listStaticCalls(params: ListCallsParams = {}): Promise<CallsListResponse> {
     const url = buildUrl("/proxy/static-calls", {
+      ...CALL_LIST_ORDER,
       limit: params.limit,
       offset: params.offset,
       status: params.status,
@@ -724,6 +750,7 @@ export class MagickClient {
 
   async listIvrCalls(params: ListCallsParams = {}): Promise<IvrSessionsListResponse> {
     const url = buildUrl("/proxy/ivr-calls", {
+      ...CALL_LIST_ORDER,
       limit: params.limit,
       offset: params.offset,
       status: params.status,

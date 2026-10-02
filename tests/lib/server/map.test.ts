@@ -165,6 +165,9 @@ describe("bulkJobToBatchDoc", () => {
       ...source,
       total: 359,
       ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      // The list surface counted 359 rows for the pull: complete, despite the
+      // contact count being higher.
+      ingestedListedTotal: 359,
       publishedRevision: "revision-1",
       fingerprint: "dataset-fp",
     };
@@ -177,6 +180,46 @@ describe("bulkJobToBatchDoc", () => {
     expect(refreshed.sourceTotal).toBe(369);
     expect(refreshed.ingestStatus).toBe("ready");
     expect(refreshed.publishedRevision).toBe("revision-1");
+  });
+
+  // The Samarthya shape: a revision an older build published SHORT (8,038 of
+  // 8,232) with nothing recording that it was short. "ready" there lets every
+  // refresh prove the terminal job unchanged and skip it forever, so it reads
+  // stale — still readable — until a pull stamps it complete.
+  it("marks an unstamped revision below the dispatched count stale, not ready", () => {
+    const job: RawBulkJob = {
+      id: "short", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 8232,
+      updated_at: "2026-09-30T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source,
+      total: 8038,
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.total).toBe(8038);
+  });
+
+  it("judges a stamped revision against its own listed total, not the contact count", () => {
+    const job: RawBulkJob = {
+      id: "stamped", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 500,
+      updated_at: "2026-09-30T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const base: BatchDoc = {
+      ...source,
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+    };
+    // 480 rows listed, 480 ingested: complete, however many contacts went out.
+    expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 480, ingestedListedTotal: 480 }).ingestStatus).toBe("ready");
+    // Listed more than were ingested (a running job's publication): stale.
+    expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 470, ingestedListedTotal: 480 }).ingestStatus).toBe("stale");
+    // The stamp is carried through the listing for the next decision.
+    expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 480, ingestedListedTotal: 480 }).ingestedListedTotal).toBe(480);
   });
 
   // A zero-record commit used to pull `total` down to 0 and take the dispatched
@@ -263,7 +306,7 @@ describe("bulkJobToBatchDoc", () => {
     const first = bulkJobToBatchDoc(base, ctx);
     const committed: BatchDoc = {
       ...first, ingestStatus: "ready", total: 9, fingerprint: "dataset-fp",
-      ingestedSourceFingerprint: first.sourceFingerprint,
+      ingestedSourceFingerprint: first.sourceFingerprint, ingestedListedTotal: 9,
     };
     const refreshed = bulkJobToBatchDoc({ ...base, updated_at: "2026-08-12T11:30:00Z" }, ctx, committed);
     expect(refreshed.sourceFingerprint).toBe(committed.sourceFingerprint);

@@ -3,7 +3,7 @@
 // (used by the campaigns listing before any records are ingested).
 
 import type { Batch, BreakdownSeg, StatusKey } from "@/lib/types";
-import { isBatchReadable, type BatchDoc, type TenantContext } from "./types";
+import { isBatchReadable, publishedRevisionMayBeShort, type BatchDoc, type TenantContext } from "./types";
 import type { RawBulkJob } from "./magick-client";
 import { dispatchTypeToType, normalizeStatus } from "./normalize";
 import { normalizeJobDispatchType } from "./magick-client";
@@ -297,13 +297,23 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     // from a genuinely moved one. Only a completed ingestion writes these.
     ingestedSourceFingerprint: existing?.ingestedSourceFingerprint,
     ingestedSourceUpdatedAt: existing?.ingestedSourceUpdatedAt,
+    ingestedListedTotal: existing?.ingestedListedTotal,
     publishedRevision: existing?.publishedRevision,
     // "stale" keeps the published revision readable — analytics and exports
     // keep working off it — while marking that a refresh has something to pull.
     // An ingested batch is re-derived from the comparison each time rather than
     // carried forward, so a source that moves and then moves back resolves to
     // "ready" again instead of latching stale until someone forces a re-pull.
-    ingestStatus: ingested ? (sourceChanged ? "stale" : "ready") : existing?.ingestStatus ?? "none",
+    //
+    // A published revision that cannot be shown to hold every record is stale
+    // too, whatever the fingerprint says: "ready" would let the refresh path
+    // prove it unchanged and skip it forever (see publishedRevisionMayBeShort).
+    ingestStatus: ingested
+      ? sourceChanged ||
+        publishedRevisionMayBeShort({ total, sourceTotal: dispatchedTotal, ingestedListedTotal: existing?.ingestedListedTotal })
+        ? "stale"
+        : "ready"
+      : existing?.ingestStatus ?? "none",
     updatedAt: new Date().toISOString(),
   };
 }

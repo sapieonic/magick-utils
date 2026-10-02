@@ -217,6 +217,56 @@ would otherwise look like an empty dispatched pull.
 `limit` is 1–100; the worker's `PAGE_SIZE` is already 100. CSV `Content-Disposition` is RFC 6266 —
 unused here, because export is Mongo.
 
+### Pull completeness
+
+**A pull of a finished job that returns fewer UNIQUE records than the list surface's own `total` is
+refused, not published.** Core pages its lists with `LIMIT/OFFSET` over `created_at`, which is not
+unique (a dispatch chunk is one multi-row INSERT), so tied rows reshuffle between page reads: one page
+repeats ids, another silently omits them, and the raw row count still equals `total`. The worker
+deduped the repeats and published the rest — an 8,232-call Combine came out as 8,038 rows under a green
+label, with only two log warnings saying otherwise. Core is fixing the ordering (a unique `id`
+tiebreak); this is the guard that holds regardless.
+
+- **The comparison is against the list's `total`, never `total_contacts`.** On all four surfaces core
+  computes it as `COUNT(*)` over the same WHERE the pages come from, so a unique count below it is real
+  loss. A contact count is a different population — rejected batches and suppressed numbers never become
+  rows — and judging by it would fail healthy partially-failed campaigns on every pull.
+  `isIncompletePaginatedPull` (`types.ts`) is the predicate.
+- **Only for a job that provably finished dialling** — the same `jobFinishedDialling` /
+  `DIALLED_JOB_STATUSES` gate the empty-pull guard uses, deliberately not a looser one. A running job's
+  COUNT and pages legitimately move apart, so it publishes with the existing warning; a cancelled,
+  failed, unrecognised or unreadable job is exempt for the reasons that guard documents.
+- **Retried, then thrown.** Up to `MAX_PULL_ATTEMPTS` (3) passes, `PULL_RETRY_DELAY_MS` apart, all into
+  the same staging revision so they union — each pass can only shrink the gap, and a reshuffle usually
+  closes it. Still short ⇒ the job errors with the counts in `job.error`, logged with job/batch/source
+  ids, listed total, unique count, duplicates and attempts. Not keyed on duplicates: duplicates with a
+  complete union are harmless, and loss can occur on a pass with none. More unique records than `total`
+  never throws. The attempt count is per run — a resume after a deferral starts it again.
+- **Recovery is through `stale`, not `error`, wherever there is something to serve.** A first pull with
+  nothing published leaves the batch `error`, which `/api/ingest` always re-enqueues (`counts ===
+  doc.total` cannot re-score an unreadable batch complete). A refused *refresh* keeps the previous
+  revision readable — but `failBatchIfOwned` resolves it to `stale` rather than `ready` whenever
+  `publishedRevisionMayBeShort` holds, and so does the campaigns listing. That predicate is what lets a
+  revision an older build published short be re-pulled at all: "ready" on a terminal job whose
+  `updated_at` never moves is "proven unchanged" and skipped by every refresh, forever, even after core is
+  fixed. The refresh path checks the predicate directly as well, so this does not depend on a listing
+  having run since deploy. A plain load (Combine, Analyze) still serves a stale batch without re-pulling:
+  blocking a CSV on upstream would trade a short file for none.
+- **`ingestedListedTotal`** is stamped on every publish so "is this revision complete?" can be answered
+  exactly afterwards. Revisions published before it existed fall back to `total < sourceTotal`, which
+  also flags some legitimately short legacy batches; each costs one re-pull on its next refresh and is
+  judged exactly from the stamp that pull writes.
+- **List ordering is a mitigation only.** The client sends `sort_by=created_at&sort_order=asc` on
+  `/proxy/calls`, `/proxy/static-calls` and `/proxy/ivr-calls` — master forwards the query verbatim and
+  core allow-lists both values on each — so rows added while a running job is paged land in the unfetched
+  tail. It does nothing for ties until core's tiebreak ships. Messaging gets neither: core's
+  `messageQuerySchema` has no sort fields (an unknown key is stripped, not refused) and its repositories
+  hard-code `created_at DESC`, so the param would only read as if it worked.
+- **Combine's "Download ready" row count** is re-read from the selected batches once preparation
+  finishes (each readable batch's `total` is its published record count) rather than the chip sum frozen
+  at Generate, which for a never-ingested batch is a contact count. The merge job's `result.rowCount` is
+  not used: it counts only the batches that job re-pulled.
+
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as
 **`stale`**: upstream's job summary has moved since the revision was ingested, but that revision is

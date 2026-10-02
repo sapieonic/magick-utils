@@ -20,7 +20,7 @@ import {
   IVR_HANGUP_NODE_KEYS,
   SHORT_CALL_SECONDS,
 } from "@/lib/server/dashboard-quality";
-import { isBatchReadable, isEmptyDispatchedPull } from "@/lib/server/types";
+import { isBatchReadable, isEmptyDispatchedPull, publishedRevisionMayBeShort } from "@/lib/server/types";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -179,8 +179,17 @@ export async function failBatchIfOwned(
   // it did not bring the batch up to date — resolve back to "stale" whenever
   // the source has moved past what the published revision was built from, so
   // the next refresh still knows there is something to pull.
+  //
+  // Likewise when the published revision itself cannot be shown complete —
+  // typically a revision an older build published short, which the refresh
+  // that just failed was trying to replace. Keeping it readable is right (its
+  // records are real, and the worker refusing a short pull is not evidence
+  // they are wrong); calling it "ready" is not, because a ready batch whose job
+  // upstream never touches again is skipped by every later refresh.
   const readableStatus =
-    current.ingestedSourceFingerprint && current.ingestedSourceFingerprint === current.sourceFingerprint
+    current.ingestedSourceFingerprint &&
+    current.ingestedSourceFingerprint === current.sourceFingerprint &&
+    !publishedRevisionMayBeShort(current)
       ? "ready"
       : "stale";
   // ...unless what is published is the empty-pull failure itself. A revision

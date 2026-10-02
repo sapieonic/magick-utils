@@ -75,6 +75,14 @@ revision back to `ready`/`stale` — a batch already poisoned by an older build 
 Only a job that PROVABLY finished dialling arms the worker's guard; a still-running, cancelled or
 unreadable job must stay exempt, or healthy campaigns get an `error` no click can clear.
 
+A pull of a provably-finished job that returns fewer **unique** records than the list surface's own
+`total` (a COUNT over the same rows) is likewise refused after `MAX_PULL_ATTEMPTS` re-pulls, never
+published: upstream paginates over a non-unique `created_at`, so tied rows reshuffle into duplicates and
+silent gaps while the raw count looks complete. Compare against the list's `total`, never
+`total_contacts`. A refused refresh keeps the old revision readable but `stale`, not `ready` —
+`publishedRevisionMayBeShort` is what keeps a short revision re-pullable instead of "proven unchanged"
+forever. See BACKEND.md → *Pull completeness*.
+
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see
 `bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`. The one refresh that is never skipped

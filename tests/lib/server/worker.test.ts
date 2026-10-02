@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const repositories = vi.hoisted(() => ({
   beginBatchIngestion: vi.fn(),
@@ -47,7 +47,13 @@ vi.mock("@/lib/server/observability/request-context", () => ({ runWithRequestCon
 
 import { logger } from "@/lib/server/logger";
 import { MagickApiError } from "@/lib/server/magick-client";
-import { processJob, runClaimedJob, SWEEP_DELAY_MARGIN_MS } from "@/lib/server/worker";
+import {
+  MAX_PULL_ATTEMPTS,
+  processJob,
+  PULL_RETRY_DELAY_MS,
+  runClaimedJob,
+  SWEEP_DELAY_MARGIN_MS,
+} from "@/lib/server/worker";
 
 // Mirrors the repositories mock above; the real constant is covered by its own test.
 const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
@@ -883,6 +889,239 @@ describe("runClaimedJob empty-pull failure", () => {
       "j1",
       "lease-1",
     );
+  });
+});
+
+describe("processJob completeness guard", () => {
+  // The Samarthya defect, in miniature: core pages calls over a non-unique
+  // `created_at`, so tied rows reshuffle between page reads. The pull returns
+  // as many raw rows as `total` (3), but one id twice and another never — and
+  // deduping hid the loss while publishing served the short revision.
+  const completed = { id: "source-b1", dispatch_type: "ai_voice_call", status: "completed", updated_at: "2026-09-30T10:00:00Z" };
+  const records = (...ids: string[]) => ids.map((recordId) => ({ recordId, status: "done" }));
+
+  /** Run with fake timers so the inter-pass delay costs nothing, and capture
+   *  the outcome without leaving an unhandled rejection behind. */
+  async function run(patch: Partial<Job> = {}) {
+    vi.useFakeTimers();
+    try {
+      const outcome = processJob(job({ batchIds: ["b1"], total: 3, ...patch })).then(
+        () => null,
+        (error: unknown) => error as Error,
+      );
+      await vi.advanceTimersByTimeAsync(PULL_RETRY_DELAY_MS * MAX_PULL_ATTEMPTS);
+      return await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  beforeEach(() => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 3 });
+    client.getBulkJob.mockResolvedValue(completed);
+  });
+  // `clearAllMocks` keeps implementations, and these tests set persistent ones.
+  afterEach(() => {
+    client.listCalls.mockReset();
+    client.listIvrCalls.mockReset();
+    repositories.getRecordsForRevision.mockReset();
+  });
+
+  it("re-pulls a short pull of a finished job, then refuses to publish it", async () => {
+    client.listCalls.mockResolvedValue({ calls: [{ id: "1" }, { id: "1" }, { id: "2" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    const error = await run();
+
+    expect(error?.message).toMatch(
+      /incomplete upstream data for b1: upstream lists 3 records but returned 2 unique ones after 3 attempts \(1 missing, 1 duplicated\)/,
+    );
+    expect(client.listCalls).toHaveBeenCalledTimes(MAX_PULL_ATTEMPTS);
+    // Every pass starts from the top, into the same revision, with the oldest-
+    // first order the client adds (asserted in magick-client.test.ts).
+    for (let n = 1; n <= MAX_PULL_ATTEMPTS; n += 1) {
+      expect(client.listCalls).toHaveBeenNthCalledWith(n, { jobId: "source-b1", limit: 100, offset: 0 });
+    }
+    // The revision is staged once and never wiped between passes: they union.
+    expect(repositories.deleteBatchRevisionRecords).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+    expect(logFns.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        batchId: "b1",
+        sourceId: "source-b1",
+        listedTotal: 3,
+        uniqueRecords: 2,
+        missingRecords: 1,
+        duplicateRows: 1,
+        attempt: MAX_PULL_ATTEMPTS,
+      }),
+      expect.stringMatching(/refusing to publish/),
+    );
+  });
+
+  it("publishes a re-pull that comes back complete on the second attempt", async () => {
+    client.listCalls
+      .mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "1" }, { id: "2" }], total: 3 })
+      .mockResolvedValueOnce({ calls: [{ id: "3" }, { id: "1" }, { id: "2" }], total: 3 });
+    repositories.getRecordsForRevision
+      .mockResolvedValueOnce(records("1", "2"))
+      .mockResolvedValue(records("1", "2", "3"));
+
+    expect(await run()).toBeNull();
+
+    expect(client.listCalls).toHaveBeenCalledTimes(2);
+    expect(client.listCalls).toHaveBeenLastCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 3, ingestedListedTotal: 3 }),
+      "j1",
+      "lease-1",
+    );
+    // Progress never moved backward across the passes.
+    const dones = repositories.checkpointJob.mock.calls.map((call) => (call[2] as { done: number }).done);
+    expect(dones).toEqual([...dones].sort((a, b) => a - b));
+  });
+
+  it("publishes a complete pull of a finished job without re-pulling", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }, { id: "3" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2", "3"));
+
+    expect(await run()).toBeNull();
+
+    expect(client.listCalls).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 3, ingestedListedTotal: 3 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // Duplicates alone are not loss: a reshuffle that happened to repeat rows
+  // while still delivering every id is a complete pull.
+  it("publishes a pull with duplicates whose unique records still reach the total", async () => {
+    client.listCalls.mockResolvedValueOnce({
+      calls: [{ id: "1" }, { id: "2" }, { id: "2" }, { id: "3" }],
+      total: 3,
+    });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2", "3"));
+
+    expect(await run()).toBeNull();
+
+    expect(client.listCalls).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 3 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // A running job's COUNT and pages legitimately move apart. Failing it would
+  // put "Sync failed" on every live campaign; it publishes, warns, and is
+  // re-pulled once it finishes (its updated_at moves, so that refresh runs).
+  it.each(["processing", "queued", "cancelled", "failed"])(
+    "publishes a short pull with a warning while the job is %s",
+    async (status) => {
+      client.getBulkJob.mockResolvedValue({ ...completed, status });
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "1" }, { id: "2" }], total: 3 });
+      repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+      expect(await run()).toBeNull();
+
+      expect(client.listCalls).toHaveBeenCalledTimes(1);
+      expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+        // Stamped short, so the listing reads it stale and refresh re-pulls it.
+        expect.objectContaining({ total: 2, ingestedListedTotal: 3 }),
+        "j1",
+        "lease-1",
+      );
+      expect(logFns.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ batchId: "b1", listedTotal: 3, actualTotal: 2 }),
+        "[worker] upstream total differed from paginated record count",
+      );
+    },
+  );
+
+  it("publishes while the job detail is unreadable, since nothing proves it finished", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 3, dispatchType: "ai_voice_call" });
+    client.getBulkJob.mockRejectedValue(new Error("upstream 500"));
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    expect(await run()).toBeNull();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalled();
+  });
+
+  // More unique rows than the COUNT means rows were added between the COUNT and
+  // the pages, never that any were lost.
+  it("does not fail when unique records exceed the listed total", async () => {
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }, { id: "3" }, { id: "4" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2", "3", "4"));
+
+    expect(await run()).toBeNull();
+    expect(client.listCalls).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 4 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // The check compares against the LIST's total, never the contact count: a
+  // partially-failed campaign dispatches contacts that never become rows, and
+  // judging it by `total_contacts` would fail it on every pull forever.
+  it("ignores a dispatched contact count above the rows the list counts", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 500, sourceTotal: 500 });
+    client.getBulkJob.mockResolvedValue({ ...completed, status: "partially_failed", total_contacts: 500 });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }, { id: "3" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2", "3"));
+
+    expect(await run({ total: 500 })).toBeNull();
+    expect(client.listCalls).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 3, ingestedListedTotal: 3 }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  it("applies to the other list surfaces too", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 3 });
+    client.getBulkJob.mockResolvedValue({ ...completed, dispatch_type: "ivr_call" });
+    client.listIvrCalls.mockResolvedValue({ sessions: [{ id: "1" }, { id: "1" }, { id: "2" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    expect((await run())?.message).toMatch(/incomplete upstream data for b1/);
+    expect(client.listIvrCalls).toHaveBeenCalledTimes(MAX_PULL_ATTEMPTS);
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+  });
+
+  // The user-facing half: the job ends in a terminal error carrying the
+  // reason, and the batch is handed to failure cleanup (which keeps any
+  // published revision readable and marks it stale — see repositories tests).
+  it("fails the job terminally with the reason when run through runClaimedJob", async () => {
+    client.listCalls.mockResolvedValue({ calls: [{ id: "1" }, { id: "1" }, { id: "2" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    vi.useFakeTimers();
+    try {
+      const done = runClaimedJob(job({ batchIds: ["b1"], total: 3 }));
+      await vi.advanceTimersByTimeAsync(PULL_RETRY_DELAY_MS * MAX_PULL_ATTEMPTS);
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(repositories.updateClaimedJob).toHaveBeenCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({
+        status: "error",
+        error: expect.stringMatching(/incomplete upstream data for b1.*Nothing was published/),
+      }),
+      { clearCredential: true },
+    );
+    expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
+    expect(repositories.deleteUnpublishedBatchRevision).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
   });
 });
 

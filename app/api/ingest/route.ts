@@ -17,6 +17,7 @@ import {
 import {
   isBatchReadable,
   isEmptyDispatchedPull,
+  publishedRevisionMayBeShort,
   type BatchDoc,
   type Job,
   type JobType,
@@ -76,6 +77,13 @@ async function refreshableBatchIds(
         // costs one redundant ingestion that the worker reclaims itself; the
         // latch costs the customer their refresh, permanently.
         if (batch.ingestStatus === "stale") return batchId;
+        // Same reasoning for a published revision that cannot be shown to hold
+        // every record — the listing marks those stale too, but this must not
+        // depend on a listing having rewritten the document since it was
+        // published. It is how a revision published short (by an older build,
+        // or while its job was still running) gets re-pulled once upstream
+        // pagination is fixed, instead of being "proven unchanged" forever.
+        if (publishedRevisionMayBeShort(batch)) return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
           if (bulkJobIsUnchangedSince(job, batch.ingestedSourceUpdatedAt)) {

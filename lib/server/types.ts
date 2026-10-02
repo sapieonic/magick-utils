@@ -33,6 +33,50 @@ export function isEmptyDispatchedPull(recordCount: number, dispatched: number | 
   return recordCount === 0 && (dispatched ?? 0) > 0;
 }
 
+/** Whether a paginated pull came back with fewer UNIQUE records than the list
+ *  surface itself says exist — i.e. pagination lost rows.
+ *
+ *  `listedTotal` must be the `total` the list endpoint returned alongside its
+ *  pages, never `sourceTotal`/`total_contacts` and never `BatchDoc.total`. On
+ *  every call surface core computes it as `COUNT(*)` over the identical WHERE
+ *  the pages are drawn from, so for a job that has stopped adding rows a unique
+ *  count below it is real loss, not a timing lag. A contact count is a
+ *  different population (rejected batches and suppressed numbers never become
+ *  rows) and comparing against it would fail healthy campaigns forever.
+ *
+ *  More unique records than `listedTotal` is not a fault — rows can only have
+ *  been added between the COUNT and the pages — and an absent total is no
+ *  claim. Callers must still gate on the job having finished dialling: while it
+ *  is running both numbers legitimately move. */
+export function isIncompletePaginatedPull(uniqueRecords: number, listedTotal: number | null | undefined): boolean {
+  return (listedTotal ?? 0) > uniqueRecords;
+}
+
+/** Whether a batch's PUBLISHED revision cannot be shown to hold every record.
+ *
+ *  A batch this is true of stays readable — its records are the best we have —
+ *  but it must not read "ready": the campaigns listing and failure cleanup both
+ *  resolve it to "stale", and `/api/ingest`'s refresh path never skips a stale
+ *  batch. That is the whole recovery path for revisions published short by a
+ *  build that did not refuse to (the 8,038-of-8,232 Combine), and for a refresh
+ *  the worker refused to publish: without it, a terminal job whose `updated_at`
+ *  never moves is "proven unchanged", every refresh no-ops, and the short data
+ *  is served forever even after upstream pagination is fixed.
+ *
+ *  Revisions that recorded their list total are judged against it exactly.
+ *  Older ones fall back to the dispatched contact count, which can run ahead of
+ *  the rows for healthy reasons (rejected batches, suppressed numbers) — so a
+ *  legitimately short legacy batch is flagged too, costs one re-pull on the next
+ *  refresh, and is then judged exactly from the stamp that pull writes. */
+export function publishedRevisionMayBeShort(
+  batch: Pick<BatchDoc, "total" | "sourceTotal" | "ingestedListedTotal">,
+): boolean {
+  if (typeof batch.ingestedListedTotal === "number") {
+    return isIncompletePaginatedPull(batch.total, batch.ingestedListedTotal);
+  }
+  return isIncompletePaginatedPull(batch.total, batch.sourceTotal);
+}
+
 /** The authenticated tenant/account context derived from the session cookie. */
 export interface TenantContext {
   tenantId: string;
@@ -106,6 +150,14 @@ export interface BatchDoc {
    * catches message receipts, replies and post-call AI enrichment, none of
    * which move a field the fingerprint covers. */
   ingestedSourceUpdatedAt?: string | null;
+  /** The `total` the list surface reported (a `COUNT(*)` over the same rows it
+   * pages) during the pull that built the published revision. It is what makes
+   * "is the published revision complete?" answerable after the fact: `total`
+   * alone cannot say, and `sourceTotal` is a contact count, a different
+   * population. Absent — or BSON null — on revisions published before it
+   * existed, and when the surface reported no total; read it with
+   * `publishedRevisionMayBeShort`, which falls back to `sourceTotal` then. */
+  ingestedListedTotal?: number | null;
   /** Immutable record revision currently visible to readers. Older documents
    * without this field use the legacy unversioned record set. */
   publishedRevision?: string;
