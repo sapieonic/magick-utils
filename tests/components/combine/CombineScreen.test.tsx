@@ -19,6 +19,7 @@ vi.mock("@/lib/api", async () => {
   return {
     ...actual,
     listCampaigns: vi.fn(),
+    listCampaignsByIds: vi.fn(),
     createIngestJob: vi.fn(),
     getJob: vi.fn(),
     downloadCsv: vi.fn().mockResolvedValue(undefined),
@@ -26,7 +27,7 @@ vi.mock("@/lib/api", async () => {
 });
 
 import { CombineScreen } from "@/components/screens/combine/CombineScreen";
-import { createIngestJob, getJob, listCampaigns } from "@/lib/api";
+import { createIngestJob, getJob, listCampaigns, listCampaignsByIds } from "@/lib/api";
 import type { Batch } from "@/lib/types";
 
 const batch = (id: string): Batch => ({
@@ -54,6 +55,53 @@ describe("CombineScreen — completed download flow", () => {
     vi.clearAllMocks();
     sessionStorage.clear();
     vi.mocked(listCampaigns).mockResolvedValue({ batches: [batch("b1"), batch("b2")], source: "live" });
+    vi.mocked(listCampaignsByIds).mockResolvedValue({ batches: [batch("b1"), batch("b2")], source: "live" });
+  });
+
+  // The chip sum is frozen at Generate and, for a batch not yet ingested, is a
+  // dispatched CONTACT count — so "Download ready · 20 rows" could promise rows
+  // the CSV does not hold. Once preparation finishes the label reads the
+  // batches' published record counts instead.
+  it("labels a finished merge with the rows the CSV actually holds", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: "job-1", total: 20, ready: false });
+    vi.mocked(getJob).mockResolvedValue({
+      jobId: "job-1", type: "merge", status: "done", total: 20, done: 17,
+      retryAt: null, retryCount: 0, error: null, result: { rowCount: 17 },
+      createdAt: "2026-08-12T00:00:00Z", updatedAt: "2026-08-12T00:00:01Z",
+    });
+    vi.mocked(listCampaignsByIds).mockResolvedValue({
+      batches: [{ ...batch("b1"), total: 9 }, { ...batch("b2"), total: 8 }],
+      source: "live",
+    });
+    render(<CombineScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
+    expect(await screen.findByText(/combined_export_2_batches\.csv · 17 rows/)).toBeInTheDocument();
+    expect(listCampaignsByIds).toHaveBeenCalledWith(["b1", "b2"]);
+  });
+
+  it("keeps the estimate when a selected batch is not readable yet", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    vi.mocked(listCampaignsByIds).mockResolvedValue({
+      batches: [{ ...batch("b1"), total: 9 }, { ...batch("b2"), total: 8, ingestStatus: "error" }],
+      source: "live",
+    });
+    render(<CombineScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
+    expect(await screen.findByRole("button", { name: /Download CSV/i })).toBeInTheDocument();
+    await waitFor(() => expect(listCampaignsByIds).toHaveBeenCalled());
+    expect(screen.getByText(/combined_export_2_batches\.csv · 20 rows/)).toBeInTheDocument();
+  });
+
+  it("keeps the estimate when the batches cannot be re-read", async () => {
+    vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
+    vi.mocked(listCampaignsByIds).mockRejectedValue(new Error("network down"));
+    render(<CombineScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
+    await waitFor(() => expect(listCampaignsByIds).toHaveBeenCalled());
+    expect(await screen.findByText(/combined_export_2_batches\.csv · 20 rows/)).toBeInTheDocument();
   });
 
   it("makes an already-ingested selection immediately downloadable", async () => {

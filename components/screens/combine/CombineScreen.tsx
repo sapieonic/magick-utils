@@ -24,7 +24,15 @@ import {
   selType,
   typeKey,
 } from "@/lib/data";
-import { createIngestJob, downloadCsv, getJob, isJobNotFound, jobProgressPercent, listCampaigns } from "@/lib/api";
+import {
+  createIngestJob,
+  downloadCsv,
+  getJob,
+  isJobNotFound,
+  jobProgressPercent,
+  listCampaigns,
+  listCampaignsByIds,
+} from "@/lib/api";
 import { useApp } from "@/lib/store";
 import { formatAppClock } from "@/lib/timezone";
 import type { Batch, ColumnDef, ColumnGroup, SelType } from "@/lib/types";
@@ -38,7 +46,36 @@ const COMBINE_PREPARED_KEY = "combinePrepared";
 const COMBINE_PHASE_KEY = "combinePhase";
 
 type CombinePhase = "build" | "working" | "done";
-type PreparedExport = { batchIds: string[]; columns: string[]; totalRows: number; batchCount: number };
+type PreparedExport = {
+  batchIds: string[];
+  columns: string[];
+  /** Chip-sum estimate frozen at Generate: for a batch not yet ingested that is
+   *  the dispatched contact count, not a row count. */
+  totalRows: number;
+  batchCount: number;
+  /** Rows the CSV will actually hold, resolved once preparation finished. */
+  exportedRows?: number;
+};
+
+/** The exact row count of a prepared export, or null when it cannot be stated.
+ *
+ *  Once a batch is readable its `total` IS its published record count (the
+ *  ingest route re-pulls any batch whose stored count disagrees), and the CSV
+ *  streams exactly those records. The merge job's own `result.rowCount` is not
+ *  usable here: it counts only the batches that job re-pulled, so a selection
+ *  that was partly ingested already would be under-reported. Every batch must
+ *  come back readable, or the figure would quietly describe a subset. */
+async function resolveExportedRows(batchIds: string[]): Promise<number | null> {
+  const { batches, source } = await listCampaignsByIds(batchIds);
+  if (source !== "live") return null;
+  let rows = 0;
+  for (const id of batchIds) {
+    const found = batches.find((batch) => batch.id === id);
+    if (!found || (found.ingestStatus !== "ready" && found.ingestStatus !== "stale")) return null;
+    rows += found.total;
+  }
+  return rows;
+}
 
 function readPrepared(): PreparedExport | null {
   if (typeof window === "undefined") return null;
@@ -103,6 +140,28 @@ export function CombineScreen() {
     if (phase === "build") sessionStorage.removeItem(COMBINE_PHASE_KEY);
     else sessionStorage.setItem(COMBINE_PHASE_KEY, phase);
   }, [phase]);
+
+  // Replace the frozen estimate with the real row count once the export is
+  // ready. Best-effort: on any failure the estimate stays on screen.
+  const preparedIds = prepared?.batchIds.join(",") ?? "";
+  const needsExportedRows = phase === "done" && Boolean(preparedIds) && prepared?.exportedRows == null;
+  useEffect(() => {
+    if (!needsExportedRows) return;
+    let alive = true;
+    resolveExportedRows(preparedIds.split(","))
+      .then((rows) => {
+        if (!alive || rows == null) return;
+        setPrepared((current) =>
+          current && current.batchIds.join(",") === preparedIds ? { ...current, exportedRows: rows } : current,
+        );
+      })
+      .catch(() => {
+        // keep the estimate
+      });
+    return () => {
+      alive = false;
+    };
+  }, [needsExportedRows, preparedIds]);
 
   // load live batches (falls back to mock automatically when backend is off)
   useEffect(() => {
@@ -600,7 +659,8 @@ export function CombineScreen() {
                       <Icon name="CircleCheck" size={17} /> Download ready
                     </div>
                     <div className="text-[13px] text-slate-500 mb-3">
-                      combined_export_{prepared?.batchCount ?? campaigns.length}_batches.csv · {fmtNum(prepared?.totalRows ?? totalRows)} rows
+                      combined_export_{prepared?.batchCount ?? campaigns.length}_batches.csv ·{" "}
+                      {fmtNum(prepared?.exportedRows ?? prepared?.totalRows ?? totalRows)} rows
                     </div>
                     <div className="flex gap-2">
                       <Button
