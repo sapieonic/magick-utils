@@ -95,7 +95,10 @@ in either order. See BACKEND.md → *Pull completeness*.
 
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see
-`bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`. The one refresh that is never skipped
+`bulkJobIsUnchangedSince` and `docs/runbooks/storage-recovery.md`. The skip compares master's
+`records_updated_at` (core's latest row write across the job's batches) bound to `status_summary`, as
+observed by the worker BEFORE the pull — never the job's `updated_at`, which master does not have — and a
+`null` on either side means unknown and always re-pulls. See BACKEND.md → *Batch freshness*. The one refresh that is never skipped
 is a batch already flagged `stale` — the two freshness signals can disagree, and deferring to the
 timestamp there latches the batch stale with no click able to clear it.
 

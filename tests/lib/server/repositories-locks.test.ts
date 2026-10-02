@@ -289,7 +289,7 @@ describe("batch worker ownership", () => {
     await keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull, {
       ingestedListedTotal: 3,
       ingestedSourceFingerprint: "sfp",
-      ingestedSourceUpdatedAt: null,
+      ingestedRecordsStamp: null,
       sourceTotal: undefined,
     });
 
@@ -300,7 +300,7 @@ describe("batch worker ownership", () => {
         shortPull,
         ingestedListedTotal: 3,
         ingestedSourceFingerprint: "sfp",
-        ingestedSourceUpdatedAt: null,
+        ingestedRecordsStamp: null,
       }),
     );
     expect(update.$set).not.toHaveProperty("sourceTotal");

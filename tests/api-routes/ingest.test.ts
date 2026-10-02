@@ -35,6 +35,11 @@ const { getBulkJob, persistRefreshedCredential, sessionDestroy } = vi.hoisted(()
 import { isBackendConfigured } from "@/lib/server/env";
 import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
+import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
+
+/** The stamp the worker would have written for a job observed at 10:00 with no
+ *  status_summary — what every "unchanged" mock below is compared against. */
+const STAMP_AT_INGEST = bulkJobRecordsStamp({ records_updated_at: "2026-09-01T10:00:00.000000Z" })!;
 import { getTenantContext } from "@/lib/server/session";
 import {
   countRecords,
@@ -207,11 +212,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T11:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T11:00:00.000000Z" });
 
     const { POST } = await import("@/app/api/ingest/route");
     await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
@@ -247,12 +252,12 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
     // Upstream wrote to the job after we ingested ⇒ real work to do.
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T11:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T11:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
@@ -272,7 +277,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
@@ -295,7 +300,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
@@ -315,11 +320,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
@@ -331,18 +336,58 @@ describe("POST /api/ingest", () => {
 
   // The Samarthya shape: a revision published SHORT by a build that did not
   // refuse to (8,038 of 8,232), still "ready" in Mongo, on a terminal job whose
-  // `updated_at` never moves again. Proving it unchanged would skip every
+  // records stamp never moves again. Proving it unchanged would skip every
   // refresh forever, so the fix to upstream pagination could never reach it.
+  // Master reports `records_updated_at: null` whenever it cannot account for
+  // every batch (an older core, a failed read, a batch inside core's settle
+  // window, messaging). Unknown must re-pull — never read as "untouched".
+  it("re-pulls when master reports records_updated_at unknown, even with a stored stamp", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    for (const unknown of [{ records_updated_at: null }, {}]) {
+      vi.mocked(createJob).mockClear();
+      getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", ...unknown });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      expect(res.status).toBe(200);
+      expect(createJob).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  // A post-call write (recording, analysis) moves the stamp while every count
+  // stays put — the exact change the job-level fingerprint is blind to.
+  it("re-pulls a finished batch once a core row was written since the pre-pull stamp", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 10, selType: "ai", ingestStatus: "ready",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(10);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000001Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    expect(res.status).toBe(200);
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
   it("refreshes a ready batch whose published revision may be short, even when untouched", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 8038, sourceTotal: 8232, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(8038);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
@@ -359,11 +404,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getBatch).mockResolvedValue({
       total: 8232, sourceTotal: 8232, ingestedListedTotal: 8232, selType: "ai", ingestStatus: "ready",
       shortPull: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" },
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(8232);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
@@ -386,7 +431,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
-      selType: "ai", ingestStatus: "stale", sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      selType: "ai", ingestStatus: "stale", sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
       ...shape,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(shape.total);
@@ -407,7 +452,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getBatch).mockResolvedValue({
       total: 8038, sourceTotal: 8232, selType: "ai", ingestStatus: "stale", ingestedListedTotal: 8232,
       shortPull: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" },
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(8038);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
@@ -477,11 +522,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getBatch).mockResolvedValue({
       total: 8038, sourceTotal: 8232, ingestedListedTotal: 8232, selType: "ai", ingestStatus: "ready",
       shortPull: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: new Date(Date.now() - 60_000).toISOString() },
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(8038);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
@@ -517,11 +562,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 0, sourceTotal: 3475, selType: "ivr", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(0);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
 
     // Plain load: must not be filtered out as complete.
@@ -544,7 +589,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 0, sourceTotal: 0, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(0);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
@@ -561,11 +606,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "processing", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "processing", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
     expect(createJob).toHaveBeenCalledTimes(1);
@@ -576,11 +621,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "stale",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T12:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T12:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
     expect(createJob).toHaveBeenCalledTimes(1);
@@ -588,7 +633,7 @@ describe("POST /api/ingest", () => {
 
   // The regression the two freshness signals can produce together: the listing
   // marks the batch stale because its source fingerprint moved, while
-  // `updated_at` sits still. Deferring to the timestamp latches the batch stale
+  // the records stamp sits still. Deferring to the stamp latches the batch stale
   // in Mongo and makes every later Refresh a no-op against that same timestamp,
   // so nothing the customer can click ever clears it.
   it("refreshes a stale batch even when its upstream timestamp has not moved", async () => {
@@ -596,11 +641,11 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "stale",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
     const { POST } = await import("@/app/api/ingest/route");
     const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
     expect(res.status).toBe(200);
@@ -614,7 +659,7 @@ describe("POST /api/ingest", () => {
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
     vi.mocked(getBatch).mockResolvedValue({
       total: 10, selType: "ai", ingestStatus: "ready",
-      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+      sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST,
     } as never);
     vi.mocked(countRecords).mockResolvedValue(10);
     vi.mocked(findActiveJobForBatches).mockResolvedValue(null);

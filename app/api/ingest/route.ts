@@ -65,16 +65,17 @@ async function refreshableBatchIds(
         const index = i + offset;
         const batch = batchDocs[index];
         // Nothing complete to compare against — this is a plain first ingest.
-        if (!complete[index] || !batch.ingestedSourceUpdatedAt || !batch.sourceId) return batchId;
+        if (!complete[index] || !batch.ingestedRecordsStamp || !batch.sourceId) return batchId;
         // A batch the campaigns listing already marked "stale" is one we have
         // positive evidence has moved, so there is nothing left to decide: pull
         // it. Skipping here would deadlock the two freshness signals against
         // each other. They are deliberately different — staleness compares the
-        // listing's source fingerprint, the skip compares `updated_at` — and
-        // they can disagree either way round. When staleness says "changed" and
-        // `updated_at` says "untouched", trusting the timestamp leaves the batch
+        // listing's source fingerprint, the skip compares the records stamp
+        // (master's `records_updated_at` + `status_summary`) — and they can
+        // disagree either way round. When staleness says "changed" and the
+        // stamp says "untouched", trusting the stamp leaves the batch
         // latched stale in Mongo with every later refresh no-oping against the
-        // same unchanged timestamp, and no click can ever clear it. Re-pulling
+        // same unchanged stamp, and no click can ever clear it. Re-pulling
         // costs one redundant ingestion that the worker reclaims itself; the
         // latch costs the customer their refresh, permanently.
         if (batch.ingestStatus === "stale") return batchId;
@@ -91,7 +92,11 @@ async function refreshableBatchIds(
         if (needsCompletenessRepull(batch)) return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
-          if (bulkJobIsUnchangedSince(job, batch.ingestedSourceUpdatedAt)) {
+          // The stamp being compared was observed by the worker BEFORE the
+          // pull that built the published revision, so equality here means no
+          // core row of the job was written since — not merely since the pull
+          // finished. A `null` on either side never matches.
+          if (bulkJobIsUnchangedSince(job, batch.ingestedRecordsStamp)) {
             log().info({ batchId }, "refresh skipped — upstream job untouched since last ingestion");
             return null;
           }

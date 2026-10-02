@@ -303,7 +303,7 @@ export interface BuildBatchDocOpts {
   fingerprint: string;
   sourceFingerprint?: string;
   ingestedSourceFingerprint?: string;
-  ingestedSourceUpdatedAt?: string | null;
+  ingestedRecordsStamp?: string | null;
   /** The list surface's own `total` for the pull that built this revision (see
    *  BatchDoc.ingestedListedTotal). */
   ingestedListedTotal?: number;
@@ -372,7 +372,7 @@ export function buildBatchDoc(
     fingerprint: opts.fingerprint,
     sourceFingerprint: opts.sourceFingerprint,
     ingestedSourceFingerprint: opts.ingestedSourceFingerprint,
-    ingestedSourceUpdatedAt: opts.ingestedSourceUpdatedAt,
+    ingestedRecordsStamp: opts.ingestedRecordsStamp,
     ingestedListedTotal: opts.ingestedListedTotal,
     shortPull: opts.shortPull ?? null,
     publishedRevision: opts.publishedRevision,

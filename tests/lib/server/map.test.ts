@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { batchDocToBatch, bulkJobIsUnchangedSince, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
+import { batchDocToBatch, bulkJobIsUnchangedSince, bulkJobRecordsStamp, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
 import type { RawBulkJob } from "@/lib/server/magick-client";
 import type { BatchDoc, TenantContext } from "@/lib/server/types";
 
@@ -420,44 +420,67 @@ describe("bulkJobToBatchDoc", () => {
 });
 
 describe("bulkJobIsUnchangedSince", () => {
+  const T1 = "2026-09-01T10:00:00.000001Z";
+  const T2 = "2026-09-01T10:00:00.000002Z";
   const done = (over: Partial<RawBulkJob> = {}): RawBulkJob => ({
     id: "job-1", dispatch_type: "ai_voice_call", status: "completed",
-    total_contacts: 10, updated_at: "2026-09-01T10:00:00Z", ...over,
+    total_contacts: 10, status_summary: { completed: 8, no_answer: 2 }, records_updated_at: T1, ...over,
+  });
+  const stampAt = (over: Partial<RawBulkJob> = {}) => bulkJobRecordsStamp(done(over));
+
+  it("is true only when a finished job's records stamp is unchanged since the pre-pull observation", () => {
+    expect(bulkJobIsUnchangedSince(done(), stampAt())).toBe(true);
   });
 
-  it("is true only when a finished job has not been touched since ingestion", () => {
-    expect(bulkJobIsUnchangedSince(done(), "2026-09-01T10:00:00Z")).toBe(true);
+  // The ticket's defect: a recording / transcript / analysis lands on a call
+  // whose status does not change — the summary fingerprint cannot see it.
+  it("is false once a core row is written again, even with identical counts", () => {
+    const later = done({ records_updated_at: T2 });
+    expect(bulkJobSourceFingerprint(later)).toBe(bulkJobSourceFingerprint(done()));
+    expect(bulkJobIsUnchangedSince(later, stampAt())).toBe(false);
   });
 
-  it("is false once upstream writes to the job again", () => {
-    expect(bulkJobIsUnchangedSince(done({ updated_at: "2026-09-01T11:00:00Z" }), "2026-09-01T10:00:00Z")).toBe(false);
+  // A max does not move when a row is deleted (retention); the counts do.
+  it("is false when the counts move with the timestamp standing still", () => {
+    expect(bulkJobIsUnchangedSince(done({ status_summary: { completed: 7, no_answer: 2 } }), stampAt())).toBe(false);
   });
 
-  // status_summary and call_status_counts are call-dispatch-only, so for a
-  // messaging campaign the summary fingerprint is frozen from dispatch onward.
-  // Delivery receipts, read receipts and replies move only updated_at — without
-  // that check "Refresh data" would be a permanent no-op for messaging.
-  it("catches messaging receipts, which move no summary field", () => {
-    const base = { id: "job-wa", dispatch_type: "whatsapp", status: "completed", total_contacts: 5000 };
-    const atIngest: RawBulkJob = { ...base, updated_at: "2026-09-01T10:00:00Z" };
-    const later: RawBulkJob = { ...base, updated_at: "2026-09-01T12:30:00Z" };
-    expect(bulkJobSourceFingerprint(atIngest)).toBe(bulkJobSourceFingerprint(later));
-    expect(bulkJobIsUnchangedSince(later, atIngest.updated_at)).toBe(false);
-  });
-
-  it("never skips a job that is still running", () => {
-    for (const status of ["processing", "queued", "in_progress", "", undefined]) {
-      expect(bulkJobIsUnchangedSince(done({ status }), "2026-09-01T10:00:00Z")).toBe(false);
+  it("covers partially_failed and the other terminal states, and never skips a running job", () => {
+    for (const status of ["completed", "partially_failed", "failed", "cancelled", "canceled"]) {
+      expect(bulkJobIsUnchangedSince(done({ status }), stampAt({ status }))).toBe(true);
+    }
+    for (const status of ["dispatched", "processing", "queued", "in_progress", "", undefined]) {
+      expect(bulkJobIsUnchangedSince(done({ status }), stampAt({ status }))).toBe(false);
     }
   });
 
-  it("never skips without a stamp — a legacy or never-ingested batch", () => {
+  it("never skips without a stamp — a legacy, resumed or never-ingested batch", () => {
     expect(bulkJobIsUnchangedSince(done(), null)).toBe(false);
     expect(bulkJobIsUnchangedSince(done(), undefined)).toBe(false);
+    expect(bulkJobIsUnchangedSince(done(), "")).toBe(false);
   });
 
-  it("never skips when upstream sends no updated_at at all", () => {
-    expect(bulkJobIsUnchangedSince(done({ updated_at: null }), null)).toBe(false);
+  // Unknown on master's side (older master/core, failed read, a batch inside
+  // core's settle window, messaging) must never read as "unchanged" — not even
+  // against a stamp that was itself taken while unknown.
+  it("treats records_updated_at null or absent as unknown on either side, never a match", () => {
+    expect(bulkJobRecordsStamp(done({ records_updated_at: null }))).toBeNull();
+    expect(bulkJobRecordsStamp(done({ records_updated_at: undefined }))).toBeNull();
+    expect(bulkJobRecordsStamp(done({ records_updated_at: "" }))).toBeNull();
+    expect(bulkJobIsUnchangedSince(done({ records_updated_at: null }), stampAt())).toBe(false);
+    expect(bulkJobIsUnchangedSince(done({ records_updated_at: null }), stampAt({ records_updated_at: null }))).toBe(false);
+  });
+
+  // Documents written before this marker carried `ingestedSourceUpdatedAt`, a
+  // copy of a job `updated_at` master never sent. Nothing reads that field, and
+  // a raw timestamp can never equal a records stamp anyway.
+  it("never matches a stamp written under the old updated_at meaning", () => {
+    expect(bulkJobIsUnchangedSince(done({ updated_at: T1 }), T1)).toBe(false);
+    expect(bulkJobIsUnchangedSince(done(), T1)).toBe(false);
+  });
+
+  it("is precise to the microsecond — two writes in one millisecond are a change", () => {
+    expect(stampAt({ records_updated_at: T1 })).not.toBe(stampAt({ records_updated_at: T2 }));
   });
 });
 

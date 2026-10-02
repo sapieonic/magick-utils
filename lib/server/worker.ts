@@ -35,6 +35,7 @@ import {
 import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { recordsContentFingerprint } from "./record-fingerprint";
+import { bulkJobRecordsStamp } from "./records-stamp";
 import {
   isBatchReadable,
   isEmptyDispatchedPull,
@@ -502,12 +503,18 @@ async function ingestBatch(
     );
     throw new Error("newer worker owns batch ingestion");
   }
-  // The job's last-modified stamp, read before this batch's first page so that
-  // anything upstream writes while we page leaves it behind and the next
-  // refresh re-pulls. Only a pull that starts at offset 0 gets one: a resumed
-  // job would be reading the stamp after its pause, and would then claim to
-  // include changes made during that pause. A null stamp simply means the batch
-  // never qualifies for a skip, which is the safe direction.
+  // The job's records stamp (`bulkJobRecordsStamp`: master's
+  // `records_updated_at`, the latest core row write across its batches), read
+  // BEFORE this batch's first page so that anything upstream writes while we
+  // page leaves it behind and the next refresh re-pulls. Reading it after the
+  // pull would be the one unsafe order: a write landing between our last page
+  // and that read would be in the stamp but not in the records, and the next
+  // refresh would skip it forever. A value master served from its few-second
+  // cache is only ever OLDER than the truth, which errs toward a redundant
+  // re-pull. Only a pull that starts at offset 0 gets one: a resumed job would
+  // be reading the stamp after its pause, and would then claim to include
+  // changes made during that pause. A null stamp simply means the batch never
+  // qualifies for a skip, which is the safe direction.
   //
   // The same fetch now also supplies `dispatch_type`, which is what chooses
   // `/proxy/calls` vs `/proxy/ivr-calls` vs `/proxy/static-calls` vs messaging.
@@ -531,7 +538,7 @@ async function ingestBatch(
       log().warn({ error, batchId }, "[worker] source job unavailable; listing will use the batch's stored dispatch_type");
       return null;
     });
-  const sourceUpdatedAt = initialOffset === 0 ? (sourceJob?.updated_at ?? null) : null;
+  const recordsStamp = initialOffset === 0 ? bulkJobRecordsStamp(sourceJob) : null;
   const dispatchType = resolveJobDispatchType(sourceJob, batch);
 
   const revision = jobId;
@@ -835,7 +842,7 @@ async function ingestBatch(
         ? {
             ingestedListedTotal: listed,
             ingestedSourceFingerprint: batch.sourceFingerprint,
-            ingestedSourceUpdatedAt: sourceUpdatedAt,
+            ingestedRecordsStamp: recordsStamp,
             sourceTotal: sourceJob?.total_contacts ?? batch.sourceTotal,
           }
         : undefined;
@@ -899,7 +906,7 @@ async function ingestBatch(
     //
     // The fingerprint comes from the batch document — i.e. from the LIST payload
     // the campaigns route last saw — and not from the detail payload fetched
-    // just above for `sourceUpdatedAt`, even though that one is fresher. A
+    // just above for `recordsStamp`, even though that one is fresher. A
     // fingerprint is only meaningful against another fingerprint of the same
     // shape: `/bulk-dispatch-jobs` and `/bulk-dispatch-jobs/{id}` are separate
     // endpoints whose summary fields (`status_summary`, `call_status_counts`)
@@ -913,7 +920,7 @@ async function ingestBatch(
     // which never skips a stale batch), so the two signals converge on the next
     // pull rather than deadlocking.
     ingestedSourceFingerprint: batch.sourceFingerprint,
-    ingestedSourceUpdatedAt: sourceUpdatedAt,
+    ingestedRecordsStamp: recordsStamp,
     // What the list surface counted for this pull, so the published revision
     // can later be judged complete or not (publishedRevisionMayBeShort). A
     // surface that reported no total made no claim of loss, so the pull is

@@ -205,7 +205,7 @@ unambiguous. An IVR/static batch with no stored type **throws** rather than fall
 `/proxy/calls`. A *present* but unknown `dispatch_type` (job payload or stored field) also throws —
 it is not treated as missing, so an AI-labelled batch cannot infer `/proxy/calls` and 400. Only
 genuinely absent values fall back. Resume fetches the job for this reason even though it still
-withholds the `ingestedSourceUpdatedAt` stamp until offset 0.
+withholds the `ingestedRecordsStamp` until offset 0.
 
 Always send `job_id` (`BatchDoc.sourceId`). Dropping it to dodge a type-mismatch 400 would list the
 whole account, which is the bug master's guard exists to prevent. A BatchDoc with no `sourceId`
@@ -267,7 +267,7 @@ batch in the job and leave Analytics showing only an error):
 | Served before the pull | Outcome | `ingestStatus` | `shortPull.keptPrevious` |
 |---|---|---|---|
 | A readable revision with **more** records than this pull | Kept; staged copy deleted (`keepPublishedRevisionIfOwned`) | `stale` | `true` |
-| A readable revision **identical** to this pull (same count, same content `fingerprint`) | Kept; staged copy deleted; only the flag and the built-from stamps (`ingestedListedTotal`, `ingestedSourceFingerprint`, `ingestedSourceUpdatedAt`, `sourceTotal`) written | `stale` | `false` |
+| A readable revision **identical** to this pull (same count, same content `fingerprint`) | Kept; staged copy deleted; only the flag and the built-from stamps (`ingestedListedTotal`, `ingestedSourceFingerprint`, `ingestedRecordsStamp`, `sourceTotal`) written | `stale` | `false` |
 | Nothing readable (first pull), or a revision no fuller than this pull and different from it | This pull published | `stale` | `false` |
 
 The identical row is the common case against a core without the tiebreak: the loss is deterministic,
@@ -299,7 +299,7 @@ next pull's, so each flagged batch **publishes once more** on its first short re
 and matches from then on; the dataset-keyed aggregate and insight caches for those selections recompute
 once with it. Nothing else compares this value: `datasetFingerprint` only folds it into cache keys, and
 the listing only preserves it. The source-freshness skip uses `ingestedSourceFingerprint` /
-`ingestedSourceUpdatedAt`, which this does not touch, so no refresh/skip loop can result. `keptPrevious` stays `false` there — readers see exactly this pull's
+`ingestedRecordsStamp`, which this does not touch, so no refresh/skip loop can result. `keptPrevious` stays `false` there — readers see exactly this pull's
 records — so nothing reports "earlier data" for it. A first pull is published rather than
 refused because a brand-new customer would otherwise see nothing at all until core deploys, while a
 partial dataset labelled "N of M" is both usable and honest. Keeping a fuller revision beats replacing
@@ -369,30 +369,51 @@ full duplicate re-ingest on every campaigns listing.
 
 Freshness is decided by comparing `sourceFingerprint` (the current upstream summary, via
 `bulkJobSourceFingerprint`) with `ingestedSourceFingerprint` (what the published revision was built
-from). The fingerprint deliberately excludes the job's `updated_at`, which upstream bumps without any
-record changing. The comparison is against what was *ingested*, not against the previous listing, so a
+from). The comparison is against what was *ingested*, not against the previous listing, so a
 source that moves and moves back resolves to "ready" rather than latching stale.
 
 **Deciding whether to re-pull is a different question and uses a different signal.** That fingerprint is
-one-directional: a change proves the source moved, but no change proves nothing, because
-`status_summary` and `call_status_counts` are call-dispatch-only and no summary field moves for message
-receipts, replies, or post-call AI enrichment. So `POST /api/ingest` with `refresh: true` skips a batch
-only when `bulkJobIsUnchangedSince` holds — the job has reached a terminal status AND its `updated_at`
-matches `ingestedSourceUpdatedAt`, stamped from the same endpoint before the last pull began. Anything
-unproven is re-pulled: redundant work is self-cleaning, silently serving stale data is not.
+one-directional: a change proves the source moved, but no change proves nothing — it is counts, and a
+recording, transcript, outcome, post-call analysis or delivery receipt lands on a row whose status does
+not change. So `POST /api/ingest` with `refresh: true` skips a batch only when `bulkJobIsUnchangedSince`
+holds: the job is terminal (`completed`, `partially_failed`, `failed`, `cancelled`) AND
+`bulkJobRecordsStamp(job)` equals `ingestedRecordsStamp`. Anything unproven is re-pulled: redundant work
+is self-cleaning, silently serving stale data is not.
+
+The stamp is master's `records_updated_at` — the latest **core row** write across the job's batches,
+derived from core's per-batch `max(updated_at)` on the same grouped read that produces `status_summary` —
+bound to that `status_summary` (a max cannot see a row being deleted; the counts can). Three facts make
+it trustworthy where its predecessor was not:
+
+- **It is the right source.** The previous skip compared the job's `updated_at`, but master's
+  `bulk_dispatch_jobs` has no such column and never sent one, so every stamp was null and every
+  Refresh re-pulled every batch, writing a full duplicate revision each time. Even a real job-row
+  timestamp would have been wrong: per-call changes are written to core's rows, never to master's job.
+- **Null is unknown, never unchanged**, on either side. Master answers `null` when any batch is
+  unaccounted for — an older master or core, a failed read, a batch inside core's 120 s settle window
+  (core withholds a max until no in-flight transaction can still commit beneath it), and messaging
+  campaigns, whose core route does not serve the freshness yet. A null never matches, not even another
+  null. Documents stamped under the old meaning carry only `ingestedSourceUpdatedAt` (always null in
+  practice), which nothing reads.
+- **It is observed BEFORE the pull.** The worker reads the detail at offset 0, before the first page,
+  and stamps that. Anything written during or after the pull therefore moves the stamp and the next
+  refresh re-pulls; a stamp read after the pull could absorb a write the pull missed and hide it for
+  good. Master may serve the value from its few-second cache, which can only make it older — the safe
+  direction. A resumed pull stamps null.
 
 Because the two signals are different, they can disagree, and one direction deadlocks: the listing marks
-a batch `stale` while `updated_at` stands still, so the skip fires, nothing is pulled, and the batch
-stays latched `stale` with no click able to clear it. A batch already flagged `stale` is therefore never
-skipped — that flag is positive evidence the source moved, so there is nothing left to decide.
+a batch `stale` while the stamp stands still, so the skip fires, nothing is pulled, and the batch stays
+latched `stale` with no click able to clear it. A batch already flagged `stale` is therefore never
+skipped — that flag is positive evidence the source moved, so there is nothing left to decide. Nor is a
+batch `needsCompletenessRepull` holds for (see *Pull completeness*), whatever its stamp says.
 
 For the same reason the worker stamps `ingestedSourceFingerprint` from the *listing's* view of the job
-(`batch.sourceFingerprint`) rather than from the detail payload it fetches for `ingestedSourceUpdatedAt`.
+(`batch.sourceFingerprint`) rather than from the detail payload it fetches for `ingestedRecordsStamp`.
 A fingerprint is only comparable with another of the same shape, and `/bulk-dispatch-jobs` and
 `/bulk-dispatch-jobs/{id}` need not agree on their summary fields; stamping a detail-derived value would
 mark every batch `stale` on the very next listing, forever. Being one listing behind is the safe
 direction: a change that lands mid-ingestion shows up as `stale` next listing, and that refresh is no
-longer skippable.
+longer skippable. The records stamp has no such problem: it is detail-to-detail on both sides.
 
 ## API routes (`app/api/`)
 | Route | Method | Purpose |

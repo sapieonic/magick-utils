@@ -153,7 +153,13 @@ export interface RawBulkJob {
   progress_pct?: number | null;
   provider?: string | null;
   created_at?: string | null;
-  updated_at?: string | null;
+  /** The latest core ROW write across the job's batches (ISO UTC, microsecond
+   *  precision), enriched by magick-master from the same grouped core read as
+   *  `status_summary`. `null` — or absent, on an older master — means UNKNOWN,
+   *  never "unchanged". Master's job row has no `updated_at`; this is the only
+   *  field that moves for recordings, transcripts, outcomes, post-call analysis
+   *  and delivery receipts. Read through `bulkJobRecordsStamp`. */
+  records_updated_at?: string | null;
   /** When master moved the job to a terminal status (`completed`,
    *  `partially_failed`, `failed`); null while it runs. */
   completed_at?: string | null;

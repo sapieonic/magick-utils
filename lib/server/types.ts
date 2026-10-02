@@ -83,7 +83,7 @@ export function publishedRevisionMayBeShort(
  *  `isEmptyDispatchedPull` is shared: the campaigns listing and failure cleanup
  *  resolve such a batch to "stale" instead of "ready", the refresh path never
  *  skips it, and a merge re-pulls it once. Without it a terminal job whose
- *  `updated_at` never moves is "proven unchanged", every refresh no-ops, and a
+ *  records stamp never moves is "proven unchanged", every refresh no-ops, and a
  *  short revision is served forever even after upstream pagination is fixed.
  *  It converges: the first complete pull clears `shortPull` and stamps an exact
  *  `ingestedListedTotal`, after which this is false and the batch reads ready. */
@@ -216,12 +216,17 @@ export interface BatchDoc {
    * from. Equal to the current `sourceFingerprint` means the batch is in step
    * with its source; differing marks it stale. */
   ingestedSourceFingerprint?: string;
-  /** The upstream job's `updated_at` when the published revision was ingested.
-   * Deliberately NOT part of `sourceFingerprint` (it churns on writes that
-   * change no record), but a skip decision needs it: it is the only signal that
-   * catches message receipts, replies and post-call AI enrichment, none of
-   * which move a field the fingerprint covers. */
-  ingestedSourceUpdatedAt?: string | null;
+  /** `bulkJobRecordsStamp` of the upstream job as observed BEFORE the pull
+   * that built the published revision began; null when it could not be stated
+   * (master reported `records_updated_at` unknown, or a resumed pull that
+   * cannot say which upstream state its pages describe). What a refresh
+   * compares to skip a re-pull — see `bulkJobIsUnchangedSince`. Absent on
+   * documents published before it existed, which therefore never skip.
+   *
+   * Replaces `ingestedSourceUpdatedAt`, which stamped the job's `updated_at`:
+   * master never sends one, so every such stamp is null, and a left-over field
+   * of that name on an old document is read by nothing. */
+  ingestedRecordsStamp?: string | null;
   /** The `total` the list surface reported (a `COUNT(*)` over the same rows it
    * pages) during the pull that built the published revision. It is what makes
    * "is the published revision complete?" answerable after the fact: `total`

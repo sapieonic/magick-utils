@@ -49,6 +49,7 @@ vi.mock("@/lib/server/observability/request-context", () => ({ runWithRequestCon
 import { logger } from "@/lib/server/logger";
 import { MagickApiError } from "@/lib/server/magick-client";
 import { processJob, runClaimedJob, SWEEP_DELAY_MARGIN_MS } from "@/lib/server/worker";
+import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
 
 // Mirrors the repositories mock above; the real constant is covered by its own test.
 const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
@@ -519,25 +520,52 @@ describe("processJob resume", () => {
   // The stamp a refresh compares against must predate the pull: anything
   // upstream writes while we page has to leave it behind, so the next refresh
   // re-pulls rather than concluding nothing changed.
-  it("stamps the source timestamp read before paging began", async () => {
+  it("stamps the records stamp read before paging began", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), sourceFingerprint: "src-fp" });
-    client.getBulkJob.mockResolvedValue({ id: "source-b1", updated_at: "2026-09-01T10:00:00Z" });
+    const observed = {
+      id: "source-b1", status: "completed",
+      records_updated_at: "2026-09-01T10:00:00.000001Z", status_summary: { completed: 1 },
+    };
+    client.getBulkJob.mockResolvedValue(observed);
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
 
     await processJob(job({ batchIds: ["b1"], total: 1 }));
 
     expect(client.getBulkJob).toHaveBeenCalledWith("source-b1");
+    // Observed BEFORE the first page: a write landing during or after the pull
+    // must move the stamp, never be absorbed into it.
+    expect(client.getBulkJob.mock.invocationCallOrder[0]!)
+      .toBeLessThan(client.listCalls.mock.invocationCallOrder[0]!);
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({
         ingestedSourceFingerprint: "src-fp",
-        ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+        ingestedRecordsStamp: bulkJobRecordsStamp(observed),
       }),
+      "j1",
+      "lease-1",
+    );
+    expect(bulkJobRecordsStamp(observed)).toEqual(expect.any(String));
+  });
+
+  it("stamps null when master reports records_updated_at unknown", async () => {
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", status: "completed", records_updated_at: null, status_summary: {} });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+
+    await processJob(job({ batchIds: ["b1"], total: 1 }));
+
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ ingestedRecordsStamp: null }),
       "j1",
       "lease-1",
     );
   });
 
   it("does not stamp a resumed pull, whose stamp would postdate its own pause", async () => {
+    // A stampable job: the null below must come from the resume rule, not from
+    // master having nothing to report.
+    client.getBulkJob.mockResolvedValue({
+      id: "source-b1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000001Z", status_summary: {},
+    });
     repositories.getRecordsForRevision
       .mockResolvedValueOnce([{ recordId: "1", status: "done" }])
       .mockResolvedValue([{ recordId: "1", status: "done" }, { recordId: "2", status: "done" }]);
@@ -550,7 +578,7 @@ describe("processJob resume", () => {
     // IVR ingest can pick a surface; the *stamp* stays null.
     expect(client.getBulkJob).toHaveBeenCalledWith("source-b1");
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
-      expect.objectContaining({ ingestedSourceUpdatedAt: null }),
+      expect.objectContaining({ ingestedRecordsStamp: null }),
       "j1",
       "lease-1",
     );
@@ -564,7 +592,7 @@ describe("processJob resume", () => {
 
     // No stamp means no skip: the next refresh re-pulls rather than guessing.
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
-      expect.objectContaining({ ingestedSourceUpdatedAt: null }),
+      expect.objectContaining({ ingestedRecordsStamp: null }),
       "j1",
       "lease-1",
     );
@@ -892,7 +920,7 @@ describe("processJob incomplete upstream pull", () => {
   // The Samarthya defect, in miniature: core pages calls over a non-unique
   // `created_at`, and tied rows are lost deterministically. The pull returns as
   // many raw rows as `total` (3), but one id twice and another never.
-  const completed = { id: "source-b1", dispatch_type: "ai_voice_call", status: "completed", updated_at: "2026-09-30T10:00:00Z" };
+  const completed = { id: "source-b1", dispatch_type: "ai_voice_call", status: "completed", records_updated_at: "2026-09-30T10:00:00.000000Z" };
   const records = (...ids: string[]) => ids.map((recordId) => ({ recordId, status: "done" }));
   const shortPage = { calls: [{ id: "1" }, { id: "1" }, { id: "2" }], total: 3 };
 
@@ -1087,7 +1115,7 @@ describe("processJob incomplete upstream pull", () => {
       {
         ingestedListedTotal: 3,
         ingestedSourceFingerprint: "src-fp",
-        ingestedSourceUpdatedAt: completed.updated_at,
+        ingestedRecordsStamp: bulkJobRecordsStamp(completed),
         sourceTotal: 3,
       },
     );
@@ -1305,7 +1333,7 @@ describe("processJob incomplete upstream pull", () => {
 
   // Still dispatching: the COUNT and the pages legitimately move apart. It is
   // published unflagged (no warning, nothing told to the reader) but stamped
-  // short and read stale, so the next refresh re-pulls it; its `updated_at`
+  // short and read stale, so the next refresh re-pulls it; its records stamp
   // moves anyway as the job progresses.
   it.each(["processing", "queued", "running"])("publishes a short pull unflagged while the job is %s", async (status) => {
     client.getBulkJob.mockResolvedValue({ ...completed, status });
