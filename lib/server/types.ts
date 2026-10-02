@@ -92,6 +92,37 @@ export function needsCompletenessRepull(
   return batch.shortPull != null || publishedRevisionMayBeShort(batch);
 }
 
+/** How long after a short pull was last observed a MERGE serves the flagged
+ *  revision instead of re-pulling it.
+ *
+ *  Against a core that pages over a non-unique `created_at`, the loss is
+ *  deterministic, so a re-pull inside this window returns the same short set
+ *  and buys nothing but upstream load — a full re-page of every flagged batch
+ *  on each Generate or per-campaign download, from one host against master's
+ *  global per-IP limit (~83 page requests for an 8k-record selection). Fifteen
+ *  minutes is long enough that clicking Generate again does not re-page, and
+ *  short enough that a re-export soon after core's fix lands is still re-pulled
+ *  without anyone having to know to press Refresh. An explicit Analytics
+ *  Refresh ignores it: that is the customer asking for exactly this work. */
+export const SHORT_PULL_REPULL_COOLDOWN_MS = 15 * 60_000;
+
+/** Whether a batch's latest short pull was observed within the cooldown, so a
+ *  merge should serve it as-is rather than re-page upstream. False when there is
+ *  no recorded short pull (a legacy or running-job revision that merely MAY be
+ *  short has never been judged exactly, and one re-pull is what judges it), and
+ *  false for an unparseable or future timestamp — the direction that re-pulls,
+ *  because skipping is what can strand a batch, while re-pulling only costs
+ *  load. */
+export function shortPullCheckedRecently(
+  batch: Pick<BatchDoc, "shortPull">,
+  now: number = Date.now(),
+): boolean {
+  const at = Date.parse(batch.shortPull?.detectedAt ?? "");
+  if (!Number.isFinite(at)) return false;
+  const age = now - at;
+  return age >= 0 && age < SHORT_PULL_REPULL_COOLDOWN_MS;
+}
+
 /** What the worker records when a pull of a job that has stopped adding rows
  *  returns fewer unique records than the list surface counted.
  *
@@ -104,9 +135,10 @@ export interface PullShortfall extends BatchShortfall {
   listed: number;
   /** Unique records the pull actually returned. */
   received: number;
-  /** True when an earlier revision holding more records was kept instead of
-   *  publishing this pull; false when the short pull itself is what readers
-   *  now see. Either way `BatchDoc.total` is the served record count. */
+  /** True when an earlier revision holding MORE records was kept instead of
+   *  publishing this pull; false when what readers see is this pull's records
+   *  — published, or already published identically and left in place. Either
+   *  way `BatchDoc.total` is the served record count. */
   keptPrevious: boolean;
 }
 

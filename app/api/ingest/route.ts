@@ -18,6 +18,7 @@ import {
   isBatchReadable,
   isEmptyDispatchedPull,
   needsCompletenessRepull,
+  shortPullCheckedRecently,
   type BatchDoc,
   type Job,
   type JobType,
@@ -84,7 +85,9 @@ async function refreshableBatchIds(
         // by the worker) gets re-pulled once upstream pagination is fixed,
         // instead of being "proven unchanged" forever. Against an unfixed
         // upstream the re-pull is short again and the worker keeps whichever
-        // revision holds more, so this costs upstream load, never data.
+        // revision holds more — writing nothing when the two are identical — so
+        // this costs upstream load, never data or storage. Deliberately NOT
+        // subject to the merge cooldown: this is the customer's explicit ask.
         if (needsCompletenessRepull(batch)) return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
@@ -171,17 +174,28 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // clear it. Treating it as incomplete puts it back in front of the worker,
     // which decides — and now says so.
     if (isEmptyDispatchedPull(counts[index], doc.sourceTotal)) return false;
-    // A merge re-pulls a batch that may be incomplete, once — the merge job
-    // visits each of its batches exactly once and never retries a short pull.
-    // Without this the customer's re-export after upstream pagination is fixed
-    // would still stream the short revision, because only Analytics' "Refresh
-    // data" sends `refresh`. Safe against an unfixed upstream: a pull that comes
-    // back short again never replaces a revision holding more records, and the
-    // CSV is still produced from whatever is served. A plain Analytics load
-    // does NOT re-pull — it serves the flagged data and its Refresh button is
-    // the deliberate re-pull; re-pulling on every page view would be a full
-    // upstream re-page per visit for as long as upstream stays unfixed.
-    if (type === "merge" && needsCompletenessRepull(doc)) return false;
+    // A merge re-pulls a batch that may be incomplete — the merge job visits
+    // each of its batches once and never retries a short pull. Without this the
+    // customer's re-export after upstream pagination is fixed would still stream
+    // the short revision, because only Analytics' "Refresh data" sends
+    // `refresh`. Safe against an unfixed upstream: a pull that comes back short
+    // again never replaces a revision holding more records, and one identical to
+    // the served revision writes nothing (see `ingestBatch`).
+    //
+    // Not on every merge, though. Against an unfixed core the re-pull is the
+    // same short set every time, so re-paging each flagged batch on each
+    // Generate is pure upstream load, all of it from this host against master's
+    // global per-IP limit. A batch whose short pull was observed within
+    // SHORT_PULL_REPULL_COOLDOWN_MS is served as it stands; the next merge after
+    // the window re-pulls it, which is what lets it converge once core is fixed.
+    // A batch that merely MAY be short (legacy stamps, a running job) has no
+    // recorded observation and is re-pulled — that pull is what judges it.
+    //
+    // A plain Analytics load does NOT re-pull at all — it serves the flagged
+    // data and its Refresh button is the deliberate re-pull, which ignores the
+    // cooldown (refreshableBatchIds); re-pulling on every page view would be a
+    // full upstream re-page per visit for as long as upstream stays unfixed.
+    if (type === "merge" && needsCompletenessRepull(doc) && !shortPullCheckedRecently(doc)) return false;
     return true;
   });
   let batchIds: string[];

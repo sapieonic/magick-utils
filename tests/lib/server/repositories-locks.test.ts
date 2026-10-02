@@ -279,6 +279,33 @@ describe("batch worker ownership", () => {
     expect(update.$unset).toEqual({ ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" });
   });
 
+  // An identical short re-pull passes the stamps a publish would have written;
+  // an absent stamp must leave the published revision's own value alone.
+  it("writes only the defined built-from stamps when keeping a revision", async () => {
+    const shortPull = { listed: 3, received: 2, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" };
+    batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 });
+
+    await keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull, {
+      ingestedListedTotal: 3,
+      ingestedSourceFingerprint: "sfp",
+      ingestedSourceUpdatedAt: null,
+      sourceTotal: undefined,
+    });
+
+    const [, update] = batchDb.updateOne.mock.calls[0];
+    expect(update.$set).toEqual(
+      expect.objectContaining({
+        ingestStatus: "stale",
+        shortPull,
+        ingestedListedTotal: 3,
+        ingestedSourceFingerprint: "sfp",
+        ingestedSourceUpdatedAt: null,
+      }),
+    );
+    expect(update.$set).not.toHaveProperty("sourceTotal");
+    expect(update.$set).not.toHaveProperty("publishedRevision");
+  });
+
   it("restores ready over a stamped-complete revision even when contacts exceed rows", async () => {
     batchDb.findOne.mockResolvedValue({
       tenantId: "t1", accountId: "a1", batchId: "b1",

@@ -215,12 +215,23 @@ export async function failBatchIfOwned(
   );
 }
 
+/** "Built from" stamps a kept revision may take from the pull that left it in
+ *  place — passed ONLY when that pull's records are identical to the published
+ *  revision's (same count, same content fingerprint), so the published revision
+ *  genuinely describes the state this pull observed. A strictly fuller kept
+ *  revision gets none: it was built from an earlier pull, and stamping it with
+ *  this one's listed total or source markers would misdescribe it. */
+export type KeptRevisionStamps = Partial<
+  Pick<BatchDoc, "ingestedListedTotal" | "ingestedSourceFingerprint" | "ingestedSourceUpdatedAt" | "sourceTotal">
+>;
+
 /** Leave the published revision in place after a pull that came back short,
  *  while this exact worker lease still owns the batch.
  *
  *  The counterpart of `publishBatchIfOwned` for the one outcome where the pull
- *  completed but was worse than what readers already see: an earlier revision
- *  holding more records stays published, untouched, and the batch is marked
+ *  completed but was no better than what readers already see: an earlier
+ *  revision holding more records — or the very same records — stays published,
+ *  its record set untouched, and the batch is marked
  *  "stale" with the shortfall recorded — readable, explicitly flagged, and never
  *  skipped by a refresh, so a pull against a fixed upstream replaces it. The
  *  rest of the job carries on; nothing about this batch is a failure. */
@@ -231,12 +242,18 @@ export async function keepPublishedRevisionIfOwned(
   jobId: string,
   leaseId: string,
   shortPull: NonNullable<BatchDoc["shortPull"]>,
+  stamps: KeptRevisionStamps = {},
 ): Promise<boolean> {
   const col = await batches();
+  // Only defined stamps are written: an absent one must leave the published
+  // revision's value alone rather than null it.
+  const defined = Object.fromEntries(
+    Object.entries(stamps).filter(([, value]) => value !== undefined),
+  ) as KeptRevisionStamps;
   const result = await col.updateOne(
     { tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId },
     {
-      $set: { ingestStatus: "stale", shortPull, updatedAt: nowIso() },
+      $set: { ...defined, ingestStatus: "stale", shortPull, updatedAt: nowIso() },
       $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
     },
   );

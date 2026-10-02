@@ -433,6 +433,61 @@ describe("POST /api/ingest", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
+  // Against an unfixed core the re-pull returns the same short set every time,
+  // so a merge does not re-page a batch whose short pull was observed within
+  // the cooldown — clicking Generate twice must not re-page every flagged batch
+  // twice. The next merge after the window re-pulls it (above), which is how it
+  // converges once core is fixed.
+  it("does not re-pull a batch on a merge when its short pull was observed within the cooldown", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 8038, sourceTotal: 8232, ingestedListedTotal: 8232, selType: "ai", ingestStatus: "stale",
+      shortPull: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: new Date(Date.now() - 60_000).toISOString() },
+      sourceId: "job-1",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(8038);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
+  it("re-pulls on a merge once the cooldown has passed", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 8038, sourceTotal: 8232, ingestedListedTotal: 8232, selType: "ai", ingestStatus: "stale",
+      shortPull: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: new Date(Date.now() - 16 * 60_000).toISOString() },
+      sourceId: "job-1",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(8038);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  // An explicit Refresh is the customer asking for exactly this work.
+  it("re-pulls a recently-checked short batch on an explicit refresh, ignoring the cooldown", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 8038, sourceTotal: 8232, ingestedListedTotal: 8232, selType: "ai", ingestStatus: "ready",
+      shortPull: { listed: 8232, received: 8038, keptPrevious: false, detectedAt: new Date(Date.now() - 60_000).toISOString() },
+      sourceId: "job-1", ingestedSourceUpdatedAt: "2026-09-01T10:00:00Z",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(8038);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", updated_at: "2026-09-01T10:00:00Z" });
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
   // A batch with nothing readable (a failed first pull) is never scored
   // complete: `counts === doc.total` cannot re-score an unreadable batch.
   it("re-enqueues a batch whose first pull failed", async () => {

@@ -228,8 +228,9 @@ time came back as 3,584 unique, identical on every pass, and the union of three 
 Concurrent UPDATEs (status callbacks moving heap tuples) are a secondary cause, not the main one.
 Re-pulling therefore recovers nothing against an unfixed core, and every finished AI/static/IVR batch
 larger than a page can come back short. In production an 8,232-call Combine came out as 8,038 rows
-under a green label. Core's fix appends a unique `id` tiebreak to every list ordering (calls, static,
-IVR and messaging); it is on a branch, not deployed.
+under a green label. The fix is core's: a unique `id` tiebreak appended to every list ordering (calls,
+static, IVR and messaging). Everything below describes how Utils behaves against a core build without
+that tiebreak, and how it converges once a build with it is serving.
 
 **Deploy guidance:** deploy core's tiebreak first. Utils is safe either way — against an unfixed core it
 reports the shortfall and keeps the fuller data; against a fixed core the next pull of each flagged
@@ -243,7 +244,13 @@ become rows) that would flag healthy partially-failed campaigns forever. More un
 `total` is not loss. Not keyed on duplicates: loss can occur on a pass with none.
 
 It applies only once the job's row set has stopped growing (`ROWS_SETTLED_JOB_STATUSES`:
-`completed`, `dispatched`, `partially_failed`, `failed`, `cancelled`). That is deliberately WIDER than
+`completed`, `dispatched`, `partially_failed`, `failed`, `cancelled`). `cancelled` and `failed` count
+only once master's terminal stamp (`cancelled_at`, else `completed_at`) is older than
+`ROWS_SETTLE_WINDOW_MS` (5 min): master flips the status while a dispatch request to core may still be
+inserting rows, so judging inside that window put "Incomplete upstream data" on healthy just-stopped
+campaigns. Inside it the pull is treated as a running job's (below) and the next pull judges it
+exactly; a missing stamp counts as settled, since withholding the flag on an absence would leave a
+short pull silent with nothing to bring the judgement back. That is deliberately WIDER than
 the empty-pull guard's `DIALLED_JOB_STATUSES`, because this outcome fails nothing: the question is only
 "will more rows appear?", and a cancelled or failed job's rows are as fixed as a completed one's.
 Exempting them left the same loss silent on exactly those campaigns, sitting `stale` with nothing to
@@ -258,9 +265,17 @@ batch in the job and leave Analytics showing only an error):
 | Served before the pull | Outcome | `ingestStatus` | `shortPull.keptPrevious` |
 |---|---|---|---|
 | A readable revision with **more** records than this pull | Kept; staged copy deleted (`keepPublishedRevisionIfOwned`) | `stale` | `true` |
-| Nothing readable (first pull), or a revision no fuller than this pull | This pull published | `stale` | `false` |
+| A readable revision **identical** to this pull (same count, same content `fingerprint`) | Kept; staged copy deleted; only the flag and the built-from stamps (`ingestedListedTotal`, `ingestedSourceFingerprint`, `ingestedSourceUpdatedAt`, `sourceTotal`) written | `stale` | `false` |
+| Nothing readable (first pull), or a revision no fuller than this pull and different from it | This pull published | `stale` | `false` |
 
-On a tie the fresh pull wins: as many records, newer statuses. A first pull is published rather than
+The identical row is the common case against a core without the tiebreak: the loss is deterministic,
+so every re-pull of a finished job returns the same short set, and publishing it again wrote a complete
+duplicate dataset per merge, download or Refresh to change nothing a reader can see (~8k records per
+Generate for the selection that surfaced this). A tie is keyed on the content fingerprint rather than
+the count alone because a finished job's rows can still change (statuses, receipts, costs, post-call
+fields); a tie that carries such a change is published, and once upstream stops changing the next tie
+is identical and writes nothing. `keptPrevious` stays `false` there — readers see exactly this pull's
+records — so nothing reports "earlier data" for it. A first pull is published rather than
 refused because a brand-new customer would otherwise see nothing at all until core deploys, while a
 partial dataset labelled "N of M" is both usable and honest. Keeping a fuller revision beats replacing
 it with a short one on a refresh — the customer already had more. Either way the job finishes `done`
@@ -272,21 +287,31 @@ reader-facing statement, surfaced as `Batch.shortfall`; only the worker writes i
 exact comparison above. It is never derived from `publishedRevisionMayBeShort`'s legacy fallback,
 which is too loose to put in front of a customer. Analytics shows an amber "Upstream returned
 incomplete data" notice and replaces "Up to date" with "Incomplete upstream data", using the job's
-warnings for the batches it pulled and the listing for the rest. Combine's "Download ready" label states
-the rows the file lacks against upstream's count ("8,038 rows — 194 fewer than upstream lists") and,
-separately, how many batches could not be refreshed and so hold earlier data. The CSV itself carries
-no marker.
+warnings for the batches it pulled and the listing for the rest — including warnings from a job that
+went on to fail on a later batch, since those still describe data the charts serve. Combine's "Download
+ready" label and the per-campaign download's "Your CSV is ready" state the rows the file lacks against
+upstream's count ("8,038 rows — 194 fewer than upstream lists") and, separately, whether the file holds
+earlier data because the latest pull could not refresh it. The CSV itself carries no marker.
 
 **Convergence.** `needsCompletenessRepull` (`shortPull` set, or `publishedRevisionMayBeShort`) is the
 shared predicate, and every place that has to agree uses it: the campaigns listing and
 `failBatchIfOwned` resolve such a batch to `stale` rather than `ready`, the refresh path never skips
-it, and **a merge re-pulls it once** (Combine sends no `refresh`, so without this a re-export after the
-core fix would still stream the short revision). A plain Analytics load does not re-pull — it serves
-the flagged data, and Refresh is the deliberate re-pull; re-pulling on every page view would re-page
-upstream per visit for as long as core stays unfixed. The first complete pull publishes with
-`shortPull: null` (`buildBatchDoc` writes the explicit null, since publication is a `$set`) and an exact
-`ingestedListedTotal`, and the batch reads `ready` again. Against an unfixed core each re-pull costs one
-full upstream pass and, when the previous revision is kept, no storage.
+it, and **a merge re-pulls it** (Combine and the per-campaign download send no `refresh`, so without
+this a re-export after the core fix would still stream the short revision) — but not within
+`SHORT_PULL_REPULL_COOLDOWN_MS` (15 min) of the batch's last observed short pull
+(`shortPullCheckedRecently`, keyed on `shortPull.detectedAt`, which every short re-pull re-stamps). The
+re-pull is the same short set every time against an unfixed core, so re-paging each flagged batch on
+each Generate was pure load from one host against master's global per-IP limit (~83 page requests per
+Generate for an 8k-record selection). A batch that merely *may* be short (legacy stamps, a running job)
+has no recorded observation and is re-pulled, since that pull is what judges it. An explicit Analytics
+Refresh ignores the cooldown. A plain Analytics load does not re-pull at all — it serves the flagged
+data; re-pulling on every page view would re-page upstream per visit. The first complete pull publishes
+with `shortPull: null` (`buildBatchDoc` writes the explicit null, since publication is a `$set`) and an
+exact `ingestedListedTotal`, and the batch reads `ready` again — on the first Refresh after the core fix,
+or the first merge after the cooldown. Against an unfixed core each re-pull costs one full upstream pass
+and storage only for its staging copy, which is deleted at once whenever the published revision is kept
+(fuller, or identical); a new revision is written only when the pull is fuller than, or differs in
+content from, what readers see.
 
 - **`ingestedListedTotal`** is stamped on every publish so "is this revision complete?" can be answered
   exactly afterwards (`publishedRevisionMayBeShort`). Revisions published before it existed fall back
@@ -297,11 +322,14 @@ full upstream pass and, when the previous revision is kept, no storage.
   core allow-lists both values on each — so rows added while a running job is paged land in the unfetched
   tail. It does nothing for ties. Messaging gets no sort param: core's `messageQuerySchema` accepts none
   (an unknown key is stripped, not refused), so its fixed newest-first order — `created_at DESC`, plus
-  `id DESC` on core's fix branch — cannot be changed from here.
-- **Combine's row count** is re-read from the selected batches once preparation finishes (each readable
-  batch's `total` is its published record count) rather than the chip sum frozen at Generate, which for
-  a never-ingested batch is a contact count. The merge job's `result.rowCount` is not used: it counts
-  only the batches that job re-pulled.
+  `id DESC` on a core with the tiebreak — cannot be changed from here.
+- **The exported row count** — Combine's "Download ready" label and the per-campaign download's "Your
+  CSV is ready" — is re-read from the selected batches once preparation finishes (`resolveExportFacts`
+  in `lib/export-facts.ts`; each readable batch's `total` is its published record count), together with
+  the shortfall (`selectionShortfall`), rather than the figure frozen before preparation, which for a
+  never-ingested batch is a contact count. Until it resolves, in demo mode, or if any batch is not
+  readable, the estimate stays. The merge job's `result.rowCount` is not used: it counts only the
+  batches that job re-pulled.
 
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as

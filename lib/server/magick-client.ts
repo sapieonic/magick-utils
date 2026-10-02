@@ -154,6 +154,11 @@ export interface RawBulkJob {
   provider?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  /** When master moved the job to a terminal status (`completed`,
+   *  `partially_failed`, `failed`); null while it runs. */
+  completed_at?: string | null;
+  /** When the job was cancelled; null otherwise. */
+  cancelled_at?: string | null;
   [key: string]: unknown;
 }
 
@@ -409,7 +414,7 @@ export function resolveJobDispatchType(
  *  `sort_order=asc|desc` on their `/search` routes. Messaging is deliberately
  *  NOT sent it: core's `messageQuerySchema` has no sort fields (an unknown key is
  *  stripped, not refused), so its fixed newest-first order — `created_at DESC`,
- *  with the same `id` tiebreak on core's fix branch — cannot be changed from
+ *  plus an `id` tiebreak on a core that has one — cannot be changed from
  *  here, and the parameter would only read as if it worked. */
 const CALL_LIST_ORDER = { sort_by: "created_at", sort_order: "asc" } as const;
 

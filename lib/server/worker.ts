@@ -432,8 +432,37 @@ const ROWS_SETTLED_JOB_STATUSES: ReadonlySet<string> = new Set([
   "canceled",
 ]);
 
-function jobStoppedAddingRows(job: RawBulkJob | null): boolean {
-  return ROWS_SETTLED_JOB_STATUSES.has((job?.status ?? "").toLowerCase().trim());
+/** Statuses master can reach while a dispatch request to core is still in
+ *  flight. A Stop flips the job to `cancelled` without waiting for the batch
+ *  being POSTed (master cancels whatever that request created once it
+ *  returns), and a dispatch that throws mid-campaign writes `failed` the same
+ *  way — so for a short while core may still be inserting rows the job's
+ *  status says will never come. Judged inside that window, a healthy
+ *  just-stopped campaign reads "Incomplete upstream data". */
+const ROWS_SETTLE_AFTER_STOP_STATUSES: ReadonlySet<string> = new Set(["failed", "cancelled", "canceled"]);
+
+/** How long after a stop/failure the row set is treated as still settling. A
+ *  late batch is bounded by the dispatch request that carries it; five minutes
+ *  covers a slow core comfortably while still flagging a genuinely short
+ *  stopped campaign on the next pull after it. */
+const ROWS_SETTLE_WINDOW_MS = 5 * 60_000;
+
+/** Whether the job's row set has stopped growing. `completed`, `dispatched`
+ *  and `partially_failed` mean so outright. `cancelled`/`failed` mean so once
+ *  the terminal timestamp master stamped (`cancelled_at`, `completed_at`) is
+ *  older than the settle window; inside it the pull is judged as for a running
+ *  job — published stamped short, re-pullable, flagged to nobody — and the next
+ *  pull judges it exactly. A missing or unparseable timestamp keeps the old
+ *  behaviour (settled): master stamps both on every such transition, and
+ *  withholding the flag on an absence would leave a short pull silent with
+ *  nothing to bring the judgement back. */
+function jobStoppedAddingRows(job: RawBulkJob | null, now: number = Date.now()): boolean {
+  const status = (job?.status ?? "").toLowerCase().trim();
+  if (!ROWS_SETTLED_JOB_STATUSES.has(status)) return false;
+  if (!ROWS_SETTLE_AFTER_STOP_STATUSES.has(status)) return true;
+  const stoppedAt = Date.parse(job?.cancelled_at ?? job?.completed_at ?? "");
+  if (!Number.isFinite(stoppedAt)) return true;
+  return now - stoppedAt >= ROWS_SETTLE_WINDOW_MS;
 }
 
 async function ingestBatch(
@@ -719,23 +748,71 @@ async function ingestBatch(
   //
   // A short pull fails nothing. If readers are already served a revision that
   // holds MORE records, that one is kept, the batch is marked stale with the
-  // shortfall recorded, and the job moves on to its other batches. Otherwise —
-  // a first-ever pull, or a refresh over a revision no fuller than this one —
+  // shortfall recorded, and the job moves on to its other batches. If they are
+  // served exactly these records already, nothing is written but the flag.
+  // Otherwise — a first-ever pull, or a refresh over a revision no fuller than
+  // this one and different from it —
   // the short pull is published, flagged with the same record, because a
   // partial dataset with "N of M" on it beats no dataset for a customer who
   // cannot be made to wait for an upstream deploy. Either way the job reports a
   // warning, `BatchDoc.shortPull` puts the shortfall in front of every reader,
   // and `needsCompletenessRepull` keeps the batch re-pullable; the first
   // complete pull clears it.
+  //
+  // Content fingerprint of exactly what this pull would publish. Computed before
+  // the completeness decision because that decision uses it: a short pull whose
+  // fingerprint equals the published revision's is the same dataset, and is not
+  // written again (see `unchanged` below).
+  const freshFp = fingerprint([
+    records.length,
+    ...records
+      .sort((a, b) => a.recordId.localeCompare(b.recordId))
+      .map((r) =>
+        JSON.stringify([
+          r.recordId,
+          r.status,
+          r.activityTimestamp,
+          r.raw?.status,
+          r.totalCostInr,
+          r.telephonyCostInr,
+          r.aiCostInr,
+          r.sentiment,
+          r.keyTopics,
+          r.durationSeconds,
+          r.talkTimeSeconds,
+          r.replyText,
+        ]),
+      ),
+  ]);
   let shortPull: PullShortfall | null = null;
   let shortfallWarning: JobWarning | undefined;
   if (jobStoppedAddingRows(sourceJob) && isIncompletePaginatedPull(records.length, listedTotal)) {
     const listed = listedTotal ?? 0;
+    const readable = isBatchReadable(batch);
     // `batch.total` is the served revision's record count once one is
-    // readable. Strictly greater: on a tie the fresh pull wins, since it holds
-    // as many records with newer statuses. The empty-pull fault revision has a
-    // total of 0 and so can never be kept over anything.
-    const keptPrevious = isBatchReadable(batch) && batch.total > records.length;
+    // readable. A revision holding MORE records is kept in place of this pull:
+    // the customer already had more. The empty-pull fault revision has a total
+    // of 0 and so can never be kept over anything.
+    const keptPrevious = readable && batch.total > records.length;
+    // A short pull that matches the served revision record for record — same
+    // count, same content fingerprint — is not written either. This is the
+    // common case against a core without the `id` tiebreak: the loss is
+    // deterministic, so every re-pull of a finished job returns the identical
+    // short set, and publishing it would write a complete duplicate dataset
+    // (and later reclaim the old one) to change nothing a reader can see. Every
+    // merge, per-campaign download and Refresh of a flagged batch did exactly
+    // that until this check existed.
+    //
+    // Gated on the fingerprint rather than on the count alone because a tie is
+    // not always "nothing new": the job's row set is fixed, but its rows'
+    // statuses, costs, receipts and post-call fields can still move after it
+    // finishes, and those are what the fingerprint covers. A tie that carries
+    // such a change publishes as before, so a refresh still delivers it; once
+    // upstream stops changing, the next tie is identical and writes nothing.
+    // A legacy revision fingerprinted by an older formula publishes once and
+    // matches from then on.
+    const unchanged =
+      readable && !keptPrevious && batch.total === records.length && batch.fingerprint === freshFp;
     shortPull = { listed, received: records.length, keptPrevious, detectedAt: new Date().toISOString() };
     const shortfallLog = {
       jobId,
@@ -760,9 +837,26 @@ async function ingestBatch(
       served: keptPrevious ? batch.total : records.length,
       message: shortfallMessage(batch.name ?? batchId, shortPull),
     };
-    if (keptPrevious) {
-      log().warn(shortfallLog, "[worker] paginated pull came back short of upstream's total; keeping the fuller published revision");
-      if (!(await keepPublishedRevisionIfOwned(ctx.tenantId, ctx.accountId, batchId, jobId, leaseId, shortPull))) {
+    if (keptPrevious || unchanged) {
+      log().warn(
+        { ...shortfallLog, unchanged },
+        keptPrevious
+          ? "[worker] paginated pull came back short of upstream's total; keeping the fuller published revision"
+          : "[worker] paginated pull came back short of upstream's total and identical to the published revision; nothing written",
+      );
+      // An identical pull describes the published revision exactly, so it may
+      // refresh what that revision is recorded as built from — the same stamps
+      // a publish would have written. A strictly fuller kept revision was built
+      // from an earlier pull and keeps its own.
+      const stamps = unchanged
+        ? {
+            ingestedListedTotal: listed,
+            ingestedSourceFingerprint: batch.sourceFingerprint,
+            ingestedSourceUpdatedAt: sourceUpdatedAt,
+            sourceTotal: sourceJob?.total_contacts ?? batch.sourceTotal,
+          }
+        : undefined;
+      if (!(await keepPublishedRevisionIfOwned(ctx.tenantId, ctx.accountId, batchId, jobId, leaseId, shortPull, stamps))) {
         throw new Error("job lease lost while keeping the published revision");
       }
       // The staged copy is never going to be published. Guarded for the one
@@ -793,27 +887,6 @@ async function ingestBatch(
       "[worker] upstream total differed from paginated record count",
     );
   }
-  const freshFp = fingerprint([
-    records.length,
-    ...records
-      .sort((a, b) => a.recordId.localeCompare(b.recordId))
-      .map((r) =>
-        JSON.stringify([
-          r.recordId,
-          r.status,
-          r.activityTimestamp,
-          r.raw?.status,
-          r.totalCostInr,
-          r.telephonyCostInr,
-          r.aiCostInr,
-          r.sentiment,
-          r.keyTopics,
-          r.durationSeconds,
-          r.talkTimeSeconds,
-          r.replyText,
-        ]),
-      ),
-  ]);
   const rebuilt = buildBatchDoc(records, ctx, {
     batchId: batch.batchId,
     sourceId: batch.sourceId,

@@ -979,6 +979,8 @@ describe("processJob incomplete upstream pull", () => {
       "j1",
       "lease-1",
       expect.objectContaining({ listed: 3, received: 2, keptPrevious: true }),
+      // A fuller kept revision was built from an earlier pull: no stamps from this one.
+      undefined,
     );
     // The staged copy is removed: once when staging began, once after the keep.
     const b1Deletes = repositories.deleteBatchRevisionRecords.mock.calls.filter((call) => call[2] === "b1");
@@ -1025,10 +1027,11 @@ describe("processJob incomplete upstream pull", () => {
     expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalled();
   });
 
-  // On a tie the fresh pull holds as many records with newer statuses, and an
+  // On a tie whose CONTENT differs (the published fingerprint here is not this
+  // pull's) the fresh pull carries newer statuses, so it is published; an
   // older, smaller revision (a snapshot taken while the job still ran) is worse.
   it.each([
-    ["no fuller than", 2],
+    ["the same size as, but different from,", 2],
     ["smaller than", 1],
   ])("publishes the short pull over a revision %s it", async (_label, previousTotal) => {
     repositories.getBatch.mockResolvedValue({
@@ -1042,6 +1045,150 @@ describe("processJob incomplete upstream pull", () => {
     expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ total: 2, shortPull: expect.objectContaining({ keptPrevious: false }) }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // Against a core without the `id` tiebreak every re-pull of a finished job is
+  // the identical short set. Publishing it again wrote a complete duplicate
+  // dataset per merge / download / Refresh while changing nothing a reader can
+  // see. The published revision is the same data: keep it, write nothing but
+  // the flag and the built-from stamps, and delete the staged copy.
+  it("writes no new revision when a short re-pull is identical to the published one", async () => {
+    // Pull once to learn this dataset's content fingerprint.
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+    const publishedFp = repositories.publishBatchIfOwned.mock.calls[0][0].fingerprint as string;
+    vi.clearAllMocks();
+
+    // That revision is now what readers see, flagged short.
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 2, fingerprint: publishedFp, ingestStatus: "stale",
+      publishedRevision: "old-rev", sourceFingerprint: "src-fp", sourceTotal: 3, ingestedListedTotal: 3,
+      shortPull: { listed: 3, received: 2, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" },
+    });
+    client.getBulkJob.mockResolvedValue({ ...completed, total_contacts: 3 });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(client.listCalls).toHaveBeenCalledTimes(1);
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+    expect(repositories.retireBatchRevision).not.toHaveBeenCalled();
+    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledWith(
+      "t1",
+      "a1",
+      "b1",
+      "j1",
+      "lease-1",
+      // Readers see exactly this pull's records, so nothing "earlier" is kept.
+      expect.objectContaining({ listed: 3, received: 2, keptPrevious: false, detectedAt: expect.any(String) }),
+      {
+        ingestedListedTotal: 3,
+        ingestedSourceFingerprint: "src-fp",
+        ingestedSourceUpdatedAt: completed.updated_at,
+        sourceTotal: 3,
+      },
+    );
+    // The fresh observation re-arms the merge cooldown.
+    const recorded = repositories.keepPublishedRevisionIfOwned.mock.calls[0][5];
+    expect(recorded.detectedAt).not.toBe("2026-10-01T00:00:00Z");
+    // Staged copy dropped: once when staging began, once after the keep.
+    expect(repositories.deleteBatchRevisionRecords.mock.calls).toEqual([
+      ["t1", "a1", "b1", "j1"],
+      ["t1", "a1", "b1", "j1"],
+    ]);
+    expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
+      "j1",
+      "lease-1",
+      expect.objectContaining({
+        status: "done",
+        done: 2,
+        warnings: [expect.objectContaining({ batchId: "b1", keptPrevious: false, served: 2 })],
+      }),
+      { clearCredential: true },
+    );
+    expect(logFns.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ batchId: "b1", unchanged: true }),
+      expect.stringMatching(/identical to the published revision; nothing written/),
+    );
+  });
+
+  // Never-ingested batches cannot be "unchanged": there is nothing readable,
+  // so the first short pull is published even if a fingerprint happens to match.
+  it("publishes a first short pull even when the batch's fingerprint matches", async () => {
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+    const publishedFp = repositories.publishBatchIfOwned.mock.calls[0][0].fingerprint as string;
+    vi.clearAllMocks();
+
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 2, fingerprint: publishedFp, ingestStatus: "none",
+    });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledTimes(1);
+  });
+
+  // A stop is not instantly final: master flips the job to cancelled/failed
+  // while a dispatch request to core may still be inserting rows. Inside the
+  // settle window the pull is judged as for a running job — published stamped
+  // short, re-pullable, told to nobody — and the next pull judges it exactly.
+  it.each([
+    ["cancelled", { cancelled_at: new Date(Date.now() - 60_000).toISOString() }],
+    ["failed", { completed_at: new Date(Date.now() - 60_000).toISOString() }],
+  ])("does not flag a short pull of a %s job inside the settle window", async (status, stamps) => {
+    client.getBulkJob.mockResolvedValue({ ...completed, status, ...stamps });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ shortPull: null, ingestedListedTotal: 3, ingestStatus: "stale" }),
+      "j1",
+      "lease-1",
+    );
+    expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
+      "j1",
+      "lease-1",
+      expect.not.objectContaining({ warnings: expect.anything() }),
+      { clearCredential: true },
+    );
+  });
+
+  it.each([
+    ["cancelled", { cancelled_at: new Date(Date.now() - 10 * 60_000).toISOString() }],
+    ["failed", { completed_at: new Date(Date.now() - 10 * 60_000).toISOString() }],
+  ])("flags a short pull of a %s job once the settle window has passed", async (status, stamps) => {
+    client.getBulkJob.mockResolvedValue({ ...completed, status, ...stamps });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ shortPull: expect.objectContaining({ listed: 3, received: 2 }) }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // `completed`/`dispatched` are untouched by the window, however recent.
+  it("flags a short pull of a just-completed job without waiting", async () => {
+    client.getBulkJob.mockResolvedValue({ ...completed, completed_at: new Date().toISOString() });
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+    await processJob(job({ batchIds: ["b1"], total: 3 }));
+
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ shortPull: expect.objectContaining({ listed: 3, received: 2 }) }),
       "j1",
       "lease-1",
     );

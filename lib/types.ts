@@ -72,6 +72,10 @@ export interface BatchShortfall {
   received: number;
   /** True when an earlier revision holding more records was kept instead. */
   keptPrevious: boolean;
+  /** When the LATEST short pull was observed — re-stamped on every short
+   *  re-pull, including one that wrote nothing because it matched the served
+   *  revision. A merge re-pull cooldown is keyed on it
+   *  (`shortPullCheckedRecently`). */
   detectedAt: string;
 }
 
