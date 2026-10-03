@@ -329,6 +329,7 @@ export async function processJob(job: Job) {
       batchIndex,
       job.cursor ?? 0,
       job.cursorOrder,
+      job.cursorListedTotal,
       completedDone,
       warnings,
     );
@@ -336,6 +337,7 @@ export async function processJob(job: Job) {
     completedDone = done;
     job.cursor = 0;
     job.cursorOrder = undefined;
+    job.cursorListedTotal = undefined;
     warnings = outcome.warnings;
   }
 
@@ -423,6 +425,7 @@ async function ingestBatch(
   batchIndex: number,
   initialOffset: number,
   initialOrder: string | undefined,
+  initialListedTotal: number | null | undefined,
   completedDone: number,
   priorWarnings: readonly JobWarning[],
 ): Promise<{ done: number; warnings: JobWarning[] }> {
@@ -566,7 +569,23 @@ async function ingestBatch(
   // revision commits — and contacts are not rows. This is the figure the
   // completeness check below compares against: core computes it as a COUNT over
   // the same WHERE the pages come from. Undefined until a page reports one.
-  let listedTotal: number | undefined;
+  //
+  // A resumed pull starts from the total its earlier pages reported (stored
+  // with the cursor): its remaining pages may all be empty, and an empty page
+  // need not report one — reading that as "no claim" would pass a short pull
+  // as complete. A checkpoint from before that was stored falls back, for a
+  // revision this job already published, to what the publish stamped.
+  // Only a FALLBACK: a total any page of this pass reports supersedes it, so a
+  // COUNT that has since dropped (rows removed upstream) is not overruled by
+  // the stale figure.
+  const resumedListedTotal: number | undefined =
+    startOffset > 0
+      ? (initialListedTotal ??
+          (batch.publishedRevision === revision ? batch.ingestedListedTotal : undefined) ??
+          undefined)
+      : undefined;
+  let passListedTotal: number | undefined;
+  let listedTotal: number | undefined = resumedListedTotal;
   let offset = startOffset;
   for (;;) {
     let page: NormalizedRecord[];
@@ -628,7 +647,8 @@ async function ingestBatch(
     }
     reportedTotal = Math.max(reportedTotal, pageTotal ?? 0);
     if (typeof pageTotal === "number" && Number.isFinite(pageTotal)) {
-      listedTotal = Math.max(listedTotal ?? 0, pageTotal);
+      passListedTotal = Math.max(passListedTotal ?? 0, pageTotal);
+      listedTotal = passListedTotal;
     }
     if (page.length === 0) {
       break;
@@ -651,6 +671,7 @@ async function ingestBatch(
       done: completedDone + expectedRecordIds.size,
       cursor: offset,
       cursorOrder: listOrder,
+      cursorListedTotal: listedTotal ?? null,
       batchIndex,
       leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
     });
@@ -749,8 +770,9 @@ async function ingestBatch(
   //    differ), so a pull with more records could still drop rows a customer
   //    had, and a kept revision froze every status in it. Carried rows may be
   //    behind on status — the price of not deleting them on the word of a pull
-  //    known to be incomplete — and a row genuinely removed upstream stays until
-  //    the first complete pull, which publishes exactly what upstream lists.
+  //    known to be incomplete. Bounded by the list total (below), so a row
+  //    removed upstream cannot ghost indefinitely once the union would exceed
+  //    it, and the first complete pull publishes exactly what upstream lists.
   // 2. UNCHANGED → WRITE NOTHING. If the result is the served revision record
   //    for record (same count, same content fingerprint), nothing is written
   //    but the flag and the built-from stamps. That is the common case against
@@ -770,24 +792,50 @@ async function ingestBatch(
   // running campaign from re-paging upstream and writing another full copy.
   const incomplete = isIncompletePaginatedPull(records.length, listedTotal);
   const readable = isBatchReadable(batch);
+  // Resumed after this job already published the revision (interrupted before
+  // its batch transition): the rows it carried then are in what readers see.
+  const resumingPublished = batch.publishedRevision === revision;
   let carried: NormalizedRecord[] = [];
-  if (batch.publishedRevision === revision) {
-    // Resumed after this job already published the revision: whatever it
-    // carried is part of what readers see, so it is part of what is served.
-    carried = stagedCarried;
-  } else {
-    if (stagedCarried.length > 0) {
-      // Carried by an interrupted attempt of this job; re-derived below against
-      // the revision actually being replaced, or not needed at all.
-      await deleteCarriedRecords(ctx.tenantId, ctx.accountId, batchId, revision);
-    }
+  if (incomplete) {
     const previousRevision = batch.publishedRevision;
-    if (incomplete && readable && previousRevision) {
+    if (resumingPublished) {
+      carried = stagedCarried;
+    } else if (readable && previousRevision) {
       const present = new Set(records.map((record) => record.recordId));
       carried = (
         await getRevisionRecordsMissingFrom(ctx.tenantId, ctx.accountId, batchId, previousRevision, present)
       ).map((record) => ({ ...record, revision, revisionCreatedAt, carriedFrom: previousRevision }));
     }
+  }
+  // Bounded by what upstream lists. In every legitimate case — tie loss, or an
+  // add-only running job — the union is at most `listedTotal`: every carried
+  // row is a real row the pull missed. A union above it means the served
+  // revision holds rows upstream no longer counts (deleted upstream), or that
+  // record ids stopped matching between the two revisions (a change in how a
+  // `recordId` is derived would carry EVERY old row and double the batch's
+  // total, rates and export). Neither is something to serve; the pull is
+  // published alone, flagged, and the anomaly logged.
+  if (carried.length > 0 && records.length + carried.length > (listedTotal ?? 0)) {
+    log().error(
+      {
+        jobId,
+        batchId,
+        listedTotal: listedTotal ?? null,
+        uniqueRecords: records.length,
+        carryCandidates: carried.length,
+        previousRevision: batch.publishedRevision,
+      },
+      "[worker] carrying forward would serve more records than upstream lists; publishing the pull alone",
+    );
+    carried = [];
+  }
+  // Carried rows staged by an interrupted attempt of this job that will not be
+  // served as they stand: on a staging revision they are re-derived (and
+  // re-written below if still needed); on a revision this job already
+  // published they leave it, because the resumed pull is complete or carrying
+  // them is out of bounds — the republish below then describes what remains.
+  if (stagedCarried.length > 0 && (!resumingPublished || carried.length === 0)) {
+    await deleteCarriedRecords(ctx.tenantId, ctx.accountId, batchId, revision, { includePublished: resumingPublished });
   }
   const served = carried.length > 0 ? [...records, ...carried] : records;
   // Content fingerprint of exactly what would be served. Computed before the
@@ -800,7 +848,15 @@ async function ingestBatch(
   let shortfallWarning: JobWarning | undefined;
   if (incomplete) {
     const listed = listedTotal ?? 0;
-    const settled = jobStoppedAddingRows(sourceJob);
+    // Settled is a judgement about the JOB, and a job does not un-stop. When
+    // its detail could not be read this time, the judgement the batch already
+    // carries stands: re-deriving it from nothing would mark a settled short
+    // batch unsettled on a transient upstream error, withdraw its warning and
+    // hide the shortfall from every reader while the data is just as short.
+    // No previous judgement and no detail is "unknown", which stays unsettled.
+    const settled = sourceJob
+      ? jobStoppedAddingRows(sourceJob)
+      : batch.shortPull != null && batch.shortPull.settled !== false;
     // Gated on the fingerprint rather than the count alone because a tie is
     // not always "nothing new": rows' statuses, costs, receipts and post-call
     // fields can move after a job finishes, and those are what the fingerprint
@@ -978,6 +1034,7 @@ async function ingestBatch(
     done: completedDone + records.length,
     cursor: offset,
     cursorOrder: listOrder,
+    cursorListedTotal: listedTotal ?? null,
     batchIndex,
     leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
   });

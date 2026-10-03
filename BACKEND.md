@@ -260,7 +260,9 @@ short pull silent with nothing to bring the judgement back. That is deliberately
 the empty-pull guard's `DIALLED_JOB_STATUSES`, because this outcome fails nothing: the question is only
 "will more rows appear?", and a cancelled or failed job's rows are as fixed as a completed one's.
 Exempting them left the same loss silent on exactly those campaigns, sitting `stale` with nothing to
-say why. Still-dispatching, unrecognised or unreadable jobs are recorded `settled: false` — their COUNT
+say why. A job whose detail cannot be read keeps the judgement the batch already carries (a job does
+not un-stop, so a settled shortfall and its warning survive a transient upstream error); with no
+previous judgement it is unknown. Still-dispatching, unrecognised and unknown jobs are recorded `settled: false` — their COUNT
 can genuinely run ahead of the pages, so "upstream returned incomplete data" would be false — and are
 told to nobody, but they go through exactly the same carry-forward, identical-content skip and merge
 cooldown as a settled gap. Before they were recorded at all, a running campaign's short pull left
@@ -280,8 +282,17 @@ used to fail every other batch in the job and leave Analytics showing only an er
    count, same content `fingerprint`), it is kept (`keepPublishedRevisionIfOwned`), the staged copy is
    deleted, and only the flag and the built-from stamps (`ingestedListedTotal`,
    `ingestedSourceFingerprint`, `ingestedRecordsStamp`, `sourceTotal`) are written. The carried rows are
-   only written to staging after this check, so the skip costs nothing.
+   only written to staging after this check, so the skip writes nothing; its read cost is the served
+   revision's ids (projected, `{recordId: 1}`) plus the full documents of the missing rows only, fetched
+   in `$in` chunks.
 3. Otherwise the union is published, flagged.
+
+**Bounded by what upstream lists.** In every legitimate case (tie loss, an add-only running job) the
+union is at most the list `total`: every carried row is a real row the pull missed. A union above it
+means the served revision holds rows upstream no longer counts (deleted upstream) or ids that stopped
+matching (a change in how `recordId` is derived would carry every old row and double the batch's total,
+rates and export). Then nothing is carried: the pull is published alone, flagged, and an error is
+logged.
 
 | Served before the pull | Outcome | `ingestStatus` | `shortPull` |
 |---|---|---|---|
@@ -297,19 +308,28 @@ this), and a running job's successive snapshots differ — so a pull with MORE r
 rows the customer had, and an equal-count pull swapped one subset for another. And a kept revision froze
 every status in it until a complete pull arrived. The union never removes a record on the word of a
 pull known to be incomplete and refreshes every record the pull did return. Its costs, accepted: a
-carried row may be behind on status (the reader copy says so); a row genuinely deleted upstream stays
-until the first COMPLETE pull, which publishes exactly what upstream lists and carries nothing; and a
-short pull reads the served revision once more (a cursor, filtered in-process — no `$nin` query
-document). A union can reach or pass `listed` while the pull itself was short; it stays flagged
+carried row may be behind on status (the reader copy says so); a row deleted upstream can stay until
+the union would exceed the list total (above) or the first COMPLETE pull, which publishes exactly what
+upstream lists and carries nothing; and a short pull reads the served revision's ids once more, plus the
+missing rows in full (no `$nin` query document). A union can reach or pass `listed` while the pull itself was short; it stays flagged
 (`shortPull` set, `stale`, re-pulled after the cooldown) because its carried rows are not current.
 
 **Resuming safely.** A resumed job reads its staging revision back and must not count rows an
 interrupted attempt carried as pulled, or a short pull would read as complete: rows with `carriedFrom`
 are excluded from the fetched set and dropped from staging (`deleteCarriedRecords`, a no-op on the
 published revision) to be re-derived. A page write of an id that was carried clears the marker
-(`replaceBatchRecords` `$unset`s it). If the job died after publishing the union but before its batch
-transition, the staging revision IS the published one, its carried rows are part of what is served, and
-the resumed pass finds it unchanged.
+(`replaceBatchRecords` `$unset`s it). A job also stores the list total beside its cursor
+(`Job.cursorListedTotal`): a resumed pass may see only empty pages, and an empty page need not report a
+total, so without it a resumed short pull would read as complete (a checkpoint from before the field
+falls back, for a revision the job already published, to its stamped `ingestedListedTotal`; a total
+reported by any page of the resumed pass supersedes both). If the job died after publishing the union
+but before its batch transition, the staging revision IS the published one: while the resumed pull is
+still short and the union within bounds, its carried rows stay part of what is served (unchanged → kept;
+new pages → republished); if the resumed pull is now complete, or carrying would exceed the total, the
+carried rows are deleted from that revision (`deleteCarriedRecords` with `includePublished`) and it is
+republished from the pulled rows alone, so a `ready`, unflagged batch never serves a row upstream does
+not list. The ownership checkpoint before a publish counts pulled rows only, so a resumed page
+checkpoint never undercounts the stored progress (`checkpointJob` refuses to move `done` backwards).
 
 The unchanged case is the common one against a core without the tiebreak: the loss is deterministic,
 so every re-pull of a finished job returns the same short set, and publishing it again wrote a complete

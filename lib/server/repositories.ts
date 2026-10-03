@@ -512,15 +512,22 @@ export async function getRecords(
   return cursor.toArray();
 }
 
+/** Ids per `$in` when fetching the records a short pull did not return. */
+const MISSING_RECORDS_CHUNK = 500;
+
 /** Records of `revision` whose ids are NOT in `present`: what a pull that came
  *  back short did not return, and so what the worker carries forward from the
  *  published revision rather than drop (see `ingestBatch`).
  *
- *  Filtered in-process off a cursor, not with a `$nin` of every id the pull
- *  returned — for a large campaign that is a query document of hundreds of
- *  kilobytes. `_id` and `retiredAt` are stripped so the rows can be written
- *  into another revision: the first would collide with the stored copy, the
- *  second describes the stored copy only. */
+ *  Two phases, because this runs on every incomplete pull — including the
+ *  common one whose result turns out identical and writes nothing — and full
+ *  documents carry transcripts and raw payloads. First only the ids are read
+ *  (`{recordId: 1}`) and compared in-process, not with a `$nin` of every id the
+ *  pull returned, which for a large campaign is a query document of hundreds of
+ *  kilobytes. Then only the missing records are fetched, in `$in` chunks.
+ *  `_id` and `retiredAt` are stripped so the rows can be written into another
+ *  revision: the first would collide with the stored copy, the second
+ *  describes the stored copy only. */
 export async function getRevisionRecordsMissingFrom(
   tenantId: string,
   accountId: string,
@@ -529,28 +536,40 @@ export async function getRevisionRecordsMissingFrom(
   present: ReadonlySet<string>,
 ): Promise<NormalizedRecord[]> {
   const col = await records();
+  const scope = { tenantId, accountId, batchId, revision };
+  const missingIds: string[] = [];
+  for await (const stored of col.find(scope, { projection: { _id: 0, recordId: 1 } })) {
+    if (!present.has(stored.recordId)) missingIds.push(stored.recordId);
+  }
   const missing: NormalizedRecord[] = [];
-  for await (const stored of col.find({ tenantId, accountId, batchId, revision })) {
-    if (present.has(stored.recordId)) continue;
-    const copy: NormalizedRecord & { _id?: unknown } = { ...stored };
-    delete copy._id;
-    delete copy.retiredAt;
-    missing.push(copy);
+  for (let i = 0; i < missingIds.length; i += MISSING_RECORDS_CHUNK) {
+    const chunk = missingIds.slice(i, i + MISSING_RECORDS_CHUNK);
+    for await (const stored of col.find({ ...scope, recordId: { $in: chunk } })) {
+      const copy: NormalizedRecord & { _id?: unknown } = { ...stored };
+      delete copy._id;
+      delete copy.retiredAt;
+      missing.push(copy);
+    }
   }
   return missing;
 }
 
 /** Drop carried-forward rows from a STAGING revision, so a resumed job can
  *  re-derive them against the revision it will actually publish over. A no-op
- *  for the published revision — those rows are what readers see. */
+ *  for the published revision — those rows are what readers see — unless
+ *  `includePublished` is passed: the one caller is a job that published this
+ *  revision itself, was interrupted before its batch transition, and is about
+ *  to republish it without those rows (its resumed pull came back complete, or
+ *  carrying them would exceed what upstream lists). */
 export async function deleteCarriedRecords(
   tenantId: string,
   accountId: string,
   batchId: string,
   revision: string,
+  options: { includePublished?: boolean } = {},
 ): Promise<void> {
   const batch = await getBatch(tenantId, accountId, batchId);
-  if (batch?.publishedRevision === revision) return;
+  if (batch?.publishedRevision === revision && !options.includePublished) return;
   const col = await records();
   await col.deleteMany({ tenantId, accountId, batchId, revision, carriedFrom: { $exists: true } });
 }
@@ -1228,7 +1247,7 @@ export async function updateClaimedJob(
 export async function checkpointJob(
   jobId: string,
   leaseId: string,
-  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil" | "warnings" | "cursorOrder">>
+  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil" | "warnings" | "cursorOrder" | "cursorListedTotal">>
 ): Promise<Job | null> {
   const col = await jobs();
   return col.findOneAndUpdate(

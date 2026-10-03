@@ -611,17 +611,36 @@ describe("expired batch cleanup", () => {
 describe("carried-forward records", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("returns the published rows a pull did not return, ready to write into another revision", async () => {
-    recordDb.find.mockReturnValue([
-      { _id: "oid-1", recordId: "1", revision: "rev-1", status: "done" },
-      { _id: "oid-3", recordId: "3", revision: "rev-1", status: "done", retiredAt: new Date(0) },
-    ]);
+  // Runs on every incomplete pull, even one that ends up writing nothing, so
+  // full documents (transcripts, raw payloads) are fetched only for the rows
+  // actually missing: ids first, then the missing ones by `$in`.
+  it("reads ids first and fetches only the missing records, ready to write into another revision", async () => {
+    recordDb.find
+      .mockReturnValueOnce([{ recordId: "1" }, { recordId: "2" }, { recordId: "3" }])
+      .mockReturnValueOnce([{ _id: "oid-3", recordId: "3", revision: "rev-1", status: "done", retiredAt: new Date(0) }]);
 
     const missing = await getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set(["1", "2"]));
 
-    expect(recordDb.find).toHaveBeenCalledWith({ tenantId: "t1", accountId: "a1", batchId: "b1", revision: "rev-1" });
+    const scope = { tenantId: "t1", accountId: "a1", batchId: "b1", revision: "rev-1" };
+    expect(recordDb.find).toHaveBeenNthCalledWith(1, scope, { projection: { _id: 0, recordId: 1 } });
+    expect(recordDb.find).toHaveBeenNthCalledWith(2, { ...scope, recordId: { $in: ["3"] } });
     // `_id` would collide with the stored copy; `retiredAt` describes it only.
     expect(missing).toEqual([{ recordId: "3", revision: "rev-1", status: "done" }]);
+  });
+
+  it("fetches nothing more when the pull returned every id", async () => {
+    recordDb.find.mockReturnValueOnce([{ recordId: "1" }, { recordId: "2" }]);
+    await expect(getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set(["1", "2"]))).resolves.toEqual([]);
+    expect(recordDb.find).toHaveBeenCalledTimes(1);
+  });
+
+  it("chunks the fetch of missing records", async () => {
+    const ids = Array.from({ length: 1001 }, (_, index) => `r${index}`);
+    recordDb.find.mockReturnValueOnce(ids.map((recordId) => ({ recordId }))).mockReturnValue([]);
+    await getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set());
+    const inSizes = recordDb.find.mock.calls.slice(1).map((call) => call[0].recordId.$in.length);
+    expect(inSizes).toEqual([500, 500, 1]);
+    recordDb.find.mockReset();
   });
 
   it("drops carried rows from a staging revision only", async () => {
@@ -636,6 +655,11 @@ describe("carried-forward records", () => {
     batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "j1" });
     await deleteCarriedRecords("t1", "a1", "b1", "j1");
     expect(recordDb.deleteMany).not.toHaveBeenCalled();
+
+    // ...unless the job that published it is about to republish without them.
+    batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "j1" });
+    await deleteCarriedRecords("t1", "a1", "b1", "j1", { includePublished: true });
+    expect(recordDb.deleteMany).toHaveBeenCalledWith(expect.objectContaining({ revision: "j1", carriedFrom: { $exists: true } }));
   });
 
   // A row the pull returned replaces a carried copy of the same id staged

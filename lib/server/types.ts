@@ -47,8 +47,10 @@ export function isEmptyDispatchedPull(recordCount: number, dispatched: number | 
  *
  *  More unique records than `listedTotal` is not a fault — rows can only have
  *  been added between the COUNT and the pages — and an absent total is no
- *  claim. Callers must still gate on the job having stopped adding rows: while
- *  it is still dispatching, both numbers legitimately move. */
+ *  claim. A true result is always recorded, but it is LOSS only once the job
+ *  has stopped adding rows: while it is still dispatching both numbers
+ *  legitimately move, which is what `PullShortfall.settled` distinguishes —
+ *  only a settled gap may be reported to a reader. */
 export function isIncompletePaginatedPull(uniqueRecords: number, listedTotal: number | null | undefined): boolean {
   return (listedTotal ?? 0) > uniqueRecords;
 }
@@ -381,6 +383,11 @@ export interface Job {
    *  checkpoints written before it existed, which are read as
    *  `LEGACY_LIST_ORDER` (no sort parameter: the server default). */
   cursorOrder?: string;
+  /** The list surface's `total` as of the pages behind `cursor` (null when
+   *  none reported one). A resumed pull's remaining pages can all be empty —
+   *  it may resume past the end — and an empty page need not carry a total, so
+   *  without this a resumed short pull could not be told from a complete one. */
+  cursorListedTotal?: number | null;
   batchIndex?: number;
   retryAt?: string | null;
   retryCount?: number;
