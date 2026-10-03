@@ -500,26 +500,80 @@ describe("POST /api/ingest", () => {
   });
 
   // A running campaign's short pull is recorded unsettled — shown to nobody —
-  // but its observation time rate-limits merges exactly the same way. Before
-  // it was recorded at all, every Generate re-paged upstream and wrote another
-  // full copy of a running campaign, the cooldown notwithstanding.
-  it("applies the cooldown to the unsettled short pull of a job still dispatching", async () => {
-    vi.mocked(isBackendConfigured).mockReturnValue(true);
-    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
-    vi.mocked(getBatch).mockResolvedValue({
+  // and the cooldown honours it only while a live read proves nothing moved:
+  // the job is still dispatching and no row of it has been written since the
+  // pull. Otherwise every Generate re-paged a quiet running campaign.
+  describe("an unsettled short pull inside the cooldown", () => {
+    const unsettled = () => ({
       total: 2000, sourceTotal: 3000, ingestedListedTotal: 2400, selType: "ai", ingestStatus: "stale",
       shortPull: {
         listed: 2400, received: 2000, carried: 0, keptPrevious: false, settled: false,
         detectedAt: new Date(Date.now() - 60_000).toISOString(),
       },
       sourceId: "job-1",
-    } as never);
-    vi.mocked(countRecords).mockResolvedValue(2000);
-    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
-    const { POST } = await import("@/app/api/ingest/route");
-    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
-    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
-    expect(createJob).not.toHaveBeenCalled();
+      ingestedRecordsStamp: STAMP_AT_INGEST,
+    });
+    const setup = () => {
+      vi.mocked(isBackendConfigured).mockReturnValue(true);
+      vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+      vi.mocked(getBatch).mockResolvedValue(unsettled() as never);
+      vi.mocked(countRecords).mockResolvedValue(2000);
+      vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    };
+
+    it("serves it while the job is still dispatching and untouched since", async () => {
+      setup();
+      getBulkJob.mockResolvedValue({ id: "job-1", status: "processing", records_updated_at: "2026-09-01T10:00:00.000000Z" });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+      await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+      expect(getBulkJob).toHaveBeenCalledWith("job-1");
+      expect(createJob).not.toHaveBeenCalled();
+    });
+
+    // The review's scenario: pulled mid-run, the campaign then finished. Serving
+    // the snapshot would hand over an incomplete CSV with no warning at all,
+    // since an unsettled shortfall is shown to nobody. Re-pulling is what makes
+    // it a settled, reader-facing record (and writes nothing if unchanged).
+    it("re-pulls once the job has finished, even though the record is recent", async () => {
+      setup();
+      getBulkJob.mockResolvedValue({ id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+      await expect(res.json()).resolves.toMatchObject({ jobId: expect.any(String), ready: false });
+      expect(createJob).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["a row was written since the pull", { status: "processing", records_updated_at: "2026-09-01T10:05:00.000000Z" }],
+      ["master cannot state the stamp", { status: "processing", records_updated_at: null }],
+    ])("re-pulls when %s", async (_label, job) => {
+      setup();
+      getBulkJob.mockResolvedValue({ id: "job-1", ...job });
+      const { POST } = await import("@/app/api/ingest/route");
+      await POST(req({ batchIds: ["b1"], type: "merge" }));
+      expect(createJob).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-pulls when the job cannot be read", async () => {
+      setup();
+      getBulkJob.mockRejectedValue(new Error("upstream 500"));
+      const { POST } = await import("@/app/api/ingest/route");
+      await POST(req({ batchIds: ["b1"], type: "merge" }));
+      expect(createJob).toHaveBeenCalledTimes(1);
+    });
+
+    // A settled record needs no live read: the job's rows are fixed.
+    it("does not read the job for a settled record", async () => {
+      setup();
+      vi.mocked(getBatch).mockResolvedValue({
+        ...unsettled(), shortPull: { ...unsettled().shortPull, settled: true },
+      } as never);
+      const { POST } = await import("@/app/api/ingest/route");
+      await POST(req({ batchIds: ["b1"], type: "merge" }));
+      expect(getBulkJob).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+    });
   });
 
   it("re-pulls on a merge once the cooldown has passed", async () => {

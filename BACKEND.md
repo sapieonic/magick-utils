@@ -374,8 +374,13 @@ this a re-export after the core fix would still stream the short revision) — b
 (`shortPullCheckedRecently`, keyed on `shortPull.detectedAt`, which every short re-pull re-stamps). The
 re-pull is the same short set every time against an unfixed core, so re-paging each flagged batch on
 each Generate was pure load from one host against master's global per-IP limit (~83 page requests per
-Generate for an 8k-record selection). The cooldown applies to every recorded short pull, settled or not —
-a running campaign's included. A batch that merely *may* be short (legacy stamps from before
+Generate for an 8k-record selection). A settled record is honoured outright. An UNSETTLED one (taken
+while the job was still adding rows) is honoured only after a live read of the job proves nothing has
+moved since (`unsettledShortPullStillCurrent` in the ingest route): the job still has not stopped adding
+rows, and its records stamp is known and equal to the one observed before that pull. Otherwise it is
+re-pulled — in particular once the campaign finishes, or a merge inside the cooldown would stream the
+mid-run snapshot under "Download ready" with no warning, since an unsettled shortfall is shown to nobody.
+That re-pull is what records the shortfall as settled and reader-facing. A batch that merely *may* be short (legacy stamps from before
 `shortPull` existed) has no recorded observation and is re-pulled, since that pull is what judges it. An explicit Analytics
 Refresh ignores the cooldown. A plain Analytics load does not re-pull at all — it serves the flagged
 data; re-pulling on every page view would re-page upstream per visit. The first complete pull publishes

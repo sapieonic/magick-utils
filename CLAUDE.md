@@ -85,7 +85,9 @@ forward** into the new revision (marked `carriedFrom`). If that union is IDENTIC
 (same count and content fingerprint, which covers every reader-visible field — `record-fingerprint.ts`;
 the usual case on a re-pull) nothing is written but the flag; otherwise it is published. Either way the
 batch reads `stale` and the worker records `BatchDoc.shortPull` with a `detectedAt` — for a job still
-adding rows too, as `settled: false`, because that timestamp is what rate-limits merges. Only a
+adding rows too, as `settled: false`, because that timestamp is what rate-limits merges (an unsettled
+record is honoured only while a live read shows the job still dispatching and its records stamp
+unchanged; once the campaign finishes, the next merge re-pulls so the gap becomes settled and visible). Only a
 **settled** gap (the job has stopped adding rows) is reader-facing (`isReaderFacingShortfall`: Analytics
 notice, Combine label, per-campaign download) and gets a `JobWarning`, written in the same checkpoint
 that moves the job past the batch; the job finishes `done` while its other batches publish normally.

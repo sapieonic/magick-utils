@@ -4,7 +4,9 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext, persistRefreshedCredential } from "@/lib/server/session";
 import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
+import { jobStoppedAddingRows } from "@/lib/server/job-state";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
+import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
 import {
   acquireIngestionLocks,
   countRecords,
@@ -118,6 +120,44 @@ async function refreshableBatchIds(
   return keep;
 }
 
+/**
+ * Whether a merge may still serve a batch whose recorded short pull was
+ * UNSETTLED — taken while the job was still adding rows — without re-paging.
+ *
+ * The cooldown exists so an unchanged short batch is not re-paged on every
+ * Generate. For a settled record that is safe: the job's rows are fixed and the
+ * loss is deterministic. An unsettled record is a snapshot of a job in motion,
+ * and serving it is only safe while nothing has moved since. The case that is
+ * not: a campaign pulled mid-run, which then finishes — within the cooldown the
+ * merge would stream the mid-run snapshot, and because the record is unsettled
+ * no reader is told it is short ("Download ready · N rows", no warning). So the
+ * job is read live, and the record is honoured only when BOTH hold:
+ *
+ * - the job still has not stopped adding rows (`jobStoppedAddingRows`); once it
+ *   has, a re-pull is what turns the record into a settled, reader-facing one
+ *   (and writes nothing if the data is the same), and
+ * - its records stamp is known and equal to the one observed before the pull
+ *   that made the record — no core row of the job was written since. A null on
+ *   either side is unknown, never unchanged, as everywhere else.
+ *
+ * Anything unprovable, including an unreadable job, re-pulls: redundant paging
+ * is the recoverable direction. A credential that can never be renewed is
+ * rethrown, as in `refreshableBatchIds`.
+ */
+async function unsettledShortPullStillCurrent(client: MagickClient, batch: BatchDoc): Promise<boolean> {
+  if (!batch.sourceId || !batch.ingestedRecordsStamp) return false;
+  try {
+    const job = await client.getBulkJob(batch.sourceId);
+    if (jobStoppedAddingRows(job)) return false;
+    const stamp = bulkJobRecordsStamp(job);
+    return stamp != null && stamp === batch.ingestedRecordsStamp;
+  } catch (err) {
+    if (err instanceof TokenRefreshPermanentError) throw err;
+    log().warn({ error: err, batchId: batch.batchId }, "merge cooldown source check failed — re-pulling to be safe");
+    return false;
+  }
+}
+
 /** Enqueue an ingestion (or merge) job for a set of batches. The worker picks it
  *  up, paginates magick-master, normalizes, and persists records to Mongo. */
 export const POST = withLogging("ingest", async (req: Request) => {
@@ -196,7 +236,7 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // SHORT_PULL_REPULL_COOLDOWN_MS is served as it stands; the next merge after
     // the window re-pulls it, which is what lets it converge once core is fixed.
     // Every short pull the worker makes is recorded with its time — a running
-    // job's too, unsettled — so the cooldown covers them all. A batch that
+    // job's too, unsettled (honoured only after the live check below). A batch that
     // merely MAY be short (legacy stamps from before `shortPull` existed) has
     // no recorded observation and is re-pulled — that pull is what judges it.
     //
@@ -204,11 +244,33 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // data and its Refresh button is the deliberate re-pull, which ignores the
     // cooldown (refreshableBatchIds); re-pulling on every page view would be a
     // full upstream re-page per visit for as long as upstream stays unfixed.
+    //
+    // An UNSETTLED record (taken while the job was still adding rows) is
+    // honoured only after a live check that nothing has moved since — see
+    // `unsettledShortPullStillCurrent` — and is otherwise re-pulled.
     if (type === "merge" && needsCompletenessRepull(doc) && !shortPullCheckedRecently(doc)) return false;
     return true;
   });
+  const unsettledInCooldown = requestedBatchIds
+    .map((_, index) => index)
+    .filter((index) =>
+      complete[index] &&
+      type === "merge" &&
+      needsCompletenessRepull(batchDocs[index]) &&
+      batchDocs[index].shortPull?.settled === false,
+    );
   let batchIds: string[];
   try {
+    if (unsettledInCooldown.length > 0) {
+      const client = new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential });
+      for (let i = 0; i < unsettledInCooldown.length; i += REFRESH_CHECK_CONCURRENCY) {
+        const slice = unsettledInCooldown.slice(i, i + REFRESH_CHECK_CONCURRENCY);
+        const current = await Promise.all(slice.map((index) => unsettledShortPullStillCurrent(client, batchDocs[index])));
+        slice.forEach((index, offset) => {
+          if (!current[offset]) complete[index] = false;
+        });
+      }
+    }
     batchIds = forceRefresh
       ? await refreshableBatchIds(ctx, requestedBatchIds, batchDocs, complete)
       : requestedBatchIds.filter((_, index) => !complete[index]);
