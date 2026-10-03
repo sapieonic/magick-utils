@@ -50,6 +50,7 @@ import { logger } from "@/lib/server/logger";
 import { MagickApiError } from "@/lib/server/magick-client";
 import { processJob, runClaimedJob, SWEEP_DELAY_MARGIN_MS } from "@/lib/server/worker";
 import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
+import { recordsContentFingerprint } from "@/lib/server/record-fingerprint";
 
 // Mirrors the repositories mock above; the real constant is covered by its own test.
 const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
@@ -957,6 +958,10 @@ describe("processJob incomplete upstream pull", () => {
       "lease-1",
     );
     expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
+    // The warning is durable in the same write that moves the job past b1.
+    expect(repositories.checkpointJob).toHaveBeenCalledWith("j1", "lease-1", {
+      done: 2, cursor: 0, batchIndex: 1, warnings: [expect.objectContaining({ batchId: "b1", kind: "incomplete_upstream" })],
+    });
     // The job finishes, carrying the shortfall where the screen can read it.
     expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
       "j1",
@@ -1303,8 +1308,11 @@ describe("processJob incomplete upstream pull", () => {
       "j1",
       "lease-1",
     );
-    // A warning an earlier run of this job left for b1 is withdrawn.
-    expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", { warnings: [] });
+    // A warning an earlier run of this job left for b1 is withdrawn — in the
+    // same write that moves the job past b1.
+    expect(repositories.checkpointJob).toHaveBeenCalledWith("j1", "lease-1", {
+      done: 3, cursor: 0, batchIndex: 1, warnings: [],
+    });
     expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
       "j1",
       "lease-1",
@@ -1443,6 +1451,59 @@ describe("processJob incomplete upstream pull", () => {
       "j1",
       "lease-1",
     );
+  });
+
+  // The keep path used to move `batchIndex` past the batch in one write and
+  // record the warning in a second, after `ingestBatch` returned. A kill
+  // between the two resumed the job past the batch with no warning, and
+  // Analytics — which treats every batch of the job as covered by its warnings
+  // — suppressed the listing's shortfall too, so the notice vanished.
+  it("still reports the shortfall when the job dies right after keeping the published revision", async () => {
+    const publishedFp = recordsContentFingerprint(records("1", "2") as never);
+    repositories.getBatch.mockImplementation((_t: string, _a: string, id: string) =>
+      Promise.resolve(
+        id === "b1"
+          ? { ...batch("b1"), name: "Promo", total: 2, fingerprint: publishedFp, ingestStatus: "stale", publishedRevision: "old-rev" }
+          : batch(id),
+      ),
+    );
+    client.getBulkJob.mockImplementation((id: string) => Promise.resolve({ ...completed, id }));
+    client.listCalls.mockResolvedValueOnce(shortPage);
+    repositories.getRecordsForRevision.mockResolvedValueOnce(records("1", "2"));
+    // The job document as Mongo would hold it: every durable write applied.
+    let stored: Job = job({ batchIds: ["b1", "b2"], total: 3 });
+    const persist = (_jobId: string, _leaseId: string, patch: Partial<Job>) => {
+      stored = { ...stored, ...patch };
+      return Promise.resolve(stored);
+    };
+    repositories.checkpointJob.mockImplementation(persist);
+    // The lease is lost on the very next write after the transition past b1,
+    // whatever that write is — the narrowest kill the old ordering lost to.
+    let killed = false;
+    repositories.updateClaimedJob.mockImplementation((jobId: string, leaseId: string, patch: Partial<Job>) => {
+      if (!killed && stored.batchIndex === 1) {
+        killed = true;
+        return Promise.resolve(null);
+      }
+      return persist(jobId, leaseId, patch);
+    });
+
+    await expect(processJob(stored)).rejects.toThrow(/lease lost/);
+    expect(killed).toBe(true);
+    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledTimes(1);
+    expect(stored.batchIndex).toBe(1);
+    expect(stored.warnings).toEqual([expect.objectContaining({ kind: "incomplete_upstream", batchId: "b1" })]);
+
+    // A new claim resumes past b1 and finishes b2; b1's warning survives.
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "9" }], total: 1 });
+    repositories.getRecordsForRevision.mockResolvedValueOnce(records("9"));
+    await processJob({ ...stored, leaseId: "lease-1" });
+
+    expect(client.listCalls).toHaveBeenCalledTimes(2);
+    expect(stored.status).toBe("done");
+    expect(stored.warnings).toEqual([
+      expect.objectContaining({ kind: "incomplete_upstream", batchId: "b1", listed: 3, received: 2 }),
+    ]);
   });
 
   it("fails on a lost lease while keeping the previous revision", async () => {

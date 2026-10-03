@@ -307,6 +307,9 @@ export async function processJob(job: Job) {
   let warnings: JobWarning[] = [...(job.warnings ?? [])];
   for (let batchIndex = startBatch; batchIndex < job.batchIds.length; batchIndex += 1) {
     const batchId = job.batchIds[batchIndex];
+    // `ingestBatch` writes this batch's warning (or its withdrawal) in the SAME
+    // checkpoint that advances `batchIndex` past the batch — see
+    // `withBatchWarning` — so what is returned here is already durable.
     const outcome = await ingestBatch(
       client,
       ctx,
@@ -316,24 +319,12 @@ export async function processJob(job: Job) {
       batchIndex,
       job.cursor ?? 0,
       completedDone,
+      warnings,
     );
     done = outcome.done;
     completedDone = done;
     job.cursor = 0;
-    // One entry per batch: a batch re-ingested on resume replaces what an
-    // earlier run said about it, including clearing it if this pull was whole.
-    const hadWarning = warnings.some((warning) => warning.batchId === batchId);
-    if (outcome.warning || hadWarning) {
-      warnings = [
-        ...warnings.filter((warning) => warning.batchId !== batchId),
-        ...(outcome.warning ? [outcome.warning] : []),
-      ];
-      // Written now rather than only at completion, so a deferral later in the
-      // job cannot lose it.
-      if (!(await updateClaimedJob(job.jobId, leaseId, { warnings }))) {
-        throw new Error("job lease lost while recording a batch warning");
-      }
-    }
+    warnings = outcome.warnings;
   }
 
   const result = job.type === "merge" ? { rowCount: done } : undefined;
@@ -466,6 +457,31 @@ function jobStoppedAddingRows(job: RawBulkJob | null, now: number = Date.now()):
   return now - stoppedAt >= ROWS_SETTLE_WINDOW_MS;
 }
 
+/** The job's warnings after `batchId` finished, and whether they changed.
+ *
+ *  One entry per batch: a batch re-ingested on resume replaces what an earlier
+ *  run said about it, including clearing it if this pull was whole.
+ *
+ *  Written by the caller in the same checkpoint that moves `batchIndex` past
+ *  the batch, never afterwards. The two used to be separate writes — the
+ *  transition first, the warning once `ingestBatch` returned — and a lease
+ *  loss, deploy or kill between them resumed the job PAST the batch, so the
+ *  warning was never written; Analytics then treats every batch of the job as
+ *  covered by its warnings and suppressed the listing's shortfall too, so the
+ *  notice vanished entirely. */
+function withBatchWarning(
+  warnings: readonly JobWarning[],
+  batchId: string,
+  warning: JobWarning | undefined,
+): { warnings: JobWarning[]; changed: boolean } {
+  const had = warnings.some((existing) => existing.batchId === batchId);
+  if (!warning && !had) return { warnings: [...warnings], changed: false };
+  return {
+    warnings: [...warnings.filter((existing) => existing.batchId !== batchId), ...(warning ? [warning] : [])],
+    changed: true,
+  };
+}
+
 async function ingestBatch(
   client: MagickClient,
   ctx: TenantContext,
@@ -475,7 +491,8 @@ async function ingestBatch(
   batchIndex: number,
   initialOffset: number,
   completedDone: number,
-): Promise<{ done: number; warning?: JobWarning }> {
+  priorWarnings: readonly JobWarning[],
+): Promise<{ done: number; warnings: JobWarning[] }> {
   const batch = await getBatch(ctx.tenantId, ctx.accountId, batchId);
   if (!batch) throw new Error(`batch ${batchId} not found (list campaigns first)`);
 
@@ -863,9 +880,15 @@ async function ingestBatch(
         });
       }
       const done = completedDone + batch.total;
-      const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
+      const next = withBatchWarning(priorWarnings, batchId, warning);
+      const transitioned = await checkpointJob(jobId, leaseId, {
+        done,
+        cursor: 0,
+        batchIndex: batchIndex + 1,
+        ...(next.changed ? { warnings: next.warnings } : {}),
+      });
       if (!transitioned) throw new Error("job lease lost during batch transition");
-      return { done, warning };
+      return { done, warnings: next.warnings };
     }
     log().warn(shortfallLog, "[worker] paginated pull came back short of upstream's total; publishing it flagged incomplete");
     shortfallWarning = warning;
@@ -978,8 +1001,14 @@ async function ingestBatch(
   // passed instead of leaving a full duplicate dataset for the daily cron.
   scheduleSupersededRevisionSweep(ctx, batchId, revision);
   const done = completedDone + records.length;
-  const transitioned = await checkpointJob(jobId, leaseId, { done, cursor: 0, batchIndex: batchIndex + 1 });
+  const next = withBatchWarning(priorWarnings, batchId, shortfallWarning);
+  const transitioned = await checkpointJob(jobId, leaseId, {
+    done,
+    cursor: 0,
+    batchIndex: batchIndex + 1,
+    ...(next.changed ? { warnings: next.warnings } : {}),
+  });
   if (!transitioned) throw new Error("job lease lost during batch transition");
   log().info({ batchId, records: records.length, durationMs: Date.now() - startedAt }, "[worker] batch ingested");
-  return { done, warning: shortfallWarning };
+  return { done, warnings: next.warnings };
 }

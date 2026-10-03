@@ -304,7 +304,9 @@ records — so nothing reports "earlier data" for it. A first pull is published 
 refused because a brand-new customer would otherwise see nothing at all until core deploys, while a
 partial dataset labelled "N of M" is both usable and honest. Keeping a fuller revision beats replacing
 it with a short one on a refresh — the customer already had more. Either way the job finishes `done`
-with a `JobWarning` per affected batch (written as it happens, so a deferral cannot lose it), and the
+with a `JobWarning` per affected batch — written in the same checkpoint that moves `batchIndex` past the
+batch, so neither a deferral nor a kill between the two can resume the job past the batch without it
+(Analytics treats a job's batches as covered by its warnings, so a lost one hid the notice entirely) — and the
 other batches in the job publish normally.
 
 **Readers.** `BatchDoc.shortPull` (`{listed, received, keptPrevious, detectedAt}`) is the one
