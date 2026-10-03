@@ -3,11 +3,20 @@
 // (used by the campaigns listing before any records are ingested).
 
 import type { Batch, BreakdownSeg, StatusKey } from "@/lib/types";
-import { isBatchReadable, type BatchDoc, type TenantContext } from "./types";
+import {
+  isBatchReadable,
+  isReaderFacingShortfall,
+  needsCompletenessRepull,
+  type BatchDoc,
+  type TenantContext,
+} from "./types";
 import type { RawBulkJob } from "./magick-client";
 import { dispatchTypeToType, normalizeStatus } from "./normalize";
 import { normalizeJobDispatchType } from "./magick-client";
 import { fingerprint, stableJson } from "./fingerprint";
+import { bulkJobRecordsStamp } from "./records-stamp";
+
+export { bulkJobRecordsStamp };
 
 const PREFIX: Record<string, string> = { ai: "AI", ivr: "IVR", whatsapp: "WA", telegram: "TG", email: "EM" };
 
@@ -44,6 +53,12 @@ export function batchDocToBatch(doc: BatchDoc): Batch {
     avgDuration: doc.avgDuration,
     avgTalkTime: doc.avgTalkTime,
     ingestStatus: doc.ingestStatus,
+    // Only ever the worker's exact judgement, never `publishedRevisionMayBeShort`'s
+    // legacy fallback — that one flags healthy partially-failed campaigns and
+    // is fit to schedule a re-pull, not to put a warning in front of a customer.
+    // And only a SETTLED one: a short pull of a job still dispatching is
+    // recorded (it rate-limits merge re-pulls) but says nothing about upstream.
+    shortfall: isReaderFacingShortfall(doc.shortPull) ? doc.shortPull! : null,
   };
 }
 
@@ -113,17 +128,13 @@ function messageBreakdown(status: string, total: number): BreakdownSeg[] {
  *  already-ingested batch is still in step with its source — i.e. whether the
  *  campaigns listing should mark it "stale".
  *
- *  Deliberately excludes `updated_at`: magick-master bumps it on any write to
- *  the job, including enrichment that changes no record. Including it made this
- *  fingerprint churn on ordinary listings, which reset ingested batches and
- *  cost a full duplicate re-ingest every time.
- *
- *  That omission makes this signal one-directional: a change here proves the
- *  source moved, but no change does NOT prove it stood still. `status_summary`
- *  and `call_status_counts` are call-dispatch-only (see RawBulkJob), so for a
- *  messaging campaign this reduces to id/total/status and cannot see delivery
- *  receipts or replies arriving. Anything deciding whether to SKIP work must
- *  therefore use `bulkJobIsUnchangedSince` below, never this alone. */
+ *  This signal is one-directional: a change here proves the source moved, but
+ *  no change does NOT prove it stood still. `status_summary` and
+ *  `call_status_counts` are counts, so a recording, transcript, outcome or
+ *  post-call analysis landing on a call that keeps its status moves nothing
+ *  here, and for a messaging campaign this reduces to id/total/status.
+ *  Anything deciding whether to SKIP work must therefore use
+ *  `bulkJobIsUnchangedSince` below, never this alone. */
 export function bulkJobSourceFingerprint(job: RawBulkJob): string {
   return fingerprint([
     (job.id ?? "").toString(),
@@ -147,35 +158,42 @@ function unorderedJson(rows: Array<Record<string, number>> | null | undefined): 
   return `[${rows.map(stableJson).sort().join(",")}]`;
 }
 
-/** Upstream job states after which no further records or enrichment arrive.
- *  Anything else — including an unrecognised state — counts as still moving. */
-const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled", "canceled"]);
+/** Upstream job states after which master dispatches nothing more. Anything
+ *  else — including an unrecognised state — counts as still moving.
+ *
+ *  `partially_failed` is as terminal as `completed` (master's lifecycle ends
+ *  in one of these four); leaving it out sent every partially failed campaign
+ *  through a full re-pull on each Refresh. Enrichment that keeps arriving after
+ *  a terminal status (analysis, recordings, receipts) is what the records stamp
+ *  below exists to see — terminal status is necessary, never sufficient. */
+const TERMINAL_JOB_STATUSES = new Set(["completed", "partially_failed", "failed", "cancelled", "canceled"]);
 
 /**
  * Whether `job` can be proven untouched since a previous ingestion recorded
- * `ingestedSourceUpdatedAt`, so re-pulling it would rewrite the same dataset.
+ * `ingestedRecordsStamp`, so re-pulling it would rewrite the same dataset.
  *
- * Requires both: the job has finished (a running campaign keeps producing
- * records), and upstream has not written to it since. `updated_at` is the whole
- * test on purpose. It is the only field that moves for the changes
- * `bulkJobSourceFingerprint` is blind to — message delivery and read receipts,
- * replies, and post-call AI enrichment such as sentiment, key topics and cost.
- * It is also a single scalar present on both the list and the detail payload,
- * so the value stamped at ingestion and the value checked here are comparable
- * even if the two endpoints differ in the richer summary fields.
+ * Requires both: the job is terminal (a running campaign keeps producing
+ * records), and its records stamp equals the one observed BEFORE the last pull
+ * began. The ordering is what makes equality sufficient: anything written
+ * after that observation moves the stamp, so the next check re-pulls; a stamp
+ * read after the pull could include a write the pull missed and then hide it
+ * forever.
  *
- * Errs toward "changed": an unknown status, an upstream that sends no
- * `updated_at`, or a batch ingested before this marker existed all return false
- * and get re-ingested. Redundant work is recoverable and self-cleaning;
- * silently serving a customer stale data is not.
+ * Errs toward "changed": an unknown status, a null on either side (master
+ * could not say, or the batch was ingested before this marker existed), or a
+ * stamp written under the old `updated_at` meaning — those docs carry no
+ * `ingestedRecordsStamp` at all — all return false and get re-ingested.
+ * Redundant work is recoverable and self-cleaning; silently serving a customer
+ * stale data is not.
  */
 export function bulkJobIsUnchangedSince(
   job: RawBulkJob,
-  ingestedSourceUpdatedAt: string | null | undefined,
+  ingestedRecordsStamp: string | null | undefined,
 ): boolean {
-  if (!ingestedSourceUpdatedAt) return false;
+  if (!ingestedRecordsStamp) return false;
   if (!TERMINAL_JOB_STATUSES.has((job.status ?? "").toLowerCase().trim())) return false;
-  return (job.updated_at ?? null) === ingestedSourceUpdatedAt;
+  const current = bulkJobRecordsStamp(job);
+  return current !== null && current === ingestedRecordsStamp;
 }
 
 /** Build a (pre-ingestion) BatchDoc summary from a bulk-dispatch job.
@@ -296,14 +314,34 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     // Preserved so a refresh can tell an unchanged source (nothing to re-pull)
     // from a genuinely moved one. Only a completed ingestion writes these.
     ingestedSourceFingerprint: existing?.ingestedSourceFingerprint,
-    ingestedSourceUpdatedAt: existing?.ingestedSourceUpdatedAt,
+    ingestedRecordsStamp: existing?.ingestedRecordsStamp,
+    ingestedListedTotal: existing?.ingestedListedTotal,
+    // The worker's record of a short pull is about the PUBLISHED revision (or
+    // the one kept in its place), not about this listing, so it survives every
+    // listing until a pull is complete.
+    shortPull: existing?.shortPull ?? null,
     publishedRevision: existing?.publishedRevision,
     // "stale" keeps the published revision readable — analytics and exports
     // keep working off it — while marking that a refresh has something to pull.
     // An ingested batch is re-derived from the comparison each time rather than
     // carried forward, so a source that moves and then moves back resolves to
     // "ready" again instead of latching stale until someone forces a re-pull.
-    ingestStatus: ingested ? (sourceChanged ? "stale" : "ready") : existing?.ingestStatus ?? "none",
+    //
+    // A batch whose published revision may be incomplete, or whose latest pull
+    // came back short, is stale too, whatever the fingerprint says: "ready"
+    // would let the refresh path prove it unchanged and skip it forever (see
+    // needsCompletenessRepull).
+    ingestStatus: ingested
+      ? sourceChanged ||
+        needsCompletenessRepull({
+          total,
+          sourceTotal: dispatchedTotal,
+          ingestedListedTotal: existing?.ingestedListedTotal,
+          shortPull: existing?.shortPull,
+        })
+        ? "stale"
+        : "ready"
+      : existing?.ingestStatus ?? "none",
     updatedAt: new Date().toISOString(),
   };
 }

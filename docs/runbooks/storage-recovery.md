@@ -67,18 +67,21 @@ by `dataSize` and by writes succeeding again, not by the disk figure.
 
 ## 4. Expect one re-ingest per batch, once
 
-A refresh is skipped only when the batch carries `ingestedSourceUpdatedAt`, which
-is stamped at ingestion time. Batches ingested before this deploy have no stamp,
-so the first "Refresh data" on each will do a full re-pull. This cannot be
-backfilled honestly — the value has to be the source's state *at the time of the
-last pull*, and that was never recorded — so the one-time cost is deliberate.
+A refresh is skipped only when the batch carries an `ingestedRecordsStamp` (master's
+`records_updated_at` + `status_summary`, observed before the pull) that the job
+still matches. Batches ingested before that stamp existed have none, so the first
+"Refresh data" on each will do a full re-pull. This cannot be backfilled honestly —
+the value has to be the source's state *at the time of the last pull*, and that was
+never recorded — so the one-time cost is deliberate. (The stamp it replaced,
+`ingestedSourceUpdatedAt`, copied a job `updated_at` master never sends, so it was
+null everywhere and the skip never engaged at all.)
 
 It is bounded: the worker reclaims the superseded copy after the grace window, so
 peak usage is roughly 2× that batch for the length of the window, not permanently.
 If the cluster is very tight, run step 2 first so the re-ingest has headroom.
 
 One batch always re-pulls regardless of its stamp: a batch the campaigns listing
-has flagged `stale`. That flag is evidence the source moved, so the timestamp
+has flagged `stale`. That flag is evidence the source moved, so the stamp
 check is skipped entirely — without that escape hatch the two freshness signals
 can disagree and latch a batch stale with no click able to clear it. If you see a
 batch refuse to leave `stale`, that rule is the thing to check first.
@@ -92,9 +95,12 @@ Two lines confirm the fix is working in production:
 - `superseded revision rows reclaimed` / `… reclaimed after grace`, with a
   `reclaimed` row count — the worker cleaning up after itself.
 
-Absence of the first under repeated refreshes means the skip is not engaging;
-check that `ingestedSourceUpdatedAt` is being stamped (`[worker] source stamp
-unavailable` warns when the upstream read failed).
+Absence of the first under repeated refreshes means the skip is not engaging.
+Check, in order: that master returns a non-null `records_updated_at` on
+`GET /bulk-dispatch-jobs/:id` (null is expected for messaging campaigns, for a
+campaign written in the last two minutes, and against a master or core that
+predates it); that `ingestedRecordsStamp` is set on the batch document; and that
+the source read is not failing (`source job unavailable` warns when it does).
 
 ## 6. Only then, consider more history
 

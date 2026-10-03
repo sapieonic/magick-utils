@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/sapieonic/magick-utils/compare/v1.4.0...v1.4.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **worker:** flag incomplete upstream pulls and skip re-pulls on records freshness ([#43](https://github.com/sapieonic/magick-utils/issues/43)) ([cc3847a](https://github.com/sapieonic/magick-utils/commit/cc3847a3f967fdd99167c65bf29677c481e309c1))
+
 # [1.4.0](https://github.com/sapieonic/magick-utils/compare/v1.3.10...v1.4.0) (2026-09-23)
 
 

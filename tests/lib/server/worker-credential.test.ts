@@ -18,6 +18,8 @@ const repositories = vi.hoisted(() => ({
   failBatchIfOwned: vi.fn(),
   getBatch: vi.fn(),
   getRecordsForRevision: vi.fn(),
+  getRevisionRecordsMissingFrom: vi.fn(),
+  deleteCarriedRecords: vi.fn(),
   publishBatchIfOwned: vi.fn(),
   releaseIngestionLocks: vi.fn(),
   renewIngestionLocks: vi.fn(),
@@ -141,6 +143,8 @@ beforeEach(() => {
   repositories.deleteSupersededRecordRevisions.mockResolvedValue(0);
   repositories.deleteOrphanedRecordRevisions.mockResolvedValue(0);
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
+  repositories.getRevisionRecordsMissingFrom.mockResolvedValue([]);
+  repositories.deleteCarriedRecords.mockResolvedValue(undefined);
   client.getBulkJob.mockResolvedValue({
     id: "source-b1",
     dispatch_type: "ai_voice_call",

@@ -9,7 +9,17 @@ vi.mock("@/lib/server/logger", () => ({
   log: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
-import { MagickClient, parseRetryAfter, resolveJobDispatchType, inferJobDispatchType, JOB_LIST_SURFACE, type RawBulkJob } from "@/lib/server/magick-client";
+import {
+  MagickClient,
+  parseRetryAfter,
+  resolveJobDispatchType,
+  inferJobDispatchType,
+  JOB_LIST_SURFACE,
+  LEGACY_LIST_ORDER,
+  listOrderToken,
+  type JobDispatchType,
+  type RawBulkJob,
+} from "@/lib/server/magick-client";
 
 describe("parseRetryAfter", () => {
   it("parses delta seconds without rounding early", () => {
@@ -329,5 +339,79 @@ describe("MagickClient job-scoped lists", () => {
     expect(new URL(urls[0]).pathname).toBe("/proxy/messaging/messages");
     expect(q.get("job_id")).toBe("job-1");
     expect(q.has("batch_id")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// List ordering (pagination mitigation)
+// ---------------------------------------------------------------------------
+
+describe("MagickClient list ordering", () => {
+  /** Capture the one URL a list call requests. */
+  function capture() {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url);
+        return { ok: true, status: 200, json: async () => ({ total: 0 }) } as unknown as Response;
+      }),
+    );
+    return urls;
+  }
+
+  // master forwards these query params verbatim on all three call surfaces, and
+  // core's validators allow-list `sort_by=created_at` on each.
+  it.each([
+    ["listCalls", "/proxy/calls"],
+    ["listStaticCalls", "/proxy/static-calls"],
+    ["listIvrCalls", "/proxy/ivr-calls"],
+  ] as const)("asks %s for oldest-first pages", async (method, path) => {
+    const urls = capture();
+    await new MagickClient(ctx)[method]({ jobId: "job-1", limit: 100, offset: 200 });
+    const url = new URL(urls[0]);
+    expect(url.pathname).toBe(path);
+    expect(url.searchParams.get("sort_by")).toBe("created_at");
+    expect(url.searchParams.get("sort_order")).toBe("asc");
+    expect(url.searchParams.get("job_id")).toBe("job-1");
+    expect(url.searchParams.get("offset")).toBe("200");
+  });
+
+  // Core's messaging list has no sort fields (an unknown key is stripped) and
+  // hard-codes newest-first, so sending one would only look as if it worked.
+  it("does not send sort params to the messaging list, which ignores them", async () => {
+    const urls = capture();
+    await new MagickClient(ctx).listMessages({ jobId: "job-1", limit: 100, offset: 0 });
+    const url = new URL(urls[0]);
+    expect(url.pathname).toBe("/proxy/messaging/messages");
+    expect(url.searchParams.has("sort_by")).toBe(false);
+    expect(url.searchParams.has("sort_order")).toBe(false);
+  });
+
+  // The token a resumed pull compares against what its staged pages were
+  // fetched under. It must name the ordering the request actually sends, and
+  // a surface that sends none must read as the legacy default, so its old
+  // checkpoints (which carry no token) still resume.
+  it.each([
+    ["ai_voice_call", "listCalls"],
+    ["static_call", "listStaticCalls"],
+    ["ivr_call", "listIvrCalls"],
+    ["whatsapp_message", "listMessages"],
+    ["telegram_message", "listMessages"],
+    ["email_message", "listMessages"],
+  ] as const)("names the ordering %s is paged under", async (dispatchType, method) => {
+    const urls = capture();
+    await new MagickClient(ctx)[method]({ jobId: "job-1", limit: 100, offset: 0 });
+    const url = new URL(urls[0]);
+    const sent = url.searchParams.has("sort_by")
+      ? `${url.searchParams.get("sort_by")}:${url.searchParams.get("sort_order")}`
+      : LEGACY_LIST_ORDER;
+    expect(listOrderToken(dispatchType as JobDispatchType)).toBe(sent);
+  });
+
+  it("knows an ordering for every list surface", () => {
+    for (const key of Object.keys(JOB_LIST_SURFACE) as JobDispatchType[]) {
+      expect(typeof listOrderToken(key)).toBe("string");
+    }
   });
 });

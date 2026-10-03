@@ -59,6 +59,7 @@ describe("GET /api/jobs/[id]", () => {
       cursor: 100,
       batchIndex: 1,
       leaseId: "secret-lease",
+      batchIds: ["b1"],
     } as never);
     const { GET } = await import("@/app/api/jobs/[id]/route");
     const res = await GET(dynReq, params("j1"));
@@ -74,6 +75,8 @@ describe("GET /api/jobs/[id]", () => {
       retryCount: 0,
       deferReason: null,
       error: null,
+      warnings: [],
+      batchIds: ["b1"],
       result: null,
       createdAt: "2026-08-12T12:00:00.000Z",
       updatedAt: "2026-08-12T12:01:00.000Z",

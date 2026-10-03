@@ -54,9 +54,39 @@ export interface Batch {
   aiInr: number;
   avgDuration: number | null;
   avgTalkTime: number | null;
+  /** Present when the latest pull of this batch came back with fewer records
+   *  than upstream's own list counts (see BACKEND.md → *Pull completeness*).
+   *  `total` is still the served record count; this says how far short of
+   *  upstream it is, and whether some of the served records were carried
+   *  forward from an earlier load. Only a settled shortfall is ever sent here
+   *  (one recorded while the job was still dispatching is not). Never set on
+   *  seeded demo batches. */
+  shortfall?: BatchShortfall | null;
   /** Whether normalized records are ready for analytics/export. Live batches
    *  carry this value; seeded demo batches omit it. */
   ingestStatus?: "none" | "ingesting" | "ready" | "stale" | "error";
+}
+
+export interface BatchShortfall {
+  /** Records upstream's list counted for the job. */
+  listed: number;
+  /** Unique records the latest pull returned. */
+  received: number;
+  /** True when the served data includes records this pull did not return,
+   *  carried forward from the revision served before it (`carried` > 0). */
+  keptPrevious: boolean;
+  /** How many served records were carried forward that way. Absent on records
+   *  written before it existed. */
+  carried?: number;
+  /** False when the job may still have been adding rows, so the gap may be lag
+   *  rather than loss. Such a shortfall is never shown to a reader; absent
+   *  means true. */
+  settled?: boolean;
+  /** When the LATEST short pull was observed — re-stamped on every short
+   *  re-pull, including one that wrote nothing because it matched the served
+   *  revision. A merge re-pull cooldown is keyed on it
+   *  (`shortPullCheckedRecently`). */
+  detectedAt: string;
 }
 
 export interface Workspace {
