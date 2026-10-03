@@ -205,6 +205,74 @@ describe("CombineScreen — completed download flow", () => {
     expect(createIngestJob).not.toHaveBeenCalled();
   });
 
+  // The persisted figures describe the revisions published when they were
+  // read; Download streams whatever is published NOW. A refresh that published
+  // a newer revision while the screen sat in sessionStorage must not leave the
+  // label quoting the old count and shortfall.
+  it("re-reads the exported rows when a finished screen is restored", async () => {
+    sessionStorage.setItem("combinePhase", "done");
+    sessionStorage.setItem(
+      "combinePrepared",
+      JSON.stringify({
+        batchIds: ["b1", "b2"], columns: ["record_id"], totalRows: 20, batchCount: 2,
+        exportedRows: 16, missingRows: 4, keptBatches: 1,
+      }),
+    );
+    // Since then both batches published complete revisions.
+    vi.mocked(listCampaignsByIds).mockResolvedValue({
+      batches: [{ ...batch("b1"), total: 11 }, { ...batch("b2"), total: 9 }],
+      source: "live",
+    });
+    render(<CombineScreen />);
+
+    expect(await screen.findByText(/combined_export_2_batches\.csv · 20 rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/fewer than upstream lists/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(listCampaignsByIds).toHaveBeenCalledWith(["b1", "b2"]);
+    // Applying the answer must not schedule another read.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(listCampaignsByIds).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sessionStorage.getItem("combinePrepared")!)).toMatchObject({
+      exportedRows: 20, missingRows: 0, keptBatches: 0,
+    });
+  });
+
+  it("drops restored figures that can no longer be stated", async () => {
+    sessionStorage.setItem("combinePhase", "done");
+    sessionStorage.setItem(
+      "combinePrepared",
+      JSON.stringify({
+        batchIds: ["b1", "b2"], columns: ["record_id"], totalRows: 20, batchCount: 2,
+        exportedRows: 16, missingRows: 4, keptBatches: 0,
+      }),
+    );
+    vi.mocked(listCampaignsByIds).mockResolvedValue({
+      batches: [batch("b1"), { ...batch("b2"), ingestStatus: "error" }],
+      source: "live",
+    });
+    render(<CombineScreen />);
+
+    // Back to the estimate, and no shortfall that may no longer be true.
+    expect(await screen.findByText(/combined_export_2_batches\.csv · 20 rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/fewer than upstream lists/)).not.toBeInTheDocument();
+  });
+
+  it("keeps restored figures on screen when the re-read fails in transit", async () => {
+    sessionStorage.setItem("combinePhase", "done");
+    sessionStorage.setItem(
+      "combinePrepared",
+      JSON.stringify({
+        batchIds: ["b1", "b2"], columns: ["record_id"], totalRows: 20, batchCount: 2,
+        exportedRows: 16, missingRows: 4, keptBatches: 0,
+      }),
+    );
+    vi.mocked(listCampaignsByIds).mockRejectedValue(new Error("network down"));
+    render(<CombineScreen />);
+
+    await waitFor(() => expect(listCampaignsByIds).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/combined_export_2_batches\.csv · 16 rows/)).toBeInTheDocument();
+  });
+
   it("resumes polling a persisted merge job after refresh", async () => {
     sessionStorage.setItem("combineJobId", "job-1");
     sessionStorage.setItem("combinePhase", "working");

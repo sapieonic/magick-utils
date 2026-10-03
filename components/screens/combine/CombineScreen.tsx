@@ -129,28 +129,64 @@ export function CombineScreen() {
   }, [phase]);
 
   // Replace the frozen estimate with the real row count once the export is
-  // ready. Best-effort: on any failure the estimate stays on screen.
+  // ready, and re-read it every time a `done` screen mounts.
+  //
+  // The figures are persisted with the rest of the prepared export, but they
+  // describe the batches' published revisions AT THE MOMENT THEY WERE READ — and
+  // Download streams whatever is published when it is pressed. A refresh, a
+  // merge from another tab or the scheduled Analytics load can publish a newer
+  // revision while this screen sits in sessionStorage, so trusting a restored
+  // count would label the file with rows it no longer holds. Resolving once per
+  // mount (and once per finished preparation within a mount) keeps the label
+  // describing the current revision without polling.
+  //
+  // `resolvedForRef` is what stops this looping: it records the export the
+  // facts were last requested for, is cleared whenever the screen leaves
+  // `done` (so a fresh Generate of the same selection resolves again), and is
+  // released by the cleanup if the request is abandoned before it settles — in
+  // StrictMode the first effect run is torn down immediately, and without that
+  // release the second run would see the key taken and never apply anything.
+  //
+  // A restored figure stays on screen while the re-read is in flight and if it
+  // fails outright (a transport error says nothing about the batches). A
+  // positive "cannot be stated" answer — a batch that is no longer readable —
+  // drops the figures back to the estimate, as on a first resolution.
   const preparedIds = prepared?.batchIds.join(",") ?? "";
-  const needsExportedRows = phase === "done" && Boolean(preparedIds) && prepared?.exportedRows == null;
+  const resolvedForRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!needsExportedRows) return;
+    if (phase !== "done" || !preparedIds) {
+      resolvedForRef.current = null;
+      return;
+    }
+    if (resolvedForRef.current === preparedIds) return;
+    resolvedForRef.current = preparedIds;
     let alive = true;
+    let settled = false;
     resolveExportFacts(preparedIds.split(","))
       .then((facts) => {
-        if (!alive || facts == null) return;
-        setPrepared((current) =>
-          current && current.batchIds.join(",") === preparedIds
-            ? { ...current, exportedRows: facts.rows, missingRows: facts.missing, keptBatches: facts.kept }
-            : current,
-        );
+        settled = true;
+        if (!alive) return;
+        setPrepared((current) => {
+          if (!current || current.batchIds.join(",") !== preparedIds) return current;
+          if (facts == null) {
+            const rest = { ...current };
+            delete rest.exportedRows;
+            delete rest.missingRows;
+            delete rest.keptBatches;
+            return rest;
+          }
+          return { ...current, exportedRows: facts.rows, missingRows: facts.missing, keptBatches: facts.kept };
+        });
       })
       .catch(() => {
-        // keep the estimate
+        settled = true;
+        // keep whatever is on screen
       });
     return () => {
       alive = false;
+      if (!settled && resolvedForRef.current === preparedIds) resolvedForRef.current = null;
     };
-  }, [needsExportedRows, preparedIds]);
+  }, [phase, preparedIds]);
 
   // load live batches (falls back to mock automatically when backend is off)
   useEffect(() => {

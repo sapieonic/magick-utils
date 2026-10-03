@@ -355,7 +355,11 @@ content from, what readers see.
   CSV is ready" — is re-read from the selected batches once preparation finishes (`resolveExportFacts`
   in `lib/export-facts.ts`; each readable batch's `total` is its published record count), together with
   the shortfall (`selectionShortfall`), rather than the figure frozen before preparation, which for a
-  never-ingested batch is a contact count. Until it resolves, in demo mode, or if any batch is not
+  never-ingested batch is a contact count. Combine persists those figures with the prepared export but
+  re-reads them every time a finished screen mounts (a reload or back-navigation): a refresh may have
+  published a newer revision in the meantime, and Download streams whatever is published when it is
+  pressed. A restored figure stays up while the re-read runs or if it fails in transit; a batch that is no
+  longer readable drops it back to the estimate. Until it resolves, in demo mode, or if any batch is not
   readable, the estimate stays. The merge job's `result.rowCount` is not used: it counts only the
   batches that job re-pulled.
 
