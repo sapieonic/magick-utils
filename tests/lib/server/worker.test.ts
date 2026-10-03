@@ -52,6 +52,8 @@ import { processJob, runClaimedJob, SWEEP_DELAY_MARGIN_MS } from "@/lib/server/w
 import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
 import { recordsContentFingerprint } from "@/lib/server/record-fingerprint";
 
+// What the call surfaces are paged under today (see listOrderToken).
+const CALL_ORDER = "created_at:asc";
 // Mirrors the repositories mock above; the real constant is covered by its own test.
 const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
 import type { Job } from "@/lib/server/types";
@@ -119,7 +121,7 @@ describe("processJob resume", () => {
       .mockResolvedValueOnce(
         Array.from({ length: 101 }, (_, index) => ({ recordId: String(index + 1), status: "done" })),
       );
-    await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 101 }));
+    await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 101 , cursorOrder: CALL_ORDER }));
 
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 100 });
     expect(repositories.deleteBatchRevisionRecords).not.toHaveBeenCalled();
@@ -180,7 +182,7 @@ describe("processJob resume", () => {
         { recordId: "unique", status: "done" },
       ]);
 
-    await processJob(job({ done: 1, cursor: 2, batchIndex: 0, batchIds: ["b1"], total: 3 }));
+    await processJob(job({ done: 1, cursor: 2, batchIndex: 0, batchIds: ["b1"], total: 3 , cursorOrder: CALL_ORDER }));
 
     expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 2 });
     expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({
@@ -210,6 +212,103 @@ describe("processJob resume", () => {
       expect.objectContaining({ done: 101 }),
       { clearCredential: true },
     );
+  });
+
+  // A raw OFFSET is only meaningful under the ordering that produced it.
+  // A job checkpointed by a build that sent no sort parameter (newest-first by
+  // default) must not keep paging the same revision oldest-first: on a core
+  // without the `id` tiebreak the two lose DIFFERENT tied rows, so the resumed
+  // revision would skip some and repeat others.
+  describe("list ordering across a resume", () => {
+    const staged = Array.from({ length: 100 }, (_, index) => ({ recordId: `old-${index}`, status: "done" }));
+
+    it("restarts a legacy checkpoint (no recorded ordering) from offset 0 under the current ordering", async () => {
+      repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 2 });
+      const sourceJob = {
+        id: "source-b1", dispatch_type: "ai_voice_call", status: "completed",
+        records_updated_at: "2026-09-30T10:00:00.000000Z",
+      };
+      client.getBulkJob.mockResolvedValue(sourceJob);
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }], total: 2 });
+      repositories.getRecordsForRevision.mockResolvedValueOnce([
+        { recordId: "1", status: "done" }, { recordId: "2", status: "done" },
+      ]);
+
+      await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 2 }));
+
+      // Progress and the cursor are reset through the lease-guarded update —
+      // `checkpointJob` would refuse to move `done` backwards.
+      expect(repositories.updateClaimedJob).toHaveBeenCalledWith("j1", "lease-1", {
+        done: 0, cursor: 0, cursorOrder: CALL_ORDER,
+      });
+      // The pages fetched under the old ordering are discarded, not reused.
+      expect(repositories.deleteBatchRevisionRecords).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+      expect(client.listCalls).toHaveBeenCalledTimes(1);
+      expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+      expect(repositories.getRecordsForRevision).toHaveBeenCalledTimes(1);
+      // Every page checkpoint names the ordering it was fetched under.
+      expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({
+        done: 2, cursor: 2, cursorOrder: CALL_ORDER,
+      }));
+      // A restarted pull read the records stamp before its first page, so it
+      // may claim it — unlike a genuine resume.
+      expect(bulkJobRecordsStamp(sourceJob)).not.toBeNull();
+      expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+        expect.objectContaining({ total: 2, ingestedRecordsStamp: bulkJobRecordsStamp(sourceJob) }),
+        "j1",
+        "lease-1",
+      );
+    });
+
+    it("restarts a checkpoint recorded under a different ordering", async () => {
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }], total: 1 });
+      await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 1, cursorOrder: "created_at:desc" }));
+      expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 0 });
+      expect(repositories.deleteBatchRevisionRecords).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+    });
+
+    it("resumes a checkpoint recorded under the same ordering", async () => {
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "new" }], total: 101 });
+      repositories.getRecordsForRevision
+        .mockResolvedValueOnce(staged)
+        .mockResolvedValueOnce([...staged, { recordId: "new", status: "done" }]);
+      await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 101, cursorOrder: CALL_ORDER }));
+      expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 100 });
+      expect(repositories.deleteBatchRevisionRecords).not.toHaveBeenCalled();
+    });
+
+    // Messaging sends no sort parameter, so a legacy checkpoint was paged under
+    // exactly the ordering it would continue with.
+    it("resumes a legacy messaging checkpoint, whose ordering has not changed", async () => {
+      repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "message", channel: "whatsapp", total: 101 });
+      client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "whatsapp_message" });
+      client.listMessages.mockResolvedValueOnce({ messages: [{ id: "new" }], total: 101 });
+      repositories.getRecordsForRevision
+        .mockResolvedValueOnce(staged)
+        .mockResolvedValueOnce([...staged, { recordId: "new", status: "done" }]);
+      await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 101 }));
+      expect(client.listMessages).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 100 });
+      expect(repositories.deleteBatchRevisionRecords).not.toHaveBeenCalled();
+      expect(repositories.checkpointJob).toHaveBeenNthCalledWith(1, "j1", "lease-1", expect.objectContaining({
+        cursorOrder: "default",
+      }));
+    });
+
+    // Killed between publishing and the batch transition: the staged revision
+    // IS what readers see, and it was completed under one ordering. Restarting
+    // would delete its rows from under them.
+    it("never restarts a revision that is already published", async () => {
+      repositories.getBatch.mockResolvedValue({
+        ...batch("b1"), total: 100, ingestStatus: "ready", publishedRevision: "j1",
+      });
+      client.listCalls.mockResolvedValueOnce({ calls: [], total: 100 });
+      repositories.getRecordsForRevision.mockResolvedValue(staged);
+      await processJob(job({ done: 100, cursor: 100, batchIndex: 0, batchIds: ["b1"], total: 100 }));
+      expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 100 });
+      expect(repositories.deleteBatchRevisionRecords).not.toHaveBeenCalled();
+      expect(repositories.updateClaimedJob).not.toHaveBeenCalledWith("j1", "lease-1", expect.objectContaining({ cursor: 0 }));
+      repositories.getRecordsForRevision.mockReset();
+    });
   });
 
   it("stops if ownership is lost while checkpointing", async () => {
@@ -572,7 +671,7 @@ describe("processJob resume", () => {
       .mockResolvedValue([{ recordId: "1", status: "done" }, { recordId: "2", status: "done" }]);
     client.listCalls.mockResolvedValueOnce({ calls: [{ id: "2" }], total: 2 });
 
-    await processJob(job({ batchIds: ["b1"], total: 2, done: 1, cursor: 1, batchIndex: 0 }));
+    await processJob(job({ batchIds: ["b1"], total: 2, done: 1, cursor: 1, batchIndex: 0 , cursorOrder: CALL_ORDER }));
 
     // A rate-limited job can pause for longer than the changes it would be
     // claiming to have captured. dispatch_type is still fetched so a resumed

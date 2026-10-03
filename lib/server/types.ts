@@ -339,6 +339,13 @@ export interface Job {
   total: number;
   done: number;
   cursor?: number;
+  /** `listOrderToken` of the ordering the pages behind `cursor` were fetched
+   *  under. A raw OFFSET means nothing without it: resuming a staged revision
+   *  with pages from a different ORDER BY skips and repeats arbitrary rows, so
+   *  the worker restarts the batch from offset 0 when the two differ. Absent on
+   *  checkpoints written before it existed, which are read as
+   *  `LEGACY_LIST_ORDER` (no sort parameter: the server default). */
+  cursorOrder?: string;
   batchIndex?: number;
   retryAt?: string | null;
   retryCount?: number;

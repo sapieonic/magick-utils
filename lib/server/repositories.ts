@@ -1180,7 +1180,7 @@ export async function updateClaimedJob(
 export async function checkpointJob(
   jobId: string,
   leaseId: string,
-  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil" | "warnings">>
+  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil" | "warnings" | "cursorOrder">>
 ): Promise<Job | null> {
   const col = await jobs();
   return col.findOneAndUpdate(

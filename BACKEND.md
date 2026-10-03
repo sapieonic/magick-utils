@@ -347,12 +347,19 @@ content from, what readers see.
   exactly afterwards (`publishedRevisionMayBeShort`). Revisions published before it existed fall back
   to `total < sourceTotal`, which also flags some legitimately short legacy batches; each costs one
   re-pull and is then judged exactly from the stamp that pull writes.
-- **List ordering is a mitigation only.** The client sends `sort_by=created_at&sort_order=asc` on
-  `/proxy/calls`, `/proxy/static-calls` and `/proxy/ivr-calls` — master forwards the query verbatim and
-  core allow-lists both values on each — so rows added while a running job is paged land in the unfetched
-  tail. It does nothing for ties. Messaging gets no sort param: core's `messageQuerySchema` accepts none
-  (an unknown key is stripped, not refused), so its fixed newest-first order — `created_at DESC`, plus
-  `id DESC` on a core with the tiebreak — cannot be changed from here.
+- **List ordering.** The client sends `sort_by=created_at&sort_order=asc` on `/proxy/calls`,
+  `/proxy/static-calls` and `/proxy/ivr-calls` — master forwards the query verbatim and core allow-lists
+  both values on each — so rows added while a running job is paged land in the unfetched tail instead of
+  shifting every later page (under the newest-first default a new row repeats one row per page and is
+  itself never fetched). It does not fix the ties, and it is not neutral while they exist: ascending and
+  descending lose DIFFERENT tied rows. A job checkpoints a raw OFFSET, so it records the ordering beside
+  it (`Job.cursorOrder`, from `listOrderToken`); a resume whose recorded ordering differs — including a
+  checkpoint with none, read as the server default (`LEGACY_LIST_ORDER`) — restarts the batch from offset
+  0 rather than append pages from another ORDER BY (never when the staging revision is already the
+  published one). Messaging gets no sort param: core's `messageQuerySchema` accepts none (an unknown key
+  is stripped, not refused), so its fixed newest-first order — `created_at DESC`, plus `id DESC` on a core
+  with the tiebreak — cannot be changed from here, and its token is the legacy one, so its resumes are
+  unaffected.
 - **The exported row count** — Combine's "Download ready" label and the per-campaign download's "Your
   CSV is ready" — is re-read from the selected batches once preparation finishes (`resolveExportFacts`
   in `lib/export-facts.ts`; each readable batch's `total` is its published record count), together with

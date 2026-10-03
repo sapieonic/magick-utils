@@ -24,7 +24,15 @@ import {
   SUPERSEDED_REVISION_GRACE_MS,
   updateClaimedJob,
 } from "./repositories";
-import { MagickApiError, MagickClient, type RawBulkJob, normalizeJobDispatchType, resolveJobDispatchType } from "./magick-client";
+import {
+  LEGACY_LIST_ORDER,
+  listOrderToken,
+  MagickApiError,
+  MagickClient,
+  type RawBulkJob,
+  normalizeJobDispatchType,
+  resolveJobDispatchType,
+} from "./magick-client";
 import {
   idTokenNeedsRefresh,
   mintIdToken,
@@ -318,12 +326,14 @@ export async function processJob(job: Job) {
       batchId,
       batchIndex,
       job.cursor ?? 0,
+      job.cursorOrder,
       completedDone,
       warnings,
     );
     done = outcome.done;
     completedDone = done;
     job.cursor = 0;
+    job.cursorOrder = undefined;
     warnings = outcome.warnings;
   }
 
@@ -490,6 +500,7 @@ async function ingestBatch(
   batchId: string,
   batchIndex: number,
   initialOffset: number,
+  initialOrder: string | undefined,
   completedDone: number,
   priorWarnings: readonly JobWarning[],
 ): Promise<{ done: number; warnings: JobWarning[] }> {
@@ -497,7 +508,7 @@ async function ingestBatch(
   if (!batch) throw new Error(`batch ${batchId} not found (list campaigns first)`);
 
   const startedAt = Date.now();
-  log().info({ batchId, offset: initialOffset, selType: batch.selType, channel: batch.channel }, "[worker] ingesting batch");
+  log().info({ batchId, offset: initialOffset, cursorOrder: initialOrder ?? null, selType: batch.selType, channel: batch.channel }, "[worker] ingesting batch");
   // Keep an already-published revision readable during refresh. New/stale
   // datasets remain blocked until their first complete revision is committed.
   // Renew and prove job ownership immediately before marking the batch. This
@@ -557,12 +568,41 @@ async function ingestBatch(
       log().warn({ error, batchId }, "[worker] source job unavailable; listing will use the batch's stored dispatch_type");
       return null;
     });
-  const recordsStamp = initialOffset === 0 ? bulkJobRecordsStamp(sourceJob) : null;
   const dispatchType = resolveJobDispatchType(sourceJob, batch);
-
   const revision = jobId;
+  const listOrder = listOrderToken(dispatchType);
+  // A resumed pull may only append pages fetched under the ordering its staged
+  // pages were fetched under: the cursor is a raw OFFSET into one ORDER BY, and
+  // continuing it under another skips and repeats arbitrary rows (ascending and
+  // descending lose different tied rows on a core without the `id` tiebreak).
+  // That is exactly a job checkpointed by a build that sent no sort parameter
+  // (server default, newest-first) and resumed by one that pages oldest-first.
+  // Start the revision again from offset 0 instead — it costs the pages already
+  // fetched, nothing else.
+  //
+  // Not when the staged revision is already the PUBLISHED one (a job resumed
+  // between publishing and its batch transition): that pull completed under a
+  // single ordering, and restarting would delete its rows from under readers.
+  let startOffset = initialOffset;
+  const stagedOrder = initialOrder ?? LEGACY_LIST_ORDER;
+  if (startOffset > 0 && stagedOrder !== listOrder && batch.publishedRevision !== revision) {
+    log().warn(
+      { batchId, stagedOrder, listOrder, discardedOffset: startOffset },
+      "[worker] staged pages were fetched under a different list ordering; restarting the batch from offset 0",
+    );
+    startOffset = 0;
+    // `checkpointJob` refuses to move `done` backwards, and the staged pages are
+    // about to be discarded, so progress is reset through the lease-guarded
+    // update instead. `cursorOrder` is written with it so a crash before the
+    // first page cannot make the next resume repeat this decision wrongly.
+    if (!(await updateClaimedJob(jobId, leaseId, { done: completedDone, cursor: 0, cursorOrder: listOrder }))) {
+      throw new Error("job lease lost while restarting the batch under a new list ordering");
+    }
+  }
+  const recordsStamp = startOffset === 0 ? bulkJobRecordsStamp(sourceJob) : null;
+
   const revisionCreatedAt = new Date();
-  if (initialOffset === 0) {
+  if (startOffset === 0) {
     await deleteBatchRevisionRecords(ctx.tenantId, ctx.accountId, batchId, revision);
   }
   // Before staging, drop anything a previous crash orphaned for this batch —
@@ -585,7 +625,7 @@ async function ingestBatch(
   // A resumed job may already have unique rows staged for this revision. Seed
   // the expected-id set from those rows so duplicate detection remains correct
   // across a rate-limit/restart boundary.
-  const stagedRecords = initialOffset > 0
+  const stagedRecords = startOffset > 0
     ? await getRecordsForRevision(ctx.tenantId, ctx.accountId, batchId, revision)
     : [];
   const expectedRecordIds = new Set(stagedRecords.map((record) => record.recordId));
@@ -601,7 +641,7 @@ async function ingestBatch(
   // completeness check below compares against: core computes it as a COUNT over
   // the same WHERE the pages come from. Undefined until a page reports one.
   let listedTotal: number | undefined;
-  let offset = initialOffset;
+  let offset = startOffset;
   for (;;) {
     let page: NormalizedRecord[];
     let pageTotal: number | null | undefined;
@@ -684,6 +724,7 @@ async function ingestBatch(
     const checkpoint = await checkpointJob(jobId, leaseId, {
       done: completedDone + expectedRecordIds.size,
       cursor: offset,
+      cursorOrder: listOrder,
       batchIndex,
       leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
     });
@@ -968,6 +1009,7 @@ async function ingestBatch(
   const ownership = await checkpointJob(jobId, leaseId, {
     done: completedDone + records.length,
     cursor: offset,
+    cursorOrder: listOrder,
     batchIndex,
     leaseUntil: new Date(Date.now() + LEASE_MS).toISOString(),
   });
