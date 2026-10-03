@@ -1,8 +1,9 @@
 // Shared server-side contracts. The data layer, magick-master client, ingestion
 // worker, and route handlers all agree on these shapes.
 
-import type { BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
+import type { BatchShortfall, BreakdownSeg, CallType, Channel, SelType, StatusKey } from "@/lib/types";
 import type { AppTimezone } from "@/lib/timezone";
+import { SHORT_PULL_REPULL_COOLDOWN_MS } from "@/lib/shortfall";
 
 /** Whether a batch has a complete published revision that readers can be served.
  *  "stale" qualifies: its records are complete and are what every reader sees,
@@ -31,6 +32,151 @@ export function isBatchReadable(batch: Pick<BatchDoc, "ingestStatus">): boolean 
  *  no dispatched count means no claim, so no fault. */
 export function isEmptyDispatchedPull(recordCount: number, dispatched: number | undefined): boolean {
   return recordCount === 0 && (dispatched ?? 0) > 0;
+}
+
+/** Whether a paginated pull came back with fewer UNIQUE records than the list
+ *  surface itself says exist — i.e. pagination lost rows.
+ *
+ *  `listedTotal` must be the `total` the list endpoint returned alongside its
+ *  pages, never `sourceTotal`/`total_contacts` and never `BatchDoc.total`. On
+ *  every call surface core computes it as `COUNT(*)` over the identical WHERE
+ *  the pages are drawn from, so for a job that has stopped adding rows a unique
+ *  count below it is real loss, not a timing lag. A contact count is a
+ *  different population (rejected batches and suppressed numbers never become
+ *  rows) and comparing against it would fail healthy campaigns forever.
+ *
+ *  More unique records than `listedTotal` is not a fault — rows can only have
+ *  been added between the COUNT and the pages — and an absent total is no
+ *  claim. A true result is always recorded, but it is LOSS only once the job
+ *  has stopped adding rows: while it is still dispatching both numbers
+ *  legitimately move, which is what `PullShortfall.settled` distinguishes —
+ *  only a settled gap may be reported to a reader. */
+export function isIncompletePaginatedPull(uniqueRecords: number, listedTotal: number | null | undefined): boolean {
+  return (listedTotal ?? 0) > uniqueRecords;
+}
+
+/** Whether a batch's PUBLISHED revision cannot be shown to hold every record.
+ *
+ *  A per-revision judgement, read off the stamps that revision was published
+ *  with. Revisions that recorded their list total are judged against it
+ *  exactly. Older ones fall back to the dispatched contact count, which can run
+ *  ahead of the rows for healthy reasons (rejected batches, suppressed numbers)
+ *  — so a legitimately short legacy batch is flagged too, costs one re-pull, and
+ *  is then judged exactly from the stamp that pull writes.
+ *
+ *  This decides whether a re-pull is worth trying, never what a reader is
+ *  told: the fallback is too loose to put in front of a customer, so the
+ *  reader-facing statement is `BatchDoc.shortPull`, which only the worker
+ *  writes and only from an exact comparison. */
+export function publishedRevisionMayBeShort(
+  batch: Pick<BatchDoc, "total" | "sourceTotal" | "ingestedListedTotal">,
+): boolean {
+  if (typeof batch.ingestedListedTotal === "number") {
+    return isIncompletePaginatedPull(batch.total, batch.ingestedListedTotal);
+  }
+  return isIncompletePaginatedPull(batch.total, batch.sourceTotal);
+}
+
+/** Whether a batch should be re-pulled for completeness rather than trusted as
+ *  "ready" — its published revision may be short, or its latest pull came back
+ *  short (settled or not) and the served revision carries its gap.
+ *
+ *  One predicate for every place that has to agree, for the reason
+ *  `isEmptyDispatchedPull` is shared: the campaigns listing and failure cleanup
+ *  resolve such a batch to "stale" instead of "ready", the refresh path never
+ *  skips it, and a merge re-pulls it once. Without it a terminal job whose
+ *  records stamp never moves is "proven unchanged", every refresh no-ops, and a
+ *  short revision is served forever even after upstream pagination is fixed.
+ *  It converges: the first complete pull clears `shortPull` and stamps an exact
+ *  `ingestedListedTotal`, after which this is false and the batch reads ready. */
+export function needsCompletenessRepull(
+  batch: Pick<BatchDoc, "total" | "sourceTotal" | "ingestedListedTotal" | "shortPull">,
+): boolean {
+  return batch.shortPull != null || publishedRevisionMayBeShort(batch);
+}
+
+// SHORT_PULL_REPULL_COOLDOWN_MS is defined in the client-safe `lib/shortfall`
+// so the screens that tell a customer when a re-pull will happen read the same
+// number the merge obeys; re-exported here for server callers.
+export { SHORT_PULL_REPULL_COOLDOWN_MS };
+
+/** Whether a batch's latest short pull was observed within the cooldown, so a
+ *  merge should serve it as-is rather than re-page upstream. Every incomplete
+ *  pull is recorded with a `detectedAt` — a running job's too, as unsettled —
+ *  so this covers them all. False when there is no recorded short pull (a
+ *  legacy revision that merely MAY be short has never been judged exactly, and
+ *  one re-pull is what judges it), and
+ *  false for an unparseable or future timestamp — the direction that re-pulls,
+ *  because skipping is what can strand a batch, while re-pulling only costs
+ *  load. */
+export function shortPullCheckedRecently(
+  batch: Pick<BatchDoc, "shortPull">,
+  now: number = Date.now(),
+): boolean {
+  const at = Date.parse(batch.shortPull?.detectedAt ?? "");
+  if (!Number.isFinite(at)) return false;
+  const age = now - at;
+  return age >= 0 && age < SHORT_PULL_REPULL_COOLDOWN_MS;
+}
+
+/** What the worker records when a pull comes back with fewer unique records
+ *  than the list surface counted (`isIncompletePaginatedPull`).
+ *
+ *  Against core builds that page over a non-unique `created_at`, rows sharing a
+ *  timestamp are lost DETERMINISTICALLY — the same rows on every pass, with no
+ *  writes at all — so for a job whose rows have settled this is not a transient
+ *  to retry through; it is a fact about the upstream that the reader has to be
+ *  told. While a job may still be adding rows the same gap can simply be lag;
+ *  it is recorded all the same (`settled: false`), because `detectedAt` is what
+ *  rate-limits merge re-pulls, but it is shown to nobody. */
+export interface PullShortfall extends BatchShortfall {
+  /** Records the list surface counted (`COUNT(*)` over the rows it pages). */
+  listed: number;
+  /** Unique records the pull actually returned. */
+  received: number;
+  /** Records the served revision holds that this pull did not return, carried
+   *  forward from the revision served before it so that an incomplete pull
+   *  never takes a record away from a reader. `BatchDoc.total` is
+   *  `received + carried`. */
+  carried: number;
+  /** `carried > 0`, kept as its own flag for the screens that only need to
+   *  know whether some served records are from an earlier load. */
+  keptPrevious: boolean;
+  /** Whether the job had stopped adding rows (`jobStoppedAddingRows` in the
+   *  worker) when the pull ran, so the gap is loss. False for a job still
+   *  dispatching, one whose detail could not be read, or one inside the
+   *  settle window after a stop: the gap may be lag, and the reader-facing
+   *  statement (`isReaderFacingShortfall`) is withheld. */
+  settled: boolean;
+}
+
+/** Whether a recorded shortfall is one a reader should be told about. Only a
+ *  pull of a job whose rows had settled says anything about upstream: for a job
+ *  still dispatching, "upstream returned 2,000 of 3,000" is just the campaign
+ *  being partway through. A record without `settled` predates the field, when
+ *  only settled pulls were recorded at all. */
+export function isReaderFacingShortfall(
+  shortPull: Pick<BatchShortfall, "settled"> | null | undefined,
+): boolean {
+  return shortPull != null && shortPull.settled !== false;
+}
+
+/** A non-fatal outcome a job reports alongside `status: "done"`. Today only an
+ *  incomplete upstream pull, which must not fail the other batches of the job
+ *  nor take a usable revision offline, but must not be silent either. */
+export interface JobWarning {
+  kind: "incomplete_upstream";
+  batchId: string;
+  name: string;
+  listed: number;
+  received: number;
+  /** Records carried forward from the previously served revision. */
+  carried: number;
+  keptPrevious: boolean;
+  /** Records readers are served for the batch after this job
+   *  (`received + carried`). */
+  served: number;
+  message: string;
 }
 
 /** The authenticated tenant/account context derived from the session cookie. */
@@ -100,17 +246,38 @@ export interface BatchDoc {
    * from. Equal to the current `sourceFingerprint` means the batch is in step
    * with its source; differing marks it stale. */
   ingestedSourceFingerprint?: string;
-  /** The upstream job's `updated_at` when the published revision was ingested.
-   * Deliberately NOT part of `sourceFingerprint` (it churns on writes that
-   * change no record), but a skip decision needs it: it is the only signal that
-   * catches message receipts, replies and post-call AI enrichment, none of
-   * which move a field the fingerprint covers. */
-  ingestedSourceUpdatedAt?: string | null;
+  /** `bulkJobRecordsStamp` of the upstream job as observed BEFORE the pull
+   * that built the published revision began; null when it could not be stated
+   * (master reported `records_updated_at` unknown, or a resumed pull that
+   * cannot say which upstream state its pages describe). What a refresh
+   * compares to skip a re-pull — see `bulkJobIsUnchangedSince`. Absent on
+   * documents published before it existed, which therefore never skip.
+   *
+   * Replaces `ingestedSourceUpdatedAt`, which stamped the job's `updated_at`:
+   * master never sends one, so every such stamp is null, and a left-over field
+   * of that name on an old document is read by nothing. */
+  ingestedRecordsStamp?: string | null;
+  /** The `total` the list surface reported (a `COUNT(*)` over the same rows it
+   * pages) during the pull that built the published revision. It is what makes
+   * "is the published revision complete?" answerable after the fact: `total`
+   * alone cannot say, and `sourceTotal` is a contact count, a different
+   * population. When the surface reported no total it is the pull's own
+   * record count (no claim of loss was made). Absent — or BSON null — only on
+   * revisions published before it existed; read it with
+   * `publishedRevisionMayBeShort`, which falls back to `sourceTotal` then. */
+  ingestedListedTotal?: number | null;
+  /** Set by the worker when the latest pull of a job that had stopped adding
+   * rows came back with fewer unique records than upstream's list counted; null
+   * once a pull is complete. The one reader-facing statement that the served
+   * data is (or may be behind) incomplete — see PullShortfall. Absent on
+   * documents written before it existed. */
+  shortPull?: PullShortfall | null;
   /** Immutable record revision currently visible to readers. Older documents
    * without this field use the legacy unversioned record set. */
   publishedRevision?: string;
   /** "stale" = a published revision is still readable, but upstream has moved
-   * on since it was ingested. Readable like "ready"; a refresh will re-pull. */
+   * on since it was ingested, or the revision may be incomplete
+   * (`needsCompletenessRepull`). Readable like "ready"; a refresh will re-pull. */
   ingestStatus: "none" | "ingesting" | "ready" | "stale" | "error";
   /** Current worker ownership, used for conditional revision publication. */
   ingestJobId?: string;
@@ -133,6 +300,13 @@ export interface NormalizedRecord {
   revisionCreatedAt?: Date;
   /** Set only after a newer revision is published; GC never targets staging. */
   retiredAt?: Date;
+  /** Set on a row copied into this revision from the previously published one
+   *  because the (incomplete) pull that built this revision did not return it;
+   *  names the revision it was copied from. Lets a resumed job tell the rows it
+   *  pulled from the rows it carried, and lets the next page write of the same
+   *  id turn a carried row back into a pulled one. Storage metadata: never part
+   *  of the content fingerprint. */
+  carriedFrom?: string;
   fingerprint: string;
   recordId: string; // call_id or message_id
   selType: SelType;
@@ -202,6 +376,18 @@ export interface Job {
   total: number;
   done: number;
   cursor?: number;
+  /** `listOrderToken` of the ordering the pages behind `cursor` were fetched
+   *  under. A raw OFFSET means nothing without it: resuming a staged revision
+   *  with pages from a different ORDER BY skips and repeats arbitrary rows, so
+   *  the worker restarts the batch from offset 0 when the two differ. Absent on
+   *  checkpoints written before it existed, which are read as
+   *  `LEGACY_LIST_ORDER` (no sort parameter: the server default). */
+  cursorOrder?: string;
+  /** The list surface's `total` as of the pages behind `cursor` (null when
+   *  none reported one). A resumed pull's remaining pages can all be empty —
+   *  it may resume past the end — and an empty page need not carry a total, so
+   *  without this a resumed short pull could not be told from a complete one. */
+  cursorListedTotal?: number | null;
   batchIndex?: number;
   retryAt?: string | null;
   retryCount?: number;
@@ -224,6 +410,8 @@ export interface Job {
   leaseId?: string | null;
   fingerprint?: string;
   error?: string | null;
+  /** Non-fatal per-batch outcomes of a job that still finished `done`. */
+  warnings?: JobWarning[];
   result?: unknown; // e.g. merge → { columns, rowCount }; insights → Insight
   createdAt: string;
   updatedAt: string;

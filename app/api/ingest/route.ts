@@ -4,7 +4,9 @@ import { isBackendConfigured } from "@/lib/server/env";
 import { getSession, getTenantContext, persistRefreshedCredential } from "@/lib/server/session";
 import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
+import { jobStoppedAddingRows } from "@/lib/server/job-state";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
+import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
 import {
   acquireIngestionLocks,
   countRecords,
@@ -17,6 +19,8 @@ import {
 import {
   isBatchReadable,
   isEmptyDispatchedPull,
+  needsCompletenessRepull,
+  shortPullCheckedRecently,
   type BatchDoc,
   type Job,
   type JobType,
@@ -63,22 +67,39 @@ async function refreshableBatchIds(
         const index = i + offset;
         const batch = batchDocs[index];
         // Nothing complete to compare against — this is a plain first ingest.
-        if (!complete[index] || !batch.ingestedSourceUpdatedAt || !batch.sourceId) return batchId;
+        if (!complete[index] || !batch.ingestedRecordsStamp || !batch.sourceId) return batchId;
         // A batch the campaigns listing already marked "stale" is one we have
         // positive evidence has moved, so there is nothing left to decide: pull
         // it. Skipping here would deadlock the two freshness signals against
         // each other. They are deliberately different — staleness compares the
-        // listing's source fingerprint, the skip compares `updated_at` — and
-        // they can disagree either way round. When staleness says "changed" and
-        // `updated_at` says "untouched", trusting the timestamp leaves the batch
+        // listing's source fingerprint, the skip compares the records stamp
+        // (master's `records_updated_at` + `status_summary`) — and they can
+        // disagree either way round. When staleness says "changed" and the
+        // stamp says "untouched", trusting the stamp leaves the batch
         // latched stale in Mongo with every later refresh no-oping against the
-        // same unchanged timestamp, and no click can ever clear it. Re-pulling
+        // same unchanged stamp, and no click can ever clear it. Re-pulling
         // costs one redundant ingestion that the worker reclaims itself; the
         // latch costs the customer their refresh, permanently.
         if (batch.ingestStatus === "stale") return batchId;
+        // Same reasoning for a batch that may be incomplete — the listing marks
+        // those stale too, but this must not depend on a listing having
+        // rewritten the document since it was published. It is how a short
+        // revision (published by an older build, or flagged
+        // by the worker) gets re-pulled once upstream pagination is fixed,
+        // instead of being "proven unchanged" forever. Against an unfixed
+        // upstream the re-pull is short again and the worker carries forward
+        // every served record it did not return — writing nothing when the
+        // result is identical — so this costs upstream load, never data or
+        // storage. Deliberately NOT
+        // subject to the merge cooldown: this is the customer's explicit ask.
+        if (needsCompletenessRepull(batch)) return batchId;
         try {
           const job = await client.getBulkJob(batch.sourceId);
-          if (bulkJobIsUnchangedSince(job, batch.ingestedSourceUpdatedAt)) {
+          // The stamp being compared was observed by the worker BEFORE the
+          // pull that built the published revision, so equality here means no
+          // core row of the job was written since — not merely since the pull
+          // finished. A `null` on either side never matches.
+          if (bulkJobIsUnchangedSince(job, batch.ingestedRecordsStamp)) {
             log().info({ batchId }, "refresh skipped — upstream job untouched since last ingestion");
             return null;
           }
@@ -97,6 +118,44 @@ async function refreshableBatchIds(
     for (const batchId of decisions) if (batchId) keep.push(batchId);
   }
   return keep;
+}
+
+/**
+ * Whether a merge may still serve a batch whose recorded short pull was
+ * UNSETTLED — taken while the job was still adding rows — without re-paging.
+ *
+ * The cooldown exists so an unchanged short batch is not re-paged on every
+ * Generate. For a settled record that is safe: the job's rows are fixed and the
+ * loss is deterministic. An unsettled record is a snapshot of a job in motion,
+ * and serving it is only safe while nothing has moved since. The case that is
+ * not: a campaign pulled mid-run, which then finishes — within the cooldown the
+ * merge would stream the mid-run snapshot, and because the record is unsettled
+ * no reader is told it is short ("Download ready · N rows", no warning). So the
+ * job is read live, and the record is honoured only when BOTH hold:
+ *
+ * - the job still has not stopped adding rows (`jobStoppedAddingRows`); once it
+ *   has, a re-pull is what turns the record into a settled, reader-facing one
+ *   (and writes nothing if the data is the same), and
+ * - its records stamp is known and equal to the one observed before the pull
+ *   that made the record — no core row of the job was written since. A null on
+ *   either side is unknown, never unchanged, as everywhere else.
+ *
+ * Anything unprovable, including an unreadable job, re-pulls: redundant paging
+ * is the recoverable direction. A credential that can never be renewed is
+ * rethrown, as in `refreshableBatchIds`.
+ */
+async function unsettledShortPullStillCurrent(client: MagickClient, batch: BatchDoc): Promise<boolean> {
+  if (!batch.sourceId || !batch.ingestedRecordsStamp) return false;
+  try {
+    const job = await client.getBulkJob(batch.sourceId);
+    if (jobStoppedAddingRows(job)) return false;
+    const stamp = bulkJobRecordsStamp(job);
+    return stamp != null && stamp === batch.ingestedRecordsStamp;
+  } catch (err) {
+    if (err instanceof TokenRefreshPermanentError) throw err;
+    log().warn({ error: err, batchId: batch.batchId }, "merge cooldown source check failed — re-pulling to be safe");
+    return false;
+  }
 }
 
 /** Enqueue an ingestion (or merge) job for a set of batches. The worker picks it
@@ -160,10 +219,58 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // the customer got a green "Up to date" over an empty screen with no way to
     // clear it. Treating it as incomplete puts it back in front of the worker,
     // which decides — and now says so.
-    return !isEmptyDispatchedPull(counts[index], doc.sourceTotal);
+    if (isEmptyDispatchedPull(counts[index], doc.sourceTotal)) return false;
+    // A merge re-pulls a batch that may be incomplete — the merge job visits
+    // each of its batches once and never retries a short pull. Without this the
+    // customer's re-export after upstream pagination is fixed would still stream
+    // the short revision, because only Analytics' "Refresh data" sends
+    // `refresh`. Safe against an unfixed upstream: a pull that comes back short
+    // again never drops a served record (they are carried forward), and one
+    // whose result is identical to the served revision writes nothing (see
+    // `ingestBatch`).
+    //
+    // Not on every merge, though. Against an unfixed core the re-pull is the
+    // same short set every time, so re-paging each flagged batch on each
+    // Generate is pure upstream load, all of it from this host against master's
+    // global per-IP limit. A batch whose short pull was observed within
+    // SHORT_PULL_REPULL_COOLDOWN_MS is served as it stands; the next merge after
+    // the window re-pulls it, which is what lets it converge once core is fixed.
+    // Every short pull the worker makes is recorded with its time — a running
+    // job's too, unsettled (honoured only after the live check below). A batch that
+    // merely MAY be short (legacy stamps from before `shortPull` existed) has
+    // no recorded observation and is re-pulled — that pull is what judges it.
+    //
+    // A plain Analytics load does NOT re-pull at all — it serves the flagged
+    // data and its Refresh button is the deliberate re-pull, which ignores the
+    // cooldown (refreshableBatchIds); re-pulling on every page view would be a
+    // full upstream re-page per visit for as long as upstream stays unfixed.
+    //
+    // An UNSETTLED record (taken while the job was still adding rows) is
+    // honoured only after a live check that nothing has moved since — see
+    // `unsettledShortPullStillCurrent` — and is otherwise re-pulled.
+    if (type === "merge" && needsCompletenessRepull(doc) && !shortPullCheckedRecently(doc)) return false;
+    return true;
   });
+  const unsettledInCooldown = requestedBatchIds
+    .map((_, index) => index)
+    .filter((index) =>
+      complete[index] &&
+      type === "merge" &&
+      needsCompletenessRepull(batchDocs[index]) &&
+      batchDocs[index].shortPull?.settled === false,
+    );
   let batchIds: string[];
   try {
+    if (unsettledInCooldown.length > 0) {
+      const client = new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential });
+      for (let i = 0; i < unsettledInCooldown.length; i += REFRESH_CHECK_CONCURRENCY) {
+        const slice = unsettledInCooldown.slice(i, i + REFRESH_CHECK_CONCURRENCY);
+        const current = await Promise.all(slice.map((index) => unsettledShortPullStillCurrent(client, batchDocs[index])));
+        slice.forEach((index, offset) => {
+          if (!current[offset]) complete[index] = false;
+        });
+      }
+    }
     batchIds = forceRefresh
       ? await refreshableBatchIds(ctx, requestedBatchIds, batchDocs, complete)
       : requestedBatchIds.filter((_, index) => !complete[index]);

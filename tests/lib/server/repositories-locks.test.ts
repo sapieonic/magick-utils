@@ -10,7 +10,7 @@ const locks = vi.hoisted(() => ({
 const usage = vi.hoisted(() => ({ findOneAndUpdate: vi.fn() }));
 const jobs = vi.hoisted(() => ({ findOne: vi.fn() }));
 const batchDb = vi.hoisted(() => ({ deleteMany: vi.fn(), find: vi.fn(), findOne: vi.fn(), findOneAndUpdate: vi.fn(), updateOne: vi.fn() }));
-const recordDb = vi.hoisted(() => ({ deleteMany: vi.fn(), updateMany: vi.fn() }));
+const recordDb = vi.hoisted(() => ({ bulkWrite: vi.fn(), deleteMany: vi.fn(), find: vi.fn(), updateMany: vi.fn() }));
 
 vi.mock("@/lib/server/db", () => ({
   aggregates: vi.fn(),
@@ -27,11 +27,15 @@ import {
   beginBatchIngestion,
   consumeAiQuota,
   deleteBatchDataOlderThan,
+  deleteCarriedRecords,
+  getRevisionRecordsMissingFrom,
+  replaceBatchRecords,
   deleteRetiredRecordRevisionsOlderThan,
   deleteOrphanedRecordRevisions,
   deleteOrphanedRecordRevisionsEverywhere,
   deleteSupersededRecordRevisions,
   failBatchIfOwned,
+  keepPublishedRevisionIfOwned,
   retireBatchRevision,
   SUPERSEDED_REVISION_GRACE_MS,
   IngestionConflictError,
@@ -220,6 +224,103 @@ describe("batch worker ownership", () => {
     await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
 
     expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("error");
+  });
+
+  // A refresh the worker refused because the pull came back short: the
+  // revision behind it may be one an older build published short. It stays
+  // readable — "error" would take real records offline — but not "ready", or the
+  // next refresh proves the terminal job unchanged and never retries it.
+  it("resolves a failed refresh over a possibly-short published revision to stale, not ready", async () => {
+    for (const shortDoc of [
+      { total: 8038, sourceTotal: 8232 }, // pre-stamp revision: judged by the contact count
+      { total: 470, sourceTotal: 470, ingestedListedTotal: 480 }, // stamped short
+    ]) {
+      batchDb.updateOne.mockClear();
+      batchDb.findOne.mockResolvedValue({
+        tenantId: "t1", accountId: "a1", batchId: "b1",
+        publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+        ...shortDoc,
+      });
+      batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+      await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+      expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
+    }
+  });
+
+  // A failure after a pull that left a shortfall on record: the kept revision
+  // may hold every record, but it is behind, and "ready" would let the next
+  // refresh prove it unchanged and never retry it.
+  it("resolves a failure over a batch with a recorded shortfall to stale", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+      total: 8232, sourceTotal: 8232, ingestedListedTotal: 8232,
+      shortPull: { listed: 8232, received: 8038, carried: 1, keptPrevious: true, settled: true, detectedAt: "x" },
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("stale");
+  });
+
+  it("keeps the published revision after a short pull only while this lease owns the batch", async () => {
+    const shortPull = { listed: 3, received: 2, carried: 1, keptPrevious: true, settled: true, detectedAt: "2026-10-01T00:00:00Z" };
+    batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 }).mockResolvedValueOnce({ matchedCount: 0 });
+
+    await expect(keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull)).resolves.toBe(true);
+    await expect(keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull)).resolves.toBe(false);
+
+    const [filter, update] = batchDb.updateOne.mock.calls[0];
+    expect(filter).toEqual({ tenantId: "t1", accountId: "a1", batchId: "b1", ingestJobId: "j1", ingestLeaseId: "lease-1" });
+    // Readable, flagged, released — and nothing about the revision itself moves.
+    expect(update.$set).toEqual(expect.objectContaining({ ingestStatus: "stale", shortPull }));
+    expect(update.$set).not.toHaveProperty("publishedRevision");
+    expect(update.$set).not.toHaveProperty("total");
+    expect(update.$unset).toEqual({ ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" });
+  });
+
+  // An identical short re-pull passes the stamps a publish would have written;
+  // an undefined stamp leaves the published value alone, an explicit null is
+  // written (a resumed pull cannot vouch for its source timestamp).
+  it("writes only the defined built-from stamps when keeping a revision", async () => {
+    const shortPull = { listed: 3, received: 2, carried: 0, keptPrevious: false, settled: true, detectedAt: "2026-10-01T00:00:00Z" };
+    batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 });
+
+    await keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull, {
+      ingestedListedTotal: 3,
+      ingestedSourceFingerprint: "sfp",
+      ingestedRecordsStamp: null,
+      sourceTotal: undefined,
+    });
+
+    const [, update] = batchDb.updateOne.mock.calls[0];
+    expect(update.$set).toEqual(
+      expect.objectContaining({
+        ingestStatus: "stale",
+        shortPull,
+        ingestedListedTotal: 3,
+        ingestedSourceFingerprint: "sfp",
+        ingestedRecordsStamp: null,
+      }),
+    );
+    expect(update.$set).not.toHaveProperty("sourceTotal");
+    expect(update.$set).not.toHaveProperty("publishedRevision");
+  });
+
+  it("restores ready over a stamped-complete revision even when contacts exceed rows", async () => {
+    batchDb.findOne.mockResolvedValue({
+      tenantId: "t1", accountId: "a1", batchId: "b1",
+      publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
+      total: 359, sourceTotal: 369, ingestedListedTotal: 359,
+    });
+    batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
+
+    await failBatchIfOwned("t1", "a1", "b1", "j1", "lease-1");
+
+    expect(batchDb.updateOne.mock.calls[0][1].$set.ingestStatus).toBe("ready");
   });
 
   it("still restores a genuinely empty campaign's published revision", async () => {
@@ -502,5 +603,80 @@ describe("expired batch cleanup", () => {
         { tenantId: "t2", accountId: "a2", batchId: "b2" },
       ],
     });
+  });
+});
+
+// The carry-forward of an incomplete pull (see `ingestBatch`): the rows a pull
+// did not return are copied from the published revision into the new one.
+describe("carried-forward records", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // Runs on every incomplete pull, even one that ends up writing nothing, so
+  // full documents (transcripts, raw payloads) are fetched only for the rows
+  // actually missing: ids first, then the missing ones by `$in`.
+  it("reads ids first and fetches only the missing records, ready to write into another revision", async () => {
+    recordDb.find
+      .mockReturnValueOnce([{ recordId: "1" }, { recordId: "2" }, { recordId: "3" }])
+      .mockReturnValueOnce([{ _id: "oid-3", recordId: "3", revision: "rev-1", status: "done", retiredAt: new Date(0) }]);
+
+    const missing = await getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set(["1", "2"]));
+
+    const scope = { tenantId: "t1", accountId: "a1", batchId: "b1", revision: "rev-1" };
+    expect(recordDb.find).toHaveBeenNthCalledWith(1, scope, { projection: { _id: 0, recordId: 1 } });
+    expect(recordDb.find).toHaveBeenNthCalledWith(2, { ...scope, recordId: { $in: ["3"] } });
+    // `_id` would collide with the stored copy; `retiredAt` describes it only.
+    expect(missing).toEqual([{ recordId: "3", revision: "rev-1", status: "done" }]);
+  });
+
+  it("fetches nothing more when the pull returned every id", async () => {
+    recordDb.find.mockReturnValueOnce([{ recordId: "1" }, { recordId: "2" }]);
+    await expect(getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set(["1", "2"]))).resolves.toEqual([]);
+    expect(recordDb.find).toHaveBeenCalledTimes(1);
+  });
+
+  it("chunks the fetch of missing records", async () => {
+    const ids = Array.from({ length: 1001 }, (_, index) => `r${index}`);
+    recordDb.find.mockReturnValueOnce(ids.map((recordId) => ({ recordId }))).mockReturnValue([]);
+    await getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set());
+    const inSizes = recordDb.find.mock.calls.slice(1).map((call) => call[0].recordId.$in.length);
+    expect(inSizes).toEqual([500, 500, 1]);
+    recordDb.find.mockReset();
+  });
+
+  it("drops carried rows from a staging revision only", async () => {
+    batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "rev-1" });
+    await deleteCarriedRecords("t1", "a1", "b1", "j1");
+    expect(recordDb.deleteMany).toHaveBeenCalledWith({
+      tenantId: "t1", accountId: "a1", batchId: "b1", revision: "j1", carriedFrom: { $exists: true },
+    });
+
+    // The published revision's carried rows are what readers see.
+    recordDb.deleteMany.mockClear();
+    batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "j1" });
+    await deleteCarriedRecords("t1", "a1", "b1", "j1");
+    expect(recordDb.deleteMany).not.toHaveBeenCalled();
+
+    // ...unless the job that published it is about to republish without them.
+    batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "j1" });
+    await deleteCarriedRecords("t1", "a1", "b1", "j1", { includePublished: true });
+    expect(recordDb.deleteMany).toHaveBeenCalledWith(expect.objectContaining({ revision: "j1", carriedFrom: { $exists: true } }));
+  });
+
+  // A row the pull returned replaces a carried copy of the same id staged
+  // earlier in the revision; `$set` alone would leave the marker behind and
+  // the row would keep counting as carried.
+  it("clears the carried marker when a pulled row overwrites a carried one, and only then", async () => {
+    recordDb.bulkWrite.mockResolvedValue({});
+    await replaceBatchRecords("t1", "a1", "b1", [
+      { recordId: "1", revision: "j1", status: "done" },
+      { recordId: "2", revision: "j1", status: "done", carriedFrom: "rev-1" },
+    ] as never);
+
+    const [ops] = recordDb.bulkWrite.mock.calls[0];
+    expect(ops[0].updateOne.update).toEqual({
+      $set: expect.not.objectContaining({ carriedFrom: expect.anything() }),
+      $unset: { carriedFrom: "" },
+    });
+    expect(ops[1].updateOne.update).toEqual({ $set: expect.objectContaining({ carriedFrom: "rev-1" }) });
   });
 });

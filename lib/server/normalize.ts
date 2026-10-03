@@ -303,7 +303,14 @@ export interface BuildBatchDocOpts {
   fingerprint: string;
   sourceFingerprint?: string;
   ingestedSourceFingerprint?: string;
-  ingestedSourceUpdatedAt?: string | null;
+  ingestedRecordsStamp?: string | null;
+  /** The list surface's own `total` for the pull that built this revision (see
+   *  BatchDoc.ingestedListedTotal). */
+  ingestedListedTotal?: number;
+  /** The worker's record of a short pull (see BatchDoc.shortPull). Written as
+   *  an explicit null when absent so a complete publish CLEARS a previous one:
+   *  `publishBatchIfOwned` is a `$set`, which leaves an omitted key in place. */
+  shortPull?: BatchDoc["shortPull"];
   publishedRevision?: string;
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
@@ -365,7 +372,9 @@ export function buildBatchDoc(
     fingerprint: opts.fingerprint,
     sourceFingerprint: opts.sourceFingerprint,
     ingestedSourceFingerprint: opts.ingestedSourceFingerprint,
-    ingestedSourceUpdatedAt: opts.ingestedSourceUpdatedAt,
+    ingestedRecordsStamp: opts.ingestedRecordsStamp,
+    ingestedListedTotal: opts.ingestedListedTotal,
+    shortPull: opts.shortPull ?? null,
     publishedRevision: opts.publishedRevision,
     ingestStatus: opts.ingestStatus ?? "ready",
     updatedAt: new Date().toISOString(),

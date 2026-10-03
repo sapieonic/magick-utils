@@ -5,7 +5,7 @@
 import { CAMPAIGNS } from "@/lib/data";
 import { inListingRange, isDashboardRange } from "@/lib/date-range";
 import type { Batch } from "@/lib/types";
-import type { AggregatesDoc, DashboardVolume, Insight, JobStatus, JobType } from "@/lib/server/types";
+import type { AggregatesDoc, DashboardVolume, Insight, JobStatus, JobType, JobWarning } from "@/lib/server/types";
 
 export interface JobDto {
   jobId: string;
@@ -21,6 +21,12 @@ export interface JobDto {
    *  is above; read it as a value that may simply be absent. */
   deferReason?: "rate_limited" | "credential" | null;
   error: string | null;
+  /** Non-fatal per-batch outcomes of a job that still finished — today, a
+   *  batch whose upstream pull came back incomplete. Optional for the same
+   *  reason `deferReason` is: older servers and test doubles omit it. */
+  warnings?: JobWarning[];
+  /** The batches this job pulls. Optional: older servers omit it. */
+  batchIds?: string[];
   result: unknown;
   createdAt: string;
   updatedAt: string;

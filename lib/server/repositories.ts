@@ -20,7 +20,7 @@ import {
   IVR_HANGUP_NODE_KEYS,
   SHORT_CALL_SECONDS,
 } from "@/lib/server/dashboard-quality";
-import { isBatchReadable, isEmptyDispatchedPull } from "@/lib/server/types";
+import { isBatchReadable, isEmptyDispatchedPull, needsCompletenessRepull } from "@/lib/server/types";
 import type {
   AggregatesDoc,
   BatchDoc,
@@ -179,8 +179,16 @@ export async function failBatchIfOwned(
   // it did not bring the batch up to date — resolve back to "stale" whenever
   // the source has moved past what the published revision was built from, so
   // the next refresh still knows there is something to pull.
+  //
+  // Likewise when the published revision may be incomplete, or the batch's
+  // last pull came back short (`needsCompletenessRepull`) — typically a
+  // revision an older build published short. Keeping it readable is right (its
+  // records are real); calling it "ready" is not, because a ready batch whose
+  // job upstream never touches again is skipped by every later refresh.
   const readableStatus =
-    current.ingestedSourceFingerprint && current.ingestedSourceFingerprint === current.sourceFingerprint
+    current.ingestedSourceFingerprint &&
+    current.ingestedSourceFingerprint === current.sourceFingerprint &&
+    !needsCompletenessRepull(current)
       ? "ready"
       : "stale";
   // ...unless what is published is the empty-pull failure itself. A revision
@@ -205,6 +213,57 @@ export async function failBatchIfOwned(
       $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
     },
   );
+}
+
+/** "Built from" stamps a kept revision takes from the pull that left it in
+ *  place. A revision is only ever kept when what that pull would serve (its
+ *  records plus anything carried forward) is identical to it — same count,
+ *  same content fingerprint — so the published revision genuinely describes the
+ *  state this pull observed. A key left `undefined` is not written; a `null` is
+ *  (see `keepPublishedRevisionIfOwned`). */
+export type KeptRevisionStamps = Partial<
+  Pick<BatchDoc, "ingestedListedTotal" | "ingestedSourceFingerprint" | "ingestedRecordsStamp" | "sourceTotal">
+>;
+
+/** Leave the published revision in place after a pull that came back short,
+ *  while this exact worker lease still owns the batch.
+ *
+ *  The counterpart of `publishBatchIfOwned` for the one outcome where the pull
+ *  completed but changed nothing readers would see: the revision it would have
+ *  published (its records, plus the served rows it did not return, carried
+ *  forward) is the published one, record for record. It stays published, its
+ *  record set untouched, and the batch is marked
+ *  "stale" with the shortfall recorded — readable, explicitly flagged, and never
+ *  skipped by a refresh, so a pull against a fixed upstream replaces it. The
+ *  rest of the job carries on; nothing about this batch is a failure. */
+export async function keepPublishedRevisionIfOwned(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  jobId: string,
+  leaseId: string,
+  shortPull: NonNullable<BatchDoc["shortPull"]>,
+  stamps: KeptRevisionStamps = {},
+): Promise<boolean> {
+  const col = await batches();
+  // `undefined` means "not passed" and leaves the published revision's value
+  // alone; an explicit `null` IS written. The distinction is deliberate and
+  // mirrors the publish path: a resumed pull stamps `ingestedRecordsStamp:
+  // null` because it cannot say which upstream state its pages describe, and
+  // nulling the stamp is what stops a later refresh from proving the batch
+  // unchanged off a timestamp this pull never verified. Skipping the null would
+  // keep the older stamp beside this pull's fingerprint — the unsafe direction.
+  const defined = Object.fromEntries(
+    Object.entries(stamps).filter(([, value]) => value !== undefined),
+  ) as KeptRevisionStamps;
+  const result = await col.updateOne(
+    { tenantId, accountId, batchId, ingestJobId: jobId, ingestLeaseId: leaseId },
+    {
+      $set: { ...defined, ingestStatus: "stale", shortPull, updatedAt: nowIso() },
+      $unset: { ingestJobId: "", ingestLeaseId: "", ingestLeaseUntil: "" },
+    },
+  );
+  return result.matchedCount === 1;
 }
 
 export async function listBatches(
@@ -374,6 +433,11 @@ export async function replaceBatchRecords(
         accountId,
         batchId,
       };
+      // A row this pull returned replaces any carried-forward copy of the same
+      // id staged earlier in the same revision, and must stop being marked as
+      // carried — `$set` alone would leave the old marker in place.
+      const carried = doc.carriedFrom != null;
+      if (!carried) delete doc.carriedFrom;
       return {
         updateOne: {
           filter: {
@@ -383,7 +447,7 @@ export async function replaceBatchRecords(
             revision: doc.revision,
             recordId: doc.recordId,
           },
-          update: { $set: doc },
+          update: carried ? { $set: doc } : { $set: doc, $unset: { carriedFrom: "" } },
           upsert: true,
         },
       };
@@ -446,6 +510,68 @@ export async function getRecords(
   if (opts?.skip != null) cursor = cursor.skip(opts.skip);
   if (opts?.limit != null) cursor = cursor.limit(opts.limit);
   return cursor.toArray();
+}
+
+/** Ids per `$in` when fetching the records a short pull did not return. */
+const MISSING_RECORDS_CHUNK = 500;
+
+/** Records of `revision` whose ids are NOT in `present`: what a pull that came
+ *  back short did not return, and so what the worker carries forward from the
+ *  published revision rather than drop (see `ingestBatch`).
+ *
+ *  Two phases, because this runs on every incomplete pull — including the
+ *  common one whose result turns out identical and writes nothing — and full
+ *  documents carry transcripts and raw payloads. First only the ids are read
+ *  (`{recordId: 1}`) and compared in-process, not with a `$nin` of every id the
+ *  pull returned, which for a large campaign is a query document of hundreds of
+ *  kilobytes. Then only the missing records are fetched, in `$in` chunks.
+ *  `_id` and `retiredAt` are stripped so the rows can be written into another
+ *  revision: the first would collide with the stored copy, the second
+ *  describes the stored copy only. */
+export async function getRevisionRecordsMissingFrom(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  revision: string,
+  present: ReadonlySet<string>,
+): Promise<NormalizedRecord[]> {
+  const col = await records();
+  const scope = { tenantId, accountId, batchId, revision };
+  const missingIds: string[] = [];
+  for await (const stored of col.find(scope, { projection: { _id: 0, recordId: 1 } })) {
+    if (!present.has(stored.recordId)) missingIds.push(stored.recordId);
+  }
+  const missing: NormalizedRecord[] = [];
+  for (let i = 0; i < missingIds.length; i += MISSING_RECORDS_CHUNK) {
+    const chunk = missingIds.slice(i, i + MISSING_RECORDS_CHUNK);
+    for await (const stored of col.find({ ...scope, recordId: { $in: chunk } })) {
+      const copy: NormalizedRecord & { _id?: unknown } = { ...stored };
+      delete copy._id;
+      delete copy.retiredAt;
+      missing.push(copy);
+    }
+  }
+  return missing;
+}
+
+/** Drop carried-forward rows from a STAGING revision, so a resumed job can
+ *  re-derive them against the revision it will actually publish over. A no-op
+ *  for the published revision — those rows are what readers see — unless
+ *  `includePublished` is passed: the one caller is a job that published this
+ *  revision itself, was interrupted before its batch transition, and is about
+ *  to republish it without those rows (its resumed pull came back complete, or
+ *  carrying them would exceed what upstream lists). */
+export async function deleteCarriedRecords(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  revision: string,
+  options: { includePublished?: boolean } = {},
+): Promise<void> {
+  const batch = await getBatch(tenantId, accountId, batchId);
+  if (batch?.publishedRevision === revision && !options.includePublished) return;
+  const col = await records();
+  await col.deleteMany({ tenantId, accountId, batchId, revision, carriedFrom: { $exists: true } });
 }
 
 export async function getRecordsForRevision(
@@ -1121,7 +1247,7 @@ export async function updateClaimedJob(
 export async function checkpointJob(
   jobId: string,
   leaseId: string,
-  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil">>
+  patch: Pick<Job, "done" | "cursor" | "batchIndex"> & Partial<Pick<Job, "leaseUntil" | "warnings" | "cursorOrder" | "cursorListedTotal">>
 ): Promise<Job | null> {
   const col = await jobs();
   return col.findOneAndUpdate(

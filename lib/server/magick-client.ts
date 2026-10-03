@@ -153,7 +153,18 @@ export interface RawBulkJob {
   progress_pct?: number | null;
   provider?: string | null;
   created_at?: string | null;
-  updated_at?: string | null;
+  /** The latest core ROW write across the job's batches (ISO UTC, microsecond
+   *  precision), enriched by magick-master from the same grouped core read as
+   *  `status_summary`. `null` — or absent, on an older master — means UNKNOWN,
+   *  never "unchanged". Master's job row has no `updated_at`; this is the only
+   *  field that moves for recordings, transcripts, outcomes, post-call analysis
+   *  and delivery receipts. Read through `bulkJobRecordsStamp`. */
+  records_updated_at?: string | null;
+  /** When master moved the job to a terminal status (`completed`,
+   *  `partially_failed`, `failed`); null while it runs. */
+  completed_at?: string | null;
+  /** When the job was cancelled; null otherwise. */
+  cancelled_at?: string | null;
   [key: string]: unknown;
 }
 
@@ -382,6 +393,78 @@ export function resolveJobDispatchType(
     );
   }
   return resolved;
+}
+
+/** Oldest-first ordering for the three CALL list surfaces, sent on every page.
+ *
+ *  Why it is sent at all: on a running job, rows keep arriving while we page.
+ *  Under core's default newest-first order each new row lands at the HEAD and
+ *  shifts every later page by one — the next page repeats a row we already have
+ *  and the new row is never fetched. Oldest-first puts it in the unfetched tail,
+ *  where the pull picks it up. That is the whole benefit, and it holds before
+ *  and after core's fix.
+ *
+ *  What it does NOT do is fix the tie loss. Core pages these lists with
+ *  `LIMIT/OFFSET` ordered by `created_at`, which is NOT unique: a dispatch chunk
+ *  is one multi-row INSERT, so its rows share a timestamp to the microsecond.
+ *  Postgres sorts each page with a top-N heapsort bounded by OFFSET+LIMIT, and
+ *  the order it leaves among tied rows changes with that bound — so consecutive
+ *  pages overlap and skip tied rows while the fetched count still equals
+ *  `total`. The loss is DETERMINISTIC for a given ordering: measured on
+ *  Postgres 16 with no writes at all, 3,600 tied rows paged 100 at a time came
+ *  back as 3,584 unique, identical on every pass. Re-pulling with the same
+ *  ordering recovers nothing; core's fix — a unique `id` tiebreak appended to
+ *  the ordering, PR magic-voice-core#410 — is what does.
+ *
+ *  And the direction is not neutral while the ties are there: ascending and
+ *  descending lose DIFFERENT tied rows. Two consequences, both handled in the
+ *  worker rather than here:
+ *  - a pull must never mix the two. A job checkpoints a raw OFFSET, so resuming
+ *    a revision staged under one ordering with pages fetched under the other
+ *    would skip and repeat arbitrary rows. `listOrderToken` names the ordering a
+ *    surface is paged under; the worker stores it beside the cursor and restarts
+ *    the revision from offset 0 when a resume would change it.
+ *  - a revision published from a newest-first pull (any build before this
+ *    request existed) and the first oldest-first pull after it can each hold
+ *    rows the other lacks. The worker therefore never lets an incomplete pull
+ *    drop a record the served revision has (see the carry-forward in
+ *    `ingestBatch`).
+ *
+ *  Verified per surface against the services' sources: magick-master forwards
+ *  the query string verbatim on `/proxy/calls`, `/proxy/static-calls` and
+ *  `/proxy/ivr-calls` (only `job_id`/`batch_id` are rewritten into the body),
+ *  and core's validators for all three allow-list `sort_by=created_at` with
+ *  `sort_order=asc|desc` on their `/search` routes. Messaging is deliberately
+ *  NOT sent it: core's `messageQuerySchema` has no sort fields (an unknown key is
+ *  stripped, not refused), so its fixed newest-first order — `created_at DESC`,
+ *  plus an `id` tiebreak on a core that has one — cannot be changed from
+ *  here, and the parameter would only read as if it worked. */
+const CALL_LIST_ORDER = { sort_by: "created_at", sort_order: "asc" } as const;
+
+/** The ordering a job checkpointed before list orderings were recorded was
+ *  paged under: no sort parameter at all, i.e. each surface's server default.
+ *  The worker reads an absent token as this. */
+export const LEGACY_LIST_ORDER = "default";
+
+/** Names the ORDER BY a dispatch type's list surface is paged under, so a
+ *  resumed pull can tell whether the pages it already staged were fetched under
+ *  the ordering it is about to continue with. Must change whenever the query
+ *  sent for that surface changes its ordering. */
+export function listOrderToken(dispatchType: JobDispatchType): string {
+  switch (dispatchType) {
+    case "ai_voice_call":
+    case "static_call":
+    case "ivr_call":
+      return `${CALL_LIST_ORDER.sort_by}:${CALL_LIST_ORDER.sort_order}`;
+    case "whatsapp_message":
+    case "telegram_message":
+    case "email_message":
+      return LEGACY_LIST_ORDER;
+    default: {
+      const unexpected: never = dispatchType;
+      throw new Error(`no list ordering known for ${String(unexpected)}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +753,7 @@ export class MagickClient {
 
   async listCalls(params: ListCallsParams = {}): Promise<CallsListResponse> {
     const url = buildUrl("/proxy/calls", {
+      ...CALL_LIST_ORDER,
       limit: params.limit,
       offset: params.offset,
       status: params.status,
@@ -711,6 +795,7 @@ export class MagickClient {
 
   async listStaticCalls(params: ListCallsParams = {}): Promise<CallsListResponse> {
     const url = buildUrl("/proxy/static-calls", {
+      ...CALL_LIST_ORDER,
       limit: params.limit,
       offset: params.offset,
       status: params.status,
@@ -724,6 +809,7 @@ export class MagickClient {
 
   async listIvrCalls(params: ListCallsParams = {}): Promise<IvrSessionsListResponse> {
     const url = buildUrl("/proxy/ivr-calls", {
+      ...CALL_LIST_ORDER,
       limit: params.limit,
       offset: params.offset,
       status: params.status,

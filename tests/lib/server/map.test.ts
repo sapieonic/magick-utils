@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { bulkJobIsUnchangedSince, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
+import { batchDocToBatch, bulkJobIsUnchangedSince, bulkJobRecordsStamp, bulkJobSourceFingerprint, bulkJobToBatchDoc } from "@/lib/server/map";
 import type { RawBulkJob } from "@/lib/server/magick-client";
 import type { BatchDoc, TenantContext } from "@/lib/server/types";
 
@@ -165,6 +165,9 @@ describe("bulkJobToBatchDoc", () => {
       ...source,
       total: 359,
       ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      // The list surface counted 359 rows for the pull: complete, despite the
+      // contact count being higher.
+      ingestedListedTotal: 359,
       publishedRevision: "revision-1",
       fingerprint: "dataset-fp",
     };
@@ -177,6 +180,102 @@ describe("bulkJobToBatchDoc", () => {
     expect(refreshed.sourceTotal).toBe(369);
     expect(refreshed.ingestStatus).toBe("ready");
     expect(refreshed.publishedRevision).toBe("revision-1");
+  });
+
+  // The Samarthya shape: a revision an older build published SHORT (8,038 of
+  // 8,232) with nothing recording that it was short. "ready" there lets every
+  // refresh prove the terminal job unchanged and skip it forever, so it reads
+  // stale — still readable — until a pull stamps it complete.
+  it("marks an unstamped revision below the dispatched count stale, not ready", () => {
+    const job: RawBulkJob = {
+      id: "short", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 8232,
+      updated_at: "2026-09-30T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source,
+      total: 8038,
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.total).toBe(8038);
+  });
+
+  it("judges a stamped revision against its own listed total, not the contact count", () => {
+    const job: RawBulkJob = {
+      id: "stamped", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 500,
+      updated_at: "2026-09-30T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const base: BatchDoc = {
+      ...source,
+      ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+    };
+    // 480 rows listed, 480 ingested: complete, however many contacts went out.
+    expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 480, ingestedListedTotal: 480 }).ingestStatus).toBe("ready");
+    // Listed more than were ingested (a running job's publication): stale.
+    expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 470, ingestedListedTotal: 480 }).ingestStatus).toBe("stale");
+    // The stamp is carried through the listing for the next decision.
+    expect(bulkJobToBatchDoc(job, ctx, { ...base, total: 480, ingestedListedTotal: 480 }).ingestedListedTotal).toBe(480);
+  });
+
+  // The worker's record of a short pull survives every listing, keeps the
+  // batch stale however complete the stamps look (the kept revision may hold
+  // every record and still be behind), and reaches the frontend shape.
+  it("carries a recorded shortfall through the listing and reads it stale", () => {
+    const job: RawBulkJob = {
+      id: "kept", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 3,
+      updated_at: "2026-09-30T10:00:00Z",
+    };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const shortPull = { listed: 3, received: 2, carried: 1, keptPrevious: true, settled: true, detectedAt: "2026-10-01T00:00:00Z" };
+    const committed: BatchDoc = {
+      ...source, total: 3, ingestStatus: "stale", ingestedSourceFingerprint: source.sourceFingerprint,
+      ingestedListedTotal: 3, publishedRevision: "revision-1", shortPull,
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.shortPull).toEqual(shortPull);
+    expect(batchDocToBatch(refreshed).shortfall).toEqual(shortPull);
+    // Cleared by a complete publish, the same listing reads ready again.
+    const cleared = bulkJobToBatchDoc(job, ctx, { ...committed, shortPull: null });
+    expect(cleared.ingestStatus).toBe("ready");
+    expect(batchDocToBatch(cleared).shortfall).toBeNull();
+  });
+
+  // A short pull of a job still dispatching is recorded — its time is what
+  // rate-limits merge re-pulls — but it says nothing about upstream, so no
+  // reader is told "upstream returned incomplete data". It still keeps the
+  // batch stale and re-pullable.
+  it("records an unsettled shortfall without showing it to readers", () => {
+    const job: RawBulkJob = { id: "live", dispatch_type: "ai_voice_call", status: "processing", total_contacts: 3 };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const shortPull = { listed: 3, received: 2, carried: 0, keptPrevious: false, settled: false, detectedAt: "2026-10-01T00:00:00Z" };
+    const committed: BatchDoc = {
+      ...source, total: 2, ingestStatus: "stale", ingestedSourceFingerprint: source.sourceFingerprint,
+      ingestedListedTotal: 3, publishedRevision: "revision-1", shortPull,
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.shortPull).toEqual(shortPull);
+    expect(batchDocToBatch(refreshed).shortfall).toBeNull();
+  });
+
+  // The loose legacy fallback schedules a re-pull but is never shown to a
+  // customer: it flags healthy partially-failed campaigns.
+  it("never derives a reader-facing shortfall from the legacy contact-count fallback", () => {
+    const job: RawBulkJob = { id: "legacy", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 8232 };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source, total: 8038, ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      publishedRevision: "revision-1",
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(batchDocToBatch(refreshed).shortfall).toBeNull();
   });
 
   // A zero-record commit used to pull `total` down to 0 and take the dispatched
@@ -263,7 +362,7 @@ describe("bulkJobToBatchDoc", () => {
     const first = bulkJobToBatchDoc(base, ctx);
     const committed: BatchDoc = {
       ...first, ingestStatus: "ready", total: 9, fingerprint: "dataset-fp",
-      ingestedSourceFingerprint: first.sourceFingerprint,
+      ingestedSourceFingerprint: first.sourceFingerprint, ingestedListedTotal: 9,
     };
     const refreshed = bulkJobToBatchDoc({ ...base, updated_at: "2026-08-12T11:30:00Z" }, ctx, committed);
     expect(refreshed.sourceFingerprint).toBe(committed.sourceFingerprint);
@@ -339,44 +438,67 @@ describe("bulkJobToBatchDoc", () => {
 });
 
 describe("bulkJobIsUnchangedSince", () => {
+  const T1 = "2026-09-01T10:00:00.000001Z";
+  const T2 = "2026-09-01T10:00:00.000002Z";
   const done = (over: Partial<RawBulkJob> = {}): RawBulkJob => ({
     id: "job-1", dispatch_type: "ai_voice_call", status: "completed",
-    total_contacts: 10, updated_at: "2026-09-01T10:00:00Z", ...over,
+    total_contacts: 10, status_summary: { completed: 8, no_answer: 2 }, records_updated_at: T1, ...over,
+  });
+  const stampAt = (over: Partial<RawBulkJob> = {}) => bulkJobRecordsStamp(done(over));
+
+  it("is true only when a finished job's records stamp is unchanged since the pre-pull observation", () => {
+    expect(bulkJobIsUnchangedSince(done(), stampAt())).toBe(true);
   });
 
-  it("is true only when a finished job has not been touched since ingestion", () => {
-    expect(bulkJobIsUnchangedSince(done(), "2026-09-01T10:00:00Z")).toBe(true);
+  // The ticket's defect: a recording / transcript / analysis lands on a call
+  // whose status does not change — the summary fingerprint cannot see it.
+  it("is false once a core row is written again, even with identical counts", () => {
+    const later = done({ records_updated_at: T2 });
+    expect(bulkJobSourceFingerprint(later)).toBe(bulkJobSourceFingerprint(done()));
+    expect(bulkJobIsUnchangedSince(later, stampAt())).toBe(false);
   });
 
-  it("is false once upstream writes to the job again", () => {
-    expect(bulkJobIsUnchangedSince(done({ updated_at: "2026-09-01T11:00:00Z" }), "2026-09-01T10:00:00Z")).toBe(false);
+  // A max does not move when a row is deleted (retention); the counts do.
+  it("is false when the counts move with the timestamp standing still", () => {
+    expect(bulkJobIsUnchangedSince(done({ status_summary: { completed: 7, no_answer: 2 } }), stampAt())).toBe(false);
   });
 
-  // status_summary and call_status_counts are call-dispatch-only, so for a
-  // messaging campaign the summary fingerprint is frozen from dispatch onward.
-  // Delivery receipts, read receipts and replies move only updated_at — without
-  // that check "Refresh data" would be a permanent no-op for messaging.
-  it("catches messaging receipts, which move no summary field", () => {
-    const base = { id: "job-wa", dispatch_type: "whatsapp", status: "completed", total_contacts: 5000 };
-    const atIngest: RawBulkJob = { ...base, updated_at: "2026-09-01T10:00:00Z" };
-    const later: RawBulkJob = { ...base, updated_at: "2026-09-01T12:30:00Z" };
-    expect(bulkJobSourceFingerprint(atIngest)).toBe(bulkJobSourceFingerprint(later));
-    expect(bulkJobIsUnchangedSince(later, atIngest.updated_at)).toBe(false);
-  });
-
-  it("never skips a job that is still running", () => {
-    for (const status of ["processing", "queued", "in_progress", "", undefined]) {
-      expect(bulkJobIsUnchangedSince(done({ status }), "2026-09-01T10:00:00Z")).toBe(false);
+  it("covers partially_failed and the other terminal states, and never skips a running job", () => {
+    for (const status of ["completed", "partially_failed", "failed", "cancelled", "canceled"]) {
+      expect(bulkJobIsUnchangedSince(done({ status }), stampAt({ status }))).toBe(true);
+    }
+    for (const status of ["dispatched", "processing", "queued", "in_progress", "", undefined]) {
+      expect(bulkJobIsUnchangedSince(done({ status }), stampAt({ status }))).toBe(false);
     }
   });
 
-  it("never skips without a stamp — a legacy or never-ingested batch", () => {
+  it("never skips without a stamp — a legacy, resumed or never-ingested batch", () => {
     expect(bulkJobIsUnchangedSince(done(), null)).toBe(false);
     expect(bulkJobIsUnchangedSince(done(), undefined)).toBe(false);
+    expect(bulkJobIsUnchangedSince(done(), "")).toBe(false);
   });
 
-  it("never skips when upstream sends no updated_at at all", () => {
-    expect(bulkJobIsUnchangedSince(done({ updated_at: null }), null)).toBe(false);
+  // Unknown on master's side (older master/core, failed read, a batch inside
+  // core's settle window, messaging) must never read as "unchanged" — not even
+  // against a stamp that was itself taken while unknown.
+  it("treats records_updated_at null or absent as unknown on either side, never a match", () => {
+    expect(bulkJobRecordsStamp(done({ records_updated_at: null }))).toBeNull();
+    expect(bulkJobRecordsStamp(done({ records_updated_at: undefined }))).toBeNull();
+    expect(bulkJobRecordsStamp(done({ records_updated_at: "" }))).toBeNull();
+    expect(bulkJobIsUnchangedSince(done({ records_updated_at: null }), stampAt())).toBe(false);
+    expect(bulkJobIsUnchangedSince(done({ records_updated_at: null }), stampAt({ records_updated_at: null }))).toBe(false);
+  });
+
+  // Documents written before this marker carried `ingestedSourceUpdatedAt`, a
+  // copy of a job `updated_at` master never sent. Nothing reads that field, and
+  // a raw timestamp can never equal a records stamp anyway.
+  it("never matches a stamp written under the old updated_at meaning", () => {
+    expect(bulkJobIsUnchangedSince(done({ updated_at: T1 }), T1)).toBe(false);
+    expect(bulkJobIsUnchangedSince(done(), T1)).toBe(false);
+  });
+
+  it("is precise to the microsecond — two writes in one millisecond are a change", () => {
+    expect(stampAt({ records_updated_at: T1 })).not.toBe(stampAt({ records_updated_at: T2 }));
   });
 });
 

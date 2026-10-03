@@ -39,6 +39,8 @@ the worker when the backend is configured.
 - `call-analysis.ts` — fills the Conversation tab's Sentiment and Key topics from core's rollup,
   because the records cannot carry them (see *Sentiment and key topics* below).
 - `fingerprint.ts` — stable hashes for cache keys / change detection.
+- `record-fingerprint.ts` — content fingerprint of a record set (`BatchDoc.fingerprint`); covers every
+  reader-visible field (see *Pull completeness*).
 - `llm/` — `getLLM()` factory + `OpenAICompatibleProvider` (DeepSeek/Kimi/OpenRouter/vLLM/Ollama) and
   `AnthropicProvider`; `complete`/`stream`/`structured` (Zod-validated, retry-on-parse-fail). `INSIGHT_SCHEMA`.
 - `worker.ts` — tails the `jobs` collection; ingest/merge jobs paginate magick-master, normalize, persist
@@ -203,7 +205,7 @@ unambiguous. An IVR/static batch with no stored type **throws** rather than fall
 `/proxy/calls`. A *present* but unknown `dispatch_type` (job payload or stored field) also throws —
 it is not treated as missing, so an AI-labelled batch cannot infer `/proxy/calls` and 400. Only
 genuinely absent values fall back. Resume fetches the job for this reason even though it still
-withholds the `ingestedSourceUpdatedAt` stamp until offset 0.
+withholds the `ingestedRecordsStamp` until offset 0.
 
 Always send `job_id` (`BatchDoc.sourceId`). Dropping it to dodge a type-mismatch 400 would list the
 whole account, which is the bug master's guard exists to prevent. A BatchDoc with no `sourceId`
@@ -217,40 +219,282 @@ would otherwise look like an empty dispatched pull.
 `limit` is 1–100; the worker's `PAGE_SIZE` is already 100. CSV `Content-Disposition` is RFC 6266 —
 unused here, because export is Mongo.
 
+### Pull completeness
+
+**Mechanism.** Core pages its list surfaces with `LIMIT/OFFSET` ordered by `created_at`, which is not
+unique — a dispatch chunk is one multi-row INSERT, so its rows share a timestamp. Postgres sorts each
+page with a top-N heapsort bounded by `OFFSET+LIMIT`, and the order it leaves among tied rows changes
+with that bound, so consecutive pages overlap and skip tied rows while the raw row count still equals
+`total`. **The loss is deterministic**: on Postgres 16 with zero writes, 3,600 tied rows paged 100 at a
+time came back as 3,584 unique, identical on every pass, and the union of three passes was still 3,584.
+Concurrent UPDATEs (status callbacks moving heap tuples) are a secondary cause, not the main one.
+Re-pulling therefore recovers nothing against an unfixed core, and every finished AI/static/IVR batch
+larger than a page can come back short. In production an 8,232-call Combine came out as 8,038 rows
+under a green label. The fix is core's: a unique `id` tiebreak appended to every list ordering (calls,
+static, IVR and messaging). Everything below describes how Utils behaves against a core build without
+that tiebreak, and how it converges once a build with it is serving.
+
+**Deploy guidance:** deploy core's tiebreak first. Utils is safe either way — against an unfixed core it
+reports the shortfall and never drops a record a reader already has; against a fixed core the next pull
+of each flagged batch comes back whole and clears the flag. No migration or manual step is needed in
+either order.
+
+**Detection.** After its one pass, the worker compares the unique record count against the list
+surface's own `total` (`isIncompletePaginatedPull`). On all four surfaces core computes that `total` as
+`COUNT(*)` over the same WHERE the pages come from, so a unique count below it is real loss — never
+compare against `total_contacts`, a different population (rejected batches and suppressed numbers never
+become rows) that would flag healthy partially-failed campaigns forever. More unique records than
+`total` is not loss. Not keyed on duplicates: loss can occur on a pass with none.
+
+Every incomplete pull is RECORDED (`BatchDoc.shortPull`, with `detectedAt`), whatever the job's state —
+that observation time is what rate-limits merge re-pulls. Whether it is SETTLED — reported as loss to a
+reader and in a job warning — applies only once the job's row set has stopped growing
+(`ROWS_SETTLED_JOB_STATUSES`:
+`completed`, `dispatched`, `partially_failed`, `failed`, `cancelled`). `cancelled` and `failed` count
+only once master's terminal stamp (`cancelled_at`, else `completed_at`) is older than
+`ROWS_SETTLE_WINDOW_MS` (5 min): master flips the status while a dispatch request to core may still be
+inserting rows, so judging inside that window put "Incomplete upstream data" on healthy just-stopped
+campaigns. Inside it the pull is treated as a running job's (below) and the next pull judges it
+exactly; a missing stamp counts as settled, since withholding the flag on an absence would leave a
+short pull silent with nothing to bring the judgement back. That is deliberately WIDER than
+the empty-pull guard's `DIALLED_JOB_STATUSES`, because this outcome fails nothing: the question is only
+"will more rows appear?", and a cancelled or failed job's rows are as fixed as a completed one's.
+Exempting them left the same loss silent on exactly those campaigns, sitting `stale` with nothing to
+say why. A job whose detail cannot be read keeps the judgement the batch already carries (a job does
+not un-stop, so a settled shortfall and its warning survive a transient upstream error); with no
+previous judgement it is unknown. Still-dispatching, unrecognised and unknown jobs are recorded `settled: false` — their COUNT
+can genuinely run ahead of the pages, so "upstream returned incomplete data" would be false — and are
+told to nobody, but they go through exactly the same carry-forward, identical-content skip and merge
+cooldown as a settled gap. Before they were recorded at all, a running campaign's short pull left
+`shortPull` null: `needsCompletenessRepull` held (stamped short) while `shortPullCheckedRecently` could
+not (no `detectedAt`), so every merge re-paged upstream and wrote another full copy even when nothing had
+changed.
+
+**Outcome — one pass, never a failure, never a lost record.** A short pull is not retried (retries
+tripled upstream load on exactly the misbehaving batches and could not help) and does not throw (which
+used to fail every other batch in the job and leave Analytics showing only an error). Instead:
+
+1. **Carry forward.** Every record the served revision holds that this pull did not return is copied
+   into the new revision (`getRevisionRecordsMissingFrom`, marked `carriedFrom`), so what is served is
+   this pull's records — fresh — plus the rest of what readers already had. `BatchDoc.total` is
+   `received + carried`.
+2. **Unchanged → write nothing.** If that union equals the served revision record for record (same
+   count, same content `fingerprint`), it is kept (`keepPublishedRevisionIfOwned`), the staged copy is
+   deleted, and only the flag and the built-from stamps (`ingestedListedTotal`,
+   `ingestedSourceFingerprint`, `ingestedRecordsStamp`, `sourceTotal`) are written. The carried rows are
+   only written to staging after this check, so the skip writes nothing; its read cost is the served
+   revision's ids (projected, `{recordId: 1}`) plus the full documents of the missing rows only, fetched
+   in `$in` chunks.
+3. Otherwise the union is published, flagged.
+
+**Bounded by what upstream lists.** In every legitimate case (tie loss, an add-only running job) the
+union is at most the list `total`: every carried row is a real row the pull missed. A union above it
+means the served revision holds rows upstream no longer counts (deleted upstream) or ids that stopped
+matching (a change in how `recordId` is derived would carry every old row and double the batch's total,
+rates and export). Then nothing is carried: the pull is published alone, flagged, and an error is
+logged.
+
+| Served before the pull | Outcome | `ingestStatus` | `shortPull` |
+|---|---|---|---|
+| Nothing readable (first pull) | This pull published | `stale` | `carried: 0` |
+| A readable revision whose rows this pull all returned, content unchanged | Kept; nothing written but the flag | `stale` | `carried: 0` |
+| A readable revision with rows this pull did not return, union unchanged | Kept; nothing written but the flag | `stale` | `carried: n`, `keptPrevious: true` |
+| Anything else | Union published | `stale` | `carried: n` (0 if nothing missing) |
+
+**Why a union, not "keep whichever revision has more records".** That was the first rule, and it was
+wrong in two directions. Two short pulls can each hold rows the other lacks — ascending and descending
+order lose different tied rows (so the first oldest-first pull after a newest-first one does exactly
+this), and a running job's successive snapshots differ — so a pull with MORE records could still drop
+rows the customer had, and an equal-count pull swapped one subset for another. And a kept revision froze
+every status in it until a complete pull arrived. The union never removes a record on the word of a
+pull known to be incomplete and refreshes every record the pull did return. Its costs, accepted: a
+carried row may be behind on status (the reader copy says so); a row deleted upstream can stay until
+the union would exceed the list total (above) or the first COMPLETE pull, which publishes exactly what
+upstream lists and carries nothing; and a short pull reads the served revision's ids once more, plus the
+missing rows in full (no `$nin` query document). A union can reach or pass `listed` while the pull itself was short; it stays flagged
+(`shortPull` set, `stale`, re-pulled after the cooldown) because its carried rows are not current.
+
+**Resuming safely.** A resumed job reads its staging revision back and must not count rows an
+interrupted attempt carried as pulled, or a short pull would read as complete: rows with `carriedFrom`
+are excluded from the fetched set and dropped from staging (`deleteCarriedRecords`, a no-op on the
+published revision) to be re-derived. A page write of an id that was carried clears the marker
+(`replaceBatchRecords` `$unset`s it). A job also stores the list total beside its cursor
+(`Job.cursorListedTotal`): a resumed pass may see only empty pages, and an empty page need not report a
+total, so without it a resumed short pull would read as complete (a checkpoint from before the field
+falls back, for a revision the job already published, to its stamped `ingestedListedTotal`; a total
+reported by any page of the resumed pass supersedes both). If the job died after publishing the union
+but before its batch transition, the staging revision IS the published one: while the resumed pull is
+still short and the union within bounds, its carried rows stay part of what is served (unchanged → kept;
+new pages → republished); if the resumed pull is now complete, or carrying would exceed the total, the
+carried rows are deleted from that revision (`deleteCarriedRecords` with `includePublished`) and it is
+republished from the pulled rows alone, so a `ready`, unflagged batch never serves a row upstream does
+not list. The ownership checkpoint before a publish counts pulled rows only, so a resumed page
+checkpoint never undercounts the stored progress (`checkpointJob` refuses to move `done` backwards).
+
+The unchanged case is the common one against a core without the tiebreak: the loss is deterministic,
+so every re-pull of a finished job returns the same short set, and publishing it again wrote a complete
+duplicate dataset per merge, download or Refresh to change nothing a reader can see (~8k records per
+Generate for the selection that surfaced this). A tie is keyed on the content fingerprint rather than
+the count alone because a finished job's rows can still change (statuses, receipts, costs, post-call
+fields); a tie that carries such a change is published, and once upstream stops changing the next tie
+is identical and writes nothing.
+
+**What the content fingerprint covers** (`recordsContentFingerprint`, `lib/server/record-fingerprint.ts`):
+every field of every record — every export column, everything aggregates/analytics/chat/insights read,
+and the whole `raw` payload — except storage metadata that differs between two copies of identical data:
+`revision`, `revisionCreatedAt`, `retiredAt`, the per-record `fingerprint` stamp, and Mongo's `_id`. It
+is a canonical serialization of the record (keys sorted at every level, `null`/`undefined`/absent treated
+as one value as a Mongo round trip does, Dates as instants, array order kept), hashed per record and
+order-independent across records. The exclusions are an explicit table,
+`NORMALIZED_RECORD_FIELD_ROLES`, which `satisfies` keeps exhaustive over `NormalizedRecord`: a new field
+fails `tsc` until it is classified, and a key the table has never heard of is fingerprinted rather than
+dropped. It used to be a hand-picked field list (status, costs, durations, sentiment, topics, reply
+text), which left out `recordingUrl`, `transcript`, `conversationSummary`, `outcome`, `timestamp`,
+receipts, IVR fields and more — so a recording or transcript arriving after the campaign finished made
+the next short tie read "identical", kept the batch stale and stamped it current. Covering `raw` whole
+has one cost: a per-request value in an upstream list row (a signed URL, a "now") would make every tie
+publish again — wasted storage, never stale data; exclude such a key by name in that table.
+
+The formula change makes every batch's stored `fingerprint` (written by the old formula) unequal to its
+next pull's, so each flagged batch **publishes once more** on its first short re-pull after the deploy
+and matches from then on; the dataset-keyed aggregate and insight caches for those selections recompute
+once with it. Nothing else compares this value: `datasetFingerprint` only folds it into cache keys, and
+the listing only preserves it. The source-freshness skip uses `ingestedSourceFingerprint` /
+`ingestedRecordsStamp`, which this does not touch, so no refresh/skip loop can result. A first pull is
+published rather than refused because a brand-new customer would otherwise see nothing at all until core
+deploys, while a partial dataset labelled "N of M" is both usable and honest. A settled pull finishes the
+job `done`
+with a `JobWarning` per affected batch — written in the same checkpoint that moves `batchIndex` past the
+batch, so neither a deferral nor a kill between the two can resume the job past the batch without it
+(Analytics treats a job's batches as covered by its warnings, so a lost one hid the notice entirely) — and the
+other batches in the job publish normally.
+
+**Readers.** `BatchDoc.shortPull` (`{listed, received, carried, keptPrevious, settled, detectedAt}`) is
+the one reader-facing statement, surfaced as `Batch.shortfall` — but only when `settled`
+(`isReaderFacingShortfall`); an unsettled one is recorded for the cooldown and shown to nobody. Only the
+worker writes it, and only from the exact comparison above. It is never derived from `publishedRevisionMayBeShort`'s legacy fallback,
+which is too loose to put in front of a customer. Analytics shows an amber "Upstream returned
+incomplete data" notice and replaces "Up to date" with "Incomplete upstream data", using the job's
+warnings for the batches it pulled and the listing for the rest — including warnings from a job that
+went on to fail on a later batch, since those still describe data the charts serve. Combine's "Download
+ready" label and the per-campaign download's "Your CSV is ready" state the rows the file lacks against
+upstream's count ("8,038 rows — 194 fewer than upstream lists") and, separately, whether the file
+carries records from an earlier load because the latest pull did not return them (and so may be behind
+on status), and when another download or Generate
+will actually re-pull (`repullHint`, quoting `SHORT_PULL_REPULL_COOLDOWN_MS`) or that Analytics'
+Refresh data does so now — "try again later" with no time sent customers round the cooldown. The CSV
+itself carries no marker.
+
+**Convergence.** `needsCompletenessRepull` (`shortPull` set, or `publishedRevisionMayBeShort`) is the
+shared predicate, and every place that has to agree uses it: the campaigns listing and
+`failBatchIfOwned` resolve such a batch to `stale` rather than `ready`, the refresh path never skips
+it, and **a merge re-pulls it** (Combine and the per-campaign download send no `refresh`, so without
+this a re-export after the core fix would still stream the short revision) — but not within
+`SHORT_PULL_REPULL_COOLDOWN_MS` (15 min) of the batch's last observed short pull
+(`shortPullCheckedRecently`, keyed on `shortPull.detectedAt`, which every short re-pull re-stamps). The
+re-pull is the same short set every time against an unfixed core, so re-paging each flagged batch on
+each Generate was pure load from one host against master's global per-IP limit (~83 page requests per
+Generate for an 8k-record selection). A settled record is honoured outright. An UNSETTLED one (taken
+while the job was still adding rows) is honoured only after a live read of the job proves nothing has
+moved since (`unsettledShortPullStillCurrent` in the ingest route): the job still has not stopped adding
+rows, and its records stamp is known and equal to the one observed before that pull. Otherwise it is
+re-pulled — in particular once the campaign finishes, or a merge inside the cooldown would stream the
+mid-run snapshot under "Download ready" with no warning, since an unsettled shortfall is shown to nobody.
+That re-pull is what records the shortfall as settled and reader-facing. A batch that merely *may* be short (legacy stamps from before
+`shortPull` existed) has no recorded observation and is re-pulled, since that pull is what judges it. An explicit Analytics
+Refresh ignores the cooldown. A plain Analytics load does not re-pull at all — it serves the flagged
+data; re-pulling on every page view would re-page upstream per visit. The first complete pull publishes
+with `shortPull: null` (`buildBatchDoc` writes the explicit null, since publication is a `$set`) and an
+exact `ingestedListedTotal`, and the batch reads `ready` again — on the first Refresh after the core fix,
+or the first merge after the cooldown. Against an unfixed core each re-pull costs one full upstream pass
+and storage only for its staging copy, which is deleted at once whenever the union is unchanged; a new
+revision is written only when the union differs in count or content from what readers see.
+
+- **`ingestedListedTotal`** is stamped on every publish so "is this revision complete?" can be answered
+  exactly afterwards (`publishedRevisionMayBeShort`). Revisions published before it existed fall back
+  to `total < sourceTotal`, which also flags some legitimately short legacy batches; each costs one
+  re-pull and is then judged exactly from the stamp that pull writes.
+- **List ordering.** The client sends `sort_by=created_at&sort_order=asc` on `/proxy/calls`,
+  `/proxy/static-calls` and `/proxy/ivr-calls` — master forwards the query verbatim and core allow-lists
+  both values on each — so rows added while a running job is paged land in the unfetched tail instead of
+  shifting every later page (under the newest-first default a new row repeats one row per page and is
+  itself never fetched). It does not fix the ties, and it is not neutral while they exist: ascending and
+  descending lose DIFFERENT tied rows. Two guards follow. A job checkpoints a raw OFFSET, so it records
+  the ordering beside it (`Job.cursorOrder`, from `listOrderToken`); a resume whose recorded ordering
+  differs — including a checkpoint with none, read as the server default (`LEGACY_LIST_ORDER`) — restarts
+  the batch from offset 0 rather than append pages from another ORDER BY (never when the staging revision
+  is already the published one). And the carry-forward above means the first oldest-first pull over a
+  revision built newest-first cannot drop the rows only the older pull returned. Messaging gets no sort
+  param: core's `messageQuerySchema` accepts none (an unknown key is stripped, not refused), so its fixed
+  newest-first order — `created_at DESC`, plus `id DESC` on a core with the tiebreak — cannot be changed
+  from here, and its token is the legacy one, so its resumes are unaffected.
+- **The exported row count** — Combine's "Download ready" label and the per-campaign download's "Your
+  CSV is ready" — is re-read from the selected batches once preparation finishes (`resolveExportFacts`
+  in `lib/export-facts.ts`; each readable batch's `total` is its published record count), together with
+  the shortfall (`selectionShortfall`), rather than the figure frozen before preparation, which for a
+  never-ingested batch is a contact count. Combine persists those figures with the prepared export but
+  re-reads them every time a finished screen mounts (a reload or back-navigation): a refresh may have
+  published a newer revision in the meantime, and Download streams whatever is published when it is
+  pressed. A restored figure stays up while the re-read runs or if it fails in transit; a batch that is no
+  longer readable drops it back to the estimate. Until it resolves, in demo mode, or if any batch is not
+  readable, the estimate stays. The merge job's `result.rowCount` is not used: it counts only the
+  batches that job re-pulled.
+
 ### Batch freshness (`BatchDoc.ingestStatus`)
 `none` → `ingesting` → `ready`, with `error` on failure. A published revision is also readable as
-**`stale`**: upstream's job summary has moved since the revision was ingested, but that revision is
-complete and is still what every reader sees. Stale batches therefore serve analytics, exports and the
+**`stale`**: upstream's job summary has moved since the revision was ingested, or the revision may be
+incomplete (see *Pull completeness*), but it is still what every reader sees. Stale batches therefore serve analytics, exports and the
 dashboard normally, and keep their ingested figures — including the record total. Resetting them to
 `none` instead made the record count flip between page loads, 409'd the next analytics call, and drove a
 full duplicate re-ingest on every campaigns listing.
 
 Freshness is decided by comparing `sourceFingerprint` (the current upstream summary, via
 `bulkJobSourceFingerprint`) with `ingestedSourceFingerprint` (what the published revision was built
-from). The fingerprint deliberately excludes the job's `updated_at`, which upstream bumps without any
-record changing. The comparison is against what was *ingested*, not against the previous listing, so a
+from). The comparison is against what was *ingested*, not against the previous listing, so a
 source that moves and moves back resolves to "ready" rather than latching stale.
 
 **Deciding whether to re-pull is a different question and uses a different signal.** That fingerprint is
-one-directional: a change proves the source moved, but no change proves nothing, because
-`status_summary` and `call_status_counts` are call-dispatch-only and no summary field moves for message
-receipts, replies, or post-call AI enrichment. So `POST /api/ingest` with `refresh: true` skips a batch
-only when `bulkJobIsUnchangedSince` holds — the job has reached a terminal status AND its `updated_at`
-matches `ingestedSourceUpdatedAt`, stamped from the same endpoint before the last pull began. Anything
-unproven is re-pulled: redundant work is self-cleaning, silently serving stale data is not.
+one-directional: a change proves the source moved, but no change proves nothing — it is counts, and a
+recording, transcript, outcome, post-call analysis or delivery receipt lands on a row whose status does
+not change. So `POST /api/ingest` with `refresh: true` skips a batch only when `bulkJobIsUnchangedSince`
+holds: the job is terminal (`completed`, `partially_failed`, `failed`, `cancelled`) AND
+`bulkJobRecordsStamp(job)` equals `ingestedRecordsStamp`. Anything unproven is re-pulled: redundant work
+is self-cleaning, silently serving stale data is not.
+
+The stamp is master's `records_updated_at` — the latest **core row** write across the job's batches,
+derived from core's per-batch `max(updated_at)` on the same grouped read that produces `status_summary` —
+bound to that `status_summary` (a max cannot see a row being deleted; the counts can). Three facts make
+it trustworthy where its predecessor was not:
+
+- **It is the right source.** The previous skip compared the job's `updated_at`, but master's
+  `bulk_dispatch_jobs` has no such column and never sent one, so every stamp was null and every
+  Refresh re-pulled every batch, writing a full duplicate revision each time. Even a real job-row
+  timestamp would have been wrong: per-call changes are written to core's rows, never to master's job.
+- **Null is unknown, never unchanged**, on either side. Master answers `null` when any batch is
+  unaccounted for — an older master or core, a failed read, a batch inside core's 120 s settle window
+  (core withholds a max until no in-flight transaction can still commit beneath it), and messaging
+  campaigns, whose core route does not serve the freshness yet. A null never matches, not even another
+  null. Documents stamped under the old meaning carry only `ingestedSourceUpdatedAt` (always null in
+  practice), which nothing reads.
+- **It is observed BEFORE the pull.** The worker reads the detail at offset 0, before the first page,
+  and stamps that. Anything written during or after the pull therefore moves the stamp and the next
+  refresh re-pulls; a stamp read after the pull could absorb a write the pull missed and hide it for
+  good. Master may serve the value from its few-second cache, which can only make it older — the safe
+  direction. A resumed pull stamps null.
 
 Because the two signals are different, they can disagree, and one direction deadlocks: the listing marks
-a batch `stale` while `updated_at` stands still, so the skip fires, nothing is pulled, and the batch
-stays latched `stale` with no click able to clear it. A batch already flagged `stale` is therefore never
-skipped — that flag is positive evidence the source moved, so there is nothing left to decide.
+a batch `stale` while the stamp stands still, so the skip fires, nothing is pulled, and the batch stays
+latched `stale` with no click able to clear it. A batch already flagged `stale` is therefore never
+skipped — that flag is positive evidence the source moved, so there is nothing left to decide. Nor is a
+batch `needsCompletenessRepull` holds for (see *Pull completeness*), whatever its stamp says.
 
 For the same reason the worker stamps `ingestedSourceFingerprint` from the *listing's* view of the job
-(`batch.sourceFingerprint`) rather than from the detail payload it fetches for `ingestedSourceUpdatedAt`.
+(`batch.sourceFingerprint`) rather than from the detail payload it fetches for `ingestedRecordsStamp`.
 A fingerprint is only comparable with another of the same shape, and `/bulk-dispatch-jobs` and
 `/bulk-dispatch-jobs/{id}` need not agree on their summary fields; stamping a detail-derived value would
 mark every batch `stale` on the very next listing, forever. Being one listing behind is the safe
 direction: a change that lands mid-ingestion shows up as `stale` next listing, and that refresh is no
-longer skippable.
+longer skippable. The records stamp has no such problem: it is detail-to-detail on both sides.
 
 ## API routes (`app/api/`)
 | Route | Method | Purpose |
@@ -262,7 +506,7 @@ longer skippable.
 | `/api/auth/logout` | POST | destroy session |
 | `/api/campaigns` | GET `?range=`\|`?ids=` | list batches (bulk-dispatch jobs → BatchDocs) |
 | `/api/ingest` | POST `{batchIds,type?}` | enqueue ingest/merge job → `{jobId,total}` |
-| `/api/jobs/[id]` | GET | job status/progress (idToken stripped) |
+| `/api/jobs/[id]` | GET | job status/progress (idToken stripped); `warnings` lists batches whose pull came back incomplete |
 | `/api/export` | GET/POST `{batchIds,columns}` | streamed CSV from Mongo records (409 if not ingested) |
 | `/api/analytics` | POST `{batchIds,refresh?}` | compute/cache aggregates (409 if not ingested) |
 | `/api/insights` | POST `{batchIds,refresh?}` | LLM insight, cached by fingerprint + configured `LLM_MODEL` |

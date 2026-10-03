@@ -16,7 +16,8 @@ import {
 } from "@/lib/api";
 import { useApp } from "@/lib/store";
 import type { Batch, TypeKey } from "@/lib/types";
-import type { AggregatesDoc } from "@/lib/server/types";
+import type { AggregatesDoc, JobWarning } from "@/lib/server/types";
+import { shortfallMessage } from "@/lib/shortfall";
 import { ChatPanel } from "@/components/screens/analytics/ChatPanel";
 import { ConversationTab } from "@/components/screens/analytics/ConversationTab";
 import { CostTab } from "@/components/screens/analytics/CostTab";
@@ -72,6 +73,10 @@ export default function Page() {
   // "your data is current" from a refresh that quietly did nothing — the
   // ambiguity the customer read as the numbers being unreliable.
   const [upToDate, setUpToDate] = useState(false);
+  // What the ingest job that just ran reported about incomplete upstream pulls,
+  // and which batches it covered. Null when no job ran for this view, in which
+  // case the batches' own `shortfall` (from the listing) is the whole story.
+  const [jobOutcome, setJobOutcome] = useState<{ warnings: JobWarning[]; batchIds: string[] | null } | null>(null);
   // `analyzeTargets` is set by whichever screen sent the customer here, so the
   // ids are known before this runs and only their names and totals are missing.
   // Resolve exactly those: listing the whole account to find a handful of them
@@ -144,6 +149,21 @@ export default function Page() {
   const ingestDenominator = targets.reduce((a: number, c: Batch) => a + c.total, 0);
   const hasVoice = targets.some((t: Batch) => t.channel === "voice");
   const hasMsg = targets.some((t: Batch) => t.channel !== "voice");
+
+  // Batches whose served data falls short of what upstream lists, or whose
+  // latest pull came back short. Never silent: a chart drawn from 8,038 of
+  // 8,232 records under "Up to date" is the defect this exists to prevent. The
+  // job that just ran is authoritative for the batches it pulled — its pull may
+  // have closed the gap the listing reported — and the listing for the rest.
+  // Keyed by batch id: two batches can share a name, and so a message.
+  const shortfalls = useMemo<Array<{ batchId: string; message: string }>>(() => {
+    const warnings = jobOutcome?.warnings ?? [];
+    const covered = new Set([...(jobOutcome?.batchIds ?? []), ...warnings.map((w) => w.batchId)]);
+    const fromListing = targets
+      .filter((t) => t.shortfall && !covered.has(t.id))
+      .map((t) => ({ batchId: t.id, message: shortfallMessage(t.name, t.shortfall!) }));
+    return [...warnings.map((w) => ({ batchId: w.batchId, message: w.message })), ...fromListing];
+  }, [jobOutcome, targets]);
 
   const [tab, setTab] = useState("overview");
   // Toggleable AI chat sidebar. Starts closed (a floating "Ask AI" button and a
@@ -228,15 +248,32 @@ export default function Page() {
           setIngestError(null);
           setIngest(jobProgressPercent(job.done, job.total || 1, job.status));
           if (job.status === "done") {
+            setJobOutcome({ warnings: job.warnings ?? [], batchIds: job.batchIds ?? null });
             await finish();
             return;
           }
           if (job.status === "error") {
+            // A job can find a short pull and THEN fail on a later batch. The
+            // warning was written as it happened and still describes data the
+            // charts below serve, so it is surfaced here too — but with no
+            // `batchIds`, because a failed job did not reach every batch and
+            // must not hide what the listing says about the ones it skipped.
+            setJobOutcome({ warnings: job.warnings ?? [], batchIds: null });
             writeAnalyticsJob(idsKey, null);
             setIngestError(job.error || "Ingestion failed");
             setIngest(100);
             setTimeout(() => alive && setIngesting(false), 400);
             settled = true;
+            // A failed job does not make the data already published unreadable:
+            // a refresh that failed leaves every earlier revision serving. Show
+            // whatever still reads, under the error, rather than an empty screen
+            // over a selection that rendered a moment ago. Best-effort — if any
+            // batch has nothing readable, the error alone is the honest answer.
+            void getAnalytics(ids)
+              .then((agg) => {
+                if (alive && agg) setAnalytics(agg);
+              })
+              .catch(() => {});
             return;
           }
           if (job.status === "rate_limited" && job.retryAt) {
@@ -313,10 +350,13 @@ export default function Page() {
       setIngesting(true);
       setIngestError(null);
       setUpToDate(false);
-      // Drop the previous aggregate on every re-run, not only on a refresh: a
+      setJobOutcome(null);
+      // Drop the previous aggregate whenever the selection may have changed: a
       // selection change must never leave the old campaign's charts rendered
-      // under the new campaign's header.
-      setAnalytics(null);
+      // under the new campaign's header. A refresh of the SAME selection keeps
+      // it until the new one arrives, so a refresh that fails still has
+      // something on screen.
+      if (!refresh) setAnalytics(null);
       if (refresh) setIngest(0);
     });
 
@@ -467,6 +507,10 @@ export default function Page() {
                 <div className="flex items-center gap-2 text-[13px] font-semibold text-red-600">
                   <Icon name="TriangleAlert" size={16} /> Sync failed
                 </div>
+              ) : analytics && shortfalls.length > 0 ? (
+                <div className="flex items-center gap-2 text-[13px] font-semibold text-amber-600">
+                  <Icon name="TriangleAlert" size={16} /> Incomplete upstream data
+                </div>
               ) : analytics ? (
                 <div className="flex items-center gap-2 text-[13px] font-semibold text-emerald-600">
                   <Icon name="CircleCheck" size={16} />
@@ -493,7 +537,26 @@ export default function Page() {
       {!ingesting && !demo && ingestError && (
         <div className="mb-5 flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50/70 px-4 py-3 text-[13px] text-red-700">
           <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
-          <span>Ingestion failed: {ingestError}. Try “Refresh data” to retry.</span>
+          <span>
+            Ingestion failed: {ingestError}. Try “Refresh data” to retry.
+            {analytics && " The charts below show the data loaded previously."}
+          </span>
+        </div>
+      )}
+      {!ingesting && !demo && shortfalls.length > 0 && (
+        <div
+          role="status"
+          className="mb-5 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-[13px] text-amber-800"
+        >
+          <Icon name="TriangleAlert" size={15} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-semibold">Upstream returned incomplete data</div>
+            <ul className="mt-1 space-y-0.5">
+              {shortfalls.map(({ batchId, message }, index) => (
+                <li key={`${batchId}:${index}`}>{message}</li>
+              ))}
+            </ul>
+          </div>
         </div>
       )}
       {!ingesting && !demo && !ingestError && !analytics && (
