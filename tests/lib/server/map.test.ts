@@ -231,7 +231,7 @@ describe("bulkJobToBatchDoc", () => {
       updated_at: "2026-09-30T10:00:00Z",
     };
     const source = bulkJobToBatchDoc(job, ctx);
-    const shortPull = { listed: 3, received: 2, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" };
+    const shortPull = { listed: 3, received: 2, carried: 1, keptPrevious: true, settled: true, detectedAt: "2026-10-01T00:00:00Z" };
     const committed: BatchDoc = {
       ...source, total: 3, ingestStatus: "stale", ingestedSourceFingerprint: source.sourceFingerprint,
       ingestedListedTotal: 3, publishedRevision: "revision-1", shortPull,
@@ -244,6 +244,24 @@ describe("bulkJobToBatchDoc", () => {
     const cleared = bulkJobToBatchDoc(job, ctx, { ...committed, shortPull: null });
     expect(cleared.ingestStatus).toBe("ready");
     expect(batchDocToBatch(cleared).shortfall).toBeNull();
+  });
+
+  // A short pull of a job still dispatching is recorded — its time is what
+  // rate-limits merge re-pulls — but it says nothing about upstream, so no
+  // reader is told "upstream returned incomplete data". It still keeps the
+  // batch stale and re-pullable.
+  it("records an unsettled shortfall without showing it to readers", () => {
+    const job: RawBulkJob = { id: "live", dispatch_type: "ai_voice_call", status: "processing", total_contacts: 3 };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const shortPull = { listed: 3, received: 2, carried: 0, keptPrevious: false, settled: false, detectedAt: "2026-10-01T00:00:00Z" };
+    const committed: BatchDoc = {
+      ...source, total: 2, ingestStatus: "stale", ingestedSourceFingerprint: source.sourceFingerprint,
+      ingestedListedTotal: 3, publishedRevision: "revision-1", shortPull,
+    };
+    const refreshed = bulkJobToBatchDoc(job, ctx, committed);
+    expect(refreshed.ingestStatus).toBe("stale");
+    expect(refreshed.shortPull).toEqual(shortPull);
+    expect(batchDocToBatch(refreshed).shortfall).toBeNull();
   });
 
   // The loose legacy fallback schedules a re-pull but is never shown to a

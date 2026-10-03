@@ -10,8 +10,11 @@ export interface ShortfallFacts {
   listed: number;
   /** Unique records the latest pull returned. */
   received: number;
-  /** An earlier, fuller revision was kept instead of publishing the pull. */
+  /** Some served records were carried forward from an earlier load because the
+   *  latest pull did not return them. */
   keptPrevious: boolean;
+  /** How many. Absent on shortfalls recorded before it existed. */
+  carried?: number;
 }
 
 const fmt = (n: number) => n.toLocaleString("en-US");
@@ -45,17 +48,22 @@ export function repullHint(action: "Download" | "Generate"): string {
 /** Says what happened, what readers now see because of it, and what closes it. */
 export function shortfallMessage(name: string, shortfall: ShortfallFacts): string {
   const head = `Upstream returned ${fmt(shortfall.received)} of ${fmt(shortfall.listed)} records for "${name}"`;
-  return shortfall.keptPrevious
-    ? `${head}; the previously loaded data, which holds more records, was kept. Refresh later to re-pull.`
-    : `${head}; only those records are included. Refresh later to re-pull the rest.`;
+  if (!shortfall.keptPrevious) return `${head}; only those records are included. Refresh later to re-pull the rest.`;
+  const carried = shortfall.carried ?? 0;
+  const kept =
+    carried > 0
+      ? `${fmt(carried)} more ${carried === 1 ? "record" : "records"} it did not return this time ${carried === 1 ? "was" : "were"} kept from an earlier load`
+      : "records it did not return this time were kept from an earlier load";
+  return `${head}; ${kept} and may be behind on status. Refresh later to re-pull.`;
 }
 
 /** How a set of selected batches falls short of what upstream lists, for the
  *  surfaces (the CSV label) that state one figure for the whole selection.
  *  `missing` counts records the SERVED revisions lack against upstream's own
- *  count; `kept` counts batches whose latest pull was short and so still serve
- *  an earlier revision — those may hold every record and still be behind on
- *  status, which is why they are reported separately rather than folded in. */
+ *  count; `kept` counts batches whose served data includes records carried from
+ *  an earlier load because the latest pull did not return them — those may hold
+ *  every record and still be behind on status, which is why they are reported
+ *  separately rather than folded in. */
 export function selectionShortfall(batches: Array<Pick<Batch, "total" | "shortfall">>): {
   missing: number;
   kept: number;

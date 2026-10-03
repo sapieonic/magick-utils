@@ -360,7 +360,7 @@ describe("buildBatchDoc", () => {
   it("writes an explicit null shortPull so a complete publish clears a previous one", () => {
     const doc = buildBatchDoc([makeRecord()], ctx, baseOpts());
     expect(doc).toHaveProperty("shortPull", null);
-    const flagged = { listed: 3, received: 1, keptPrevious: false, detectedAt: "x" };
+    const flagged = { listed: 3, received: 1, carried: 0, keptPrevious: false, settled: true, detectedAt: "x" };
     expect(buildBatchDoc([makeRecord()], ctx, baseOpts({ shortPull: flagged })).shortPull).toEqual(flagged);
   });
 

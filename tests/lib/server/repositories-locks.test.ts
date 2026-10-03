@@ -10,7 +10,7 @@ const locks = vi.hoisted(() => ({
 const usage = vi.hoisted(() => ({ findOneAndUpdate: vi.fn() }));
 const jobs = vi.hoisted(() => ({ findOne: vi.fn() }));
 const batchDb = vi.hoisted(() => ({ deleteMany: vi.fn(), find: vi.fn(), findOne: vi.fn(), findOneAndUpdate: vi.fn(), updateOne: vi.fn() }));
-const recordDb = vi.hoisted(() => ({ deleteMany: vi.fn(), updateMany: vi.fn() }));
+const recordDb = vi.hoisted(() => ({ bulkWrite: vi.fn(), deleteMany: vi.fn(), find: vi.fn(), updateMany: vi.fn() }));
 
 vi.mock("@/lib/server/db", () => ({
   aggregates: vi.fn(),
@@ -27,6 +27,9 @@ import {
   beginBatchIngestion,
   consumeAiQuota,
   deleteBatchDataOlderThan,
+  deleteCarriedRecords,
+  getRevisionRecordsMissingFrom,
+  replaceBatchRecords,
   deleteRetiredRecordRevisionsOlderThan,
   deleteOrphanedRecordRevisions,
   deleteOrphanedRecordRevisionsEverywhere,
@@ -254,7 +257,7 @@ describe("batch worker ownership", () => {
       tenantId: "t1", accountId: "a1", batchId: "b1",
       publishedRevision: "rev-1", sourceFingerprint: "fp", ingestedSourceFingerprint: "fp",
       total: 8232, sourceTotal: 8232, ingestedListedTotal: 8232,
-      shortPull: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "x" },
+      shortPull: { listed: 8232, received: 8038, carried: 1, keptPrevious: true, settled: true, detectedAt: "x" },
     });
     batchDb.updateOne.mockResolvedValue({ matchedCount: 1 });
 
@@ -264,7 +267,7 @@ describe("batch worker ownership", () => {
   });
 
   it("keeps the published revision after a short pull only while this lease owns the batch", async () => {
-    const shortPull = { listed: 3, received: 2, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" };
+    const shortPull = { listed: 3, received: 2, carried: 1, keptPrevious: true, settled: true, detectedAt: "2026-10-01T00:00:00Z" };
     batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 }).mockResolvedValueOnce({ matchedCount: 0 });
 
     await expect(keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull)).resolves.toBe(true);
@@ -283,7 +286,7 @@ describe("batch worker ownership", () => {
   // an undefined stamp leaves the published value alone, an explicit null is
   // written (a resumed pull cannot vouch for its source timestamp).
   it("writes only the defined built-from stamps when keeping a revision", async () => {
-    const shortPull = { listed: 3, received: 2, keptPrevious: false, detectedAt: "2026-10-01T00:00:00Z" };
+    const shortPull = { listed: 3, received: 2, carried: 0, keptPrevious: false, settled: true, detectedAt: "2026-10-01T00:00:00Z" };
     batchDb.updateOne.mockResolvedValueOnce({ matchedCount: 1 });
 
     await keepPublishedRevisionIfOwned("t1", "a1", "b1", "j1", "lease-1", shortPull, {
@@ -600,5 +603,56 @@ describe("expired batch cleanup", () => {
         { tenantId: "t2", accountId: "a2", batchId: "b2" },
       ],
     });
+  });
+});
+
+// The carry-forward of an incomplete pull (see `ingestBatch`): the rows a pull
+// did not return are copied from the published revision into the new one.
+describe("carried-forward records", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns the published rows a pull did not return, ready to write into another revision", async () => {
+    recordDb.find.mockReturnValue([
+      { _id: "oid-1", recordId: "1", revision: "rev-1", status: "done" },
+      { _id: "oid-3", recordId: "3", revision: "rev-1", status: "done", retiredAt: new Date(0) },
+    ]);
+
+    const missing = await getRevisionRecordsMissingFrom("t1", "a1", "b1", "rev-1", new Set(["1", "2"]));
+
+    expect(recordDb.find).toHaveBeenCalledWith({ tenantId: "t1", accountId: "a1", batchId: "b1", revision: "rev-1" });
+    // `_id` would collide with the stored copy; `retiredAt` describes it only.
+    expect(missing).toEqual([{ recordId: "3", revision: "rev-1", status: "done" }]);
+  });
+
+  it("drops carried rows from a staging revision only", async () => {
+    batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "rev-1" });
+    await deleteCarriedRecords("t1", "a1", "b1", "j1");
+    expect(recordDb.deleteMany).toHaveBeenCalledWith({
+      tenantId: "t1", accountId: "a1", batchId: "b1", revision: "j1", carriedFrom: { $exists: true },
+    });
+
+    // The published revision's carried rows are what readers see.
+    recordDb.deleteMany.mockClear();
+    batchDb.findOne.mockResolvedValueOnce({ publishedRevision: "j1" });
+    await deleteCarriedRecords("t1", "a1", "b1", "j1");
+    expect(recordDb.deleteMany).not.toHaveBeenCalled();
+  });
+
+  // A row the pull returned replaces a carried copy of the same id staged
+  // earlier in the revision; `$set` alone would leave the marker behind and
+  // the row would keep counting as carried.
+  it("clears the carried marker when a pulled row overwrites a carried one, and only then", async () => {
+    recordDb.bulkWrite.mockResolvedValue({});
+    await replaceBatchRecords("t1", "a1", "b1", [
+      { recordId: "1", revision: "j1", status: "done" },
+      { recordId: "2", revision: "j1", status: "done", carriedFrom: "rev-1" },
+    ] as never);
+
+    const [ops] = recordDb.bulkWrite.mock.calls[0];
+    expect(ops[0].updateOne.update).toEqual({
+      $set: expect.not.objectContaining({ carriedFrom: expect.anything() }),
+      $unset: { carriedFrom: "" },
+    });
+    expect(ops[1].updateOne.update).toEqual({ $set: expect.objectContaining({ carriedFrom: "rev-1" }) });
   });
 });

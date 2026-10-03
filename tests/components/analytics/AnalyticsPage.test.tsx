@@ -391,14 +391,14 @@ describe("Analytics page incomplete upstream data", () => {
   // of the shortfall is what the screen reports.
   it("reports a shortfall the listing carries when no job ran", async () => {
     mockCampaigns({
-      batches: [{ ...campaign, shortfall: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "x" } }],
+      batches: [{ ...campaign, shortfall: { listed: 8232, received: 8038, carried: 194, keptPrevious: true, detectedAt: "x" } }],
       source: "live",
     });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, done: 0, ready: true });
     render(<Page />);
 
     expect(await screen.findByText("Incomplete upstream data")).toBeInTheDocument();
-    expect(screen.getByText(/previously loaded data, which holds more records, was kept/)).toBeInTheDocument();
+    expect(screen.getByText(/194 more records it did not return this time were kept from an earlier load/)).toBeInTheDocument();
   });
 
   // A job that re-pulled the batch is authoritative over the listing it was
@@ -483,7 +483,7 @@ describe("Analytics page incomplete upstream data", () => {
   // speaks for the ones it did not, even though they are in `batchIds`.
   it("keeps listing shortfalls for batches a failed job did not report on", async () => {
     mockCampaigns({
-      batches: [{ ...campaign, shortfall: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "x" } }],
+      batches: [{ ...campaign, shortfall: { listed: 8232, received: 8038, carried: 194, keptPrevious: true, detectedAt: "x" } }],
       source: "live",
     });
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: "job-1", total: 10, done: 0, ready: false });
@@ -491,7 +491,7 @@ describe("Analytics page incomplete upstream data", () => {
     render(<Page />);
 
     expect(await screen.findByText(/Ingestion failed: upstream 500/)).toBeInTheDocument();
-    expect(screen.getByText(/previously loaded data, which holds more records, was kept/)).toBeInTheDocument();
+    expect(screen.getByText(/194 more records it did not return this time were kept from an earlier load/)).toBeInTheDocument();
   });
 
   // Two campaigns may share a name, and so a message; keyed by message, React

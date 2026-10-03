@@ -10,6 +10,8 @@ const repositories = vi.hoisted(() => ({
   failBatchIfOwned: vi.fn(),
   getBatch: vi.fn(),
   getRecordsForRevision: vi.fn(),
+  getRevisionRecordsMissingFrom: vi.fn(),
+  deleteCarriedRecords: vi.fn(),
   keepPublishedRevisionIfOwned: vi.fn(),
   publishBatchIfOwned: vi.fn(),
   releaseIngestionLocks: vi.fn(),
@@ -56,7 +58,7 @@ import { recordsContentFingerprint } from "@/lib/server/record-fingerprint";
 const CALL_ORDER = "created_at:asc";
 // Mirrors the repositories mock above; the real constant is covered by its own test.
 const SUPERSEDED_REVISION_GRACE_MS = 30 * 60 * 1000;
-import type { Job } from "@/lib/server/types";
+import { shortPullCheckedRecently, type Job } from "@/lib/server/types";
 
 const job = (patch: Partial<Job> = {}): Job => ({
   jobId: "j1",
@@ -109,6 +111,8 @@ beforeEach(() => {
     updated_at: "2026-09-01T09:00:00Z",
   });
   repositories.replaceBatchRecords.mockResolvedValue(undefined);
+  repositories.getRevisionRecordsMissingFrom.mockResolvedValue([]);
+  repositories.deleteCarriedRecords.mockResolvedValue(undefined);
 });
 
 describe("processJob resume", () => {
@@ -1087,7 +1091,10 @@ describe("processJob incomplete upstream pull", () => {
     );
   });
 
-  it("keeps a fuller published revision, marks the batch stale and finishes the other batches", async () => {
+  // Readers already have record 3; this pull lost it to a tie. It is carried
+  // forward into the new revision rather than dropped on the word of a pull
+  // known to be incomplete — and the records the pull DID return are fresh.
+  it("carries forward the records a short pull did not return, and finishes the other batches", async () => {
     repositories.getBatch.mockImplementation((_t: string, _a: string, id: string) =>
       Promise.resolve(
         id === "b1"
@@ -1100,28 +1107,39 @@ describe("processJob incomplete upstream pull", () => {
       .mockResolvedValueOnce(shortPage) // b1: 2 unique of 3
       .mockResolvedValueOnce({ calls: [{ id: "9" }], total: 1 }); // b2: complete
     repositories.getRecordsForRevision.mockResolvedValueOnce(records("1", "2")).mockResolvedValueOnce(records("9"));
+    repositories.getRevisionRecordsMissingFrom.mockResolvedValueOnce([
+      { recordId: "3", status: "done", revision: "old-rev", revisionCreatedAt: new Date(0) },
+    ]);
 
     await processJob(job({ batchIds: ["b1", "b2"], total: 4 }));
 
-    // b1: the 3-record revision readers see stays published, flagged.
-    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledWith(
-      "t1",
-      "a1",
-      "b1",
+    expect(repositories.getRevisionRecordsMissingFrom).toHaveBeenCalledTimes(1);
+    expect(repositories.getRevisionRecordsMissingFrom).toHaveBeenCalledWith("t1", "a1", "b1", "old-rev", new Set(["1", "2"]));
+    // The carried row is re-stamped into this job's revision and marked.
+    expect(repositories.replaceBatchRecords).toHaveBeenCalledWith("t1", "a1", "b1", [
+      expect.objectContaining({ recordId: "3", revision: "j1", carriedFrom: "old-rev" }),
+    ]);
+    expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({
+        batchId: "b1",
+        total: 3,
+        ingestStatus: "stale",
+        shortPull: expect.objectContaining({ listed: 3, received: 2, carried: 1, keptPrevious: true, settled: true }),
+      }),
       "j1",
       "lease-1",
-      expect.objectContaining({ listed: 3, received: 2, keptPrevious: true }),
-      // A fuller kept revision was built from an earlier pull: no stamps from this one.
-      undefined,
     );
-    // The staged copy is removed: once when staging began, once after the keep
-    // (through the variant that re-reads the batch before deleting).
-    const b1Deletes = repositories.deleteBatchRevisionRecords.mock.calls.filter((call) => call[2] === "b1");
-    expect(b1Deletes).toEqual([["t1", "a1", "b1", "j1"]]);
-    expect(repositories.deleteUnpublishedBatchRevision).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
-    expect(repositories.retireBatchRevision).not.toHaveBeenCalledWith("t1", "a1", "b1", expect.anything());
+    expect(repositories.retireBatchRevision).toHaveBeenCalledWith("t1", "a1", "b1", "old-rev");
+    // Progress counts pulled rows until the batch transition adds the carried
+    // one: a resume after the publish re-checkpoints pages as pulled-so-far,
+    // and `checkpointJob` refuses to move `done` backwards.
+    expect(repositories.checkpointJob.mock.calls.slice(0, 3).map((call) => call[2])).toEqual([
+      expect.objectContaining({ done: 2, cursor: 3, batchIndex: 0 }),
+      expect.objectContaining({ done: 2, cursor: 3, batchIndex: 0 }),
+      expect.objectContaining({ done: 3, cursor: 0, batchIndex: 1 }),
+    ]);
     // b2 is published normally, with nothing flagged.
-    expect(repositories.publishBatchIfOwned).toHaveBeenCalledTimes(1);
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
       expect.objectContaining({ batchId: "b2", shortPull: null, ingestStatus: "ready" }),
       "j1",
@@ -1135,9 +1153,35 @@ describe("processJob incomplete upstream pull", () => {
       expect.objectContaining({
         status: "done",
         done: 4,
-        warnings: [expect.objectContaining({ batchId: "b1", keptPrevious: true, served: 3 })],
+        warnings: [expect.objectContaining({ batchId: "b1", received: 2, carried: 1, keptPrevious: true, served: 3 })],
       }),
       { clearCredential: true },
+    );
+  });
+
+  // The case "keep whichever revision has more records" got wrong: a pull with
+  // MORE records than the served revision that still lacks some of its rows —
+  // what the first ascending pull after a descending one produces, since the
+  // two orders lose different tied rows. Publishing it as-is dropped rows the
+  // customer had; the union keeps every row either pass returned.
+  it("never drops a served record even when the short pull holds more records overall", async () => {
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 2, ingestStatus: "stale", publishedRevision: "old-rev",
+    });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }, { id: "3" }], total: 5 });
+    repositories.getRecordsForRevision.mockResolvedValue(records("1", "2", "3"));
+    // The served revision had "1" and "4"; this pull returned 1, 2, 3.
+    repositories.getRevisionRecordsMissingFrom.mockResolvedValueOnce([{ recordId: "4", status: "done", revision: "old-rev" }]);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({
+        total: 4,
+        shortPull: expect.objectContaining({ listed: 5, received: 3, carried: 1 }),
+      }),
+      "j1",
+      "lease-1",
     );
   });
 
@@ -1155,7 +1199,7 @@ describe("processJob incomplete upstream pull", () => {
       expect.anything(),
     );
     expect(repositories.failBatchIfOwned).not.toHaveBeenCalled();
-    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalled();
   });
 
   // On a tie whose CONTENT differs (the published fingerprint here is not this
@@ -1346,7 +1390,13 @@ describe("processJob incomplete upstream pull", () => {
     await processJob(job({ batchIds: ["b1"], total: 3 }));
 
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
-      expect.objectContaining({ shortPull: null, ingestedListedTotal: 3, ingestStatus: "stale" }),
+      expect.objectContaining({
+        // Recorded (its time rate-limits merge re-pulls) but not settled, so
+        // shown to nobody.
+        shortPull: expect.objectContaining({ listed: 3, received: 2, settled: false, detectedAt: expect.any(String) }),
+        ingestedListedTotal: 3,
+        ingestStatus: "stale",
+      }),
       "j1",
       "lease-1",
     );
@@ -1439,8 +1489,8 @@ describe("processJob incomplete upstream pull", () => {
   });
 
   // Still dispatching: the COUNT and the pages legitimately move apart. It is
-  // published unflagged (no warning, nothing told to the reader) but stamped
-  // short and read stale, so the next refresh re-pulls it; its records stamp
+  // published with the gap recorded as unsettled (no warning, nothing told to
+  // the reader) and read stale, so a refresh re-pulls it; its records stamp
   // moves anyway as the job progresses.
   it.each(["processing", "queued", "running"])("publishes a short pull unflagged while the job is %s", async (status) => {
     client.getBulkJob.mockResolvedValue({ ...completed, status });
@@ -1450,7 +1500,12 @@ describe("processJob incomplete upstream pull", () => {
     await processJob(job({ batchIds: ["b1"], total: 3 }));
 
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
-      expect.objectContaining({ total: 2, ingestedListedTotal: 3, shortPull: null, ingestStatus: "stale" }),
+      expect.objectContaining({
+        total: 2,
+        ingestedListedTotal: 3,
+        shortPull: expect.objectContaining({ listed: 3, received: 2, settled: false }),
+        ingestStatus: "stale",
+      }),
       "j1",
       "lease-1",
     );
@@ -1461,6 +1516,77 @@ describe("processJob incomplete upstream pull", () => {
       expect.not.objectContaining({ warnings: expect.anything() }),
       { clearCredential: true },
     );
+  });
+
+  // A running job's short re-pull that changed nothing is the same dataset as
+  // what readers already have, whatever the job's state. It used to publish a
+  // full new copy on every merge — the unsettled gap left `shortPull` null, so
+  // neither the identical-content skip nor the merge cooldown could apply.
+  describe("a job still adding rows", () => {
+    const processing = { ...completed, status: "processing" };
+    const publishedFp = () => recordsContentFingerprint(records("1", "2") as never);
+    const served = (patch: object = {}) => ({
+      ...batch("b1"), name: "Promo", total: 2, ingestStatus: "stale", publishedRevision: "old-rev",
+      fingerprint: publishedFp(), sourceFingerprint: "src-fp", ingestedListedTotal: 3,
+      shortPull: { listed: 3, received: 2, carried: 0, keptPrevious: false, settled: false, detectedAt: "2026-10-01T00:00:00Z" },
+      ...patch,
+    });
+
+    it("writes nothing when the re-pull is identical, and re-arms the merge cooldown", async () => {
+      repositories.getBatch.mockResolvedValue(served());
+      client.getBulkJob.mockResolvedValue(processing);
+      client.listCalls.mockResolvedValueOnce(shortPage);
+      repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));
+
+      await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+      expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+      expect(repositories.replaceBatchRecords).toHaveBeenCalledTimes(1); // the page itself, staged then dropped
+      expect(repositories.deleteUnpublishedBatchRevision).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+      expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledWith(
+        "t1", "a1", "b1", "j1", "lease-1",
+        expect.objectContaining({ listed: 3, received: 2, settled: false }),
+        expect.objectContaining({ ingestedListedTotal: 3 }),
+      );
+      const recorded = repositories.keepPublishedRevisionIfOwned.mock.calls[0][5];
+      // What the worker recorded is what the merge cooldown reads.
+      expect(shortPullCheckedRecently({ shortPull: recorded })).toBe(true);
+      // Nothing is said about upstream for a job that is still dispatching.
+      expect(repositories.updateClaimedJob).toHaveBeenLastCalledWith(
+        "j1",
+        "lease-1",
+        expect.not.objectContaining({ warnings: expect.anything() }),
+        { clearCredential: true },
+      );
+    });
+
+    it("publishes when the job has added rows since", async () => {
+      repositories.getBatch.mockResolvedValue(served());
+      client.getBulkJob.mockResolvedValue(processing);
+      client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }, { id: "3" }], total: 4 });
+      repositories.getRecordsForRevision.mockResolvedValue(records("1", "2", "3"));
+
+      await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+      expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
+      expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+        expect.objectContaining({ total: 3, shortPull: expect.objectContaining({ listed: 4, received: 3, settled: false }) }),
+        "j1",
+        "lease-1",
+      );
+    });
+
+    it("publishes when a record's content moved at the same count", async () => {
+      repositories.getBatch.mockResolvedValue(served());
+      client.getBulkJob.mockResolvedValue(processing);
+      client.listCalls.mockResolvedValueOnce(shortPage);
+      repositories.getRecordsForRevision.mockResolvedValue([{ recordId: "1", status: "done" }, { recordId: "2", status: "failed" }]);
+
+      await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+      expect(repositories.keepPublishedRevisionIfOwned).not.toHaveBeenCalled();
+      expect(repositories.publishBatchIfOwned).toHaveBeenCalledTimes(1);
+    });
   });
 
   // Cancelled and failed jobs add no more rows, so their shortfall is loss and
@@ -1488,7 +1614,7 @@ describe("processJob incomplete upstream pull", () => {
 
     await processJob(job({ batchIds: ["b1"], total: 3 }));
     expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
-      expect.objectContaining({ shortPull: null }),
+      expect.objectContaining({ shortPull: expect.objectContaining({ settled: false }) }),
       "j1",
       "lease-1",
     );
@@ -1552,6 +1678,55 @@ describe("processJob incomplete upstream pull", () => {
     );
   });
 
+  // Interrupted after carrying rows into staging but before publishing: the
+  // carried rows were not returned by upstream and must not count as pulled
+  // (that would read as a complete pull), and they are re-derived against the
+  // revision actually being replaced.
+  it("does not count rows an interrupted attempt carried as pulled", async () => {
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 3, ingestStatus: "stale", publishedRevision: "old-rev",
+    });
+    const staged = [...records("1", "2"), { recordId: "3", status: "done", revision: "j1", carriedFrom: "old-rev" }];
+    repositories.getRecordsForRevision.mockResolvedValue(staged);
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 3 });
+    repositories.getRevisionRecordsMissingFrom.mockResolvedValueOnce([{ recordId: "3", status: "done", revision: "old-rev" }]);
+
+    await processJob(job({ batchIds: ["b1"], total: 3, done: 2, cursor: 3, cursorOrder: CALL_ORDER }));
+
+    expect(client.listCalls).toHaveBeenCalledWith({ jobId: "source-b1", limit: 100, offset: 3 });
+    expect(repositories.deleteCarriedRecords).toHaveBeenCalledWith("t1", "a1", "b1", "j1");
+    expect(repositories.publishBatchIfOwned).toHaveBeenCalledWith(
+      expect.objectContaining({ total: 3, shortPull: expect.objectContaining({ listed: 3, received: 2, carried: 1 }) }),
+      "j1",
+      "lease-1",
+    );
+  });
+
+  // Interrupted after publishing the union but before the batch transition:
+  // the carried rows ARE in the published revision, so they are served, and
+  // the resumed pass finds nothing changed.
+  it("keeps the union a previous attempt already published", async () => {
+    const staged = [...records("1", "2"), { recordId: "3", status: "done", revision: "j1", carriedFrom: "old-rev" }];
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), name: "Promo", total: 3, ingestStatus: "stale", publishedRevision: "j1",
+      fingerprint: recordsContentFingerprint(staged as never),
+    });
+    repositories.getRecordsForRevision.mockResolvedValue(staged);
+    client.listCalls.mockResolvedValueOnce({ calls: [], total: 3 });
+
+    await processJob(job({ batchIds: ["b1"], total: 3, done: 3, cursor: 3, cursorOrder: CALL_ORDER }));
+
+    expect(repositories.deleteCarriedRecords).not.toHaveBeenCalled();
+    expect(repositories.getRevisionRecordsMissingFrom).not.toHaveBeenCalled();
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledWith(
+      "t1", "a1", "b1", "j1", "lease-1",
+      expect.objectContaining({ received: 2, carried: 1, keptPrevious: true }),
+      expect.anything(),
+    );
+    expect(repositories.deleteUnpublishedBatchRevision).not.toHaveBeenCalled();
+  });
+
   // The keep path used to move `batchIndex` past the batch in one write and
   // record the warning in a second, after `ingestBatch` returned. A kill
   // between the two resumed the job past the batch with no warning, and
@@ -1606,7 +1781,9 @@ describe("processJob incomplete upstream pull", () => {
   });
 
   it("fails on a lost lease while keeping the previous revision", async () => {
-    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 3, ingestStatus: "ready" });
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), total: 2, ingestStatus: "ready", fingerprint: recordsContentFingerprint(records("1", "2") as never),
+    });
     repositories.keepPublishedRevisionIfOwned.mockResolvedValueOnce(false);
     client.listCalls.mockResolvedValueOnce(shortPage);
     repositories.getRecordsForRevision.mockResolvedValue(records("1", "2"));

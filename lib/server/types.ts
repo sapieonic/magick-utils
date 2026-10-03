@@ -77,7 +77,7 @@ export function publishedRevisionMayBeShort(
 
 /** Whether a batch should be re-pulled for completeness rather than trusted as
  *  "ready" — its published revision may be short, or its latest pull came back
- *  short and a fuller earlier revision was kept in its place.
+ *  short (settled or not) and the served revision carries its gap.
  *
  *  One predicate for every place that has to agree, for the reason
  *  `isEmptyDispatchedPull` is shared: the campaigns listing and failure cleanup
@@ -99,9 +99,11 @@ export function needsCompletenessRepull(
 export { SHORT_PULL_REPULL_COOLDOWN_MS };
 
 /** Whether a batch's latest short pull was observed within the cooldown, so a
- *  merge should serve it as-is rather than re-page upstream. False when there is
- *  no recorded short pull (a legacy or running-job revision that merely MAY be
- *  short has never been judged exactly, and one re-pull is what judges it), and
+ *  merge should serve it as-is rather than re-page upstream. Every incomplete
+ *  pull is recorded with a `detectedAt` — a running job's too, as unsettled —
+ *  so this covers them all. False when there is no recorded short pull (a
+ *  legacy revision that merely MAY be short has never been judged exactly, and
+ *  one re-pull is what judges it), and
  *  false for an unparseable or future timestamp — the direction that re-pulls,
  *  because skipping is what can strand a batch, while re-pulling only costs
  *  load. */
@@ -115,23 +117,46 @@ export function shortPullCheckedRecently(
   return age >= 0 && age < SHORT_PULL_REPULL_COOLDOWN_MS;
 }
 
-/** What the worker records when a pull of a job that has stopped adding rows
- *  returns fewer unique records than the list surface counted.
+/** What the worker records when a pull comes back with fewer unique records
+ *  than the list surface counted (`isIncompletePaginatedPull`).
  *
  *  Against core builds that page over a non-unique `created_at`, rows sharing a
  *  timestamp are lost DETERMINISTICALLY — the same rows on every pass, with no
- *  writes at all — so this is not a transient to retry through; it is a fact
- *  about the upstream that the reader has to be told. */
+ *  writes at all — so for a job whose rows have settled this is not a transient
+ *  to retry through; it is a fact about the upstream that the reader has to be
+ *  told. While a job may still be adding rows the same gap can simply be lag;
+ *  it is recorded all the same (`settled: false`), because `detectedAt` is what
+ *  rate-limits merge re-pulls, but it is shown to nobody. */
 export interface PullShortfall extends BatchShortfall {
   /** Records the list surface counted (`COUNT(*)` over the rows it pages). */
   listed: number;
   /** Unique records the pull actually returned. */
   received: number;
-  /** True when an earlier revision holding MORE records was kept instead of
-   *  publishing this pull; false when what readers see is this pull's records
-   *  — published, or already published identically and left in place. Either
-   *  way `BatchDoc.total` is the served record count. */
+  /** Records the served revision holds that this pull did not return, carried
+   *  forward from the revision served before it so that an incomplete pull
+   *  never takes a record away from a reader. `BatchDoc.total` is
+   *  `received + carried`. */
+  carried: number;
+  /** `carried > 0`, kept as its own flag for the screens that only need to
+   *  know whether some served records are from an earlier load. */
   keptPrevious: boolean;
+  /** Whether the job had stopped adding rows (`jobStoppedAddingRows` in the
+   *  worker) when the pull ran, so the gap is loss. False for a job still
+   *  dispatching, one whose detail could not be read, or one inside the
+   *  settle window after a stop: the gap may be lag, and the reader-facing
+   *  statement (`isReaderFacingShortfall`) is withheld. */
+  settled: boolean;
+}
+
+/** Whether a recorded shortfall is one a reader should be told about. Only a
+ *  pull of a job whose rows had settled says anything about upstream: for a job
+ *  still dispatching, "upstream returned 2,000 of 3,000" is just the campaign
+ *  being partway through. A record without `settled` predates the field, when
+ *  only settled pulls were recorded at all. */
+export function isReaderFacingShortfall(
+  shortPull: Pick<BatchShortfall, "settled"> | null | undefined,
+): boolean {
+  return shortPull != null && shortPull.settled !== false;
 }
 
 /** A non-fatal outcome a job reports alongside `status: "done"`. Today only an
@@ -143,8 +168,11 @@ export interface JobWarning {
   name: string;
   listed: number;
   received: number;
+  /** Records carried forward from the previously served revision. */
+  carried: number;
   keptPrevious: boolean;
-  /** Records readers are served for the batch after this job. */
+  /** Records readers are served for the batch after this job
+   *  (`received + carried`). */
   served: number;
   message: string;
 }
@@ -270,6 +298,13 @@ export interface NormalizedRecord {
   revisionCreatedAt?: Date;
   /** Set only after a newer revision is published; GC never targets staging. */
   retiredAt?: Date;
+  /** Set on a row copied into this revision from the previously published one
+   *  because the (incomplete) pull that built this revision did not return it;
+   *  names the revision it was copied from. Lets a resumed job tell the rows it
+   *  pulled from the rows it carried, and lets the next page write of the same
+   *  id turn a carried row back into a pulled one. Storage metadata: never part
+   *  of the content fingerprint. */
+  carriedFrom?: string;
   fingerprint: string;
   recordId: string; // call_id or message_id
   selType: SelType;

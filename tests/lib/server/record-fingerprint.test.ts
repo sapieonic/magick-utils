@@ -16,6 +16,7 @@ const full = (): NormalizedRecord => ({
   revision: "rev-1",
   revisionCreatedAt: new Date("2026-10-01T00:00:00Z"),
   retiredAt: new Date("2026-10-01T01:00:00Z"),
+  carriedFrom: "rev-0",
   fingerprint: "fp-at-pull-time",
   recordId: "r1",
   selType: "ai",
@@ -90,7 +91,7 @@ describe("recordsContentFingerprint", () => {
 
   it("covers exactly the classified metadata, plus Mongo's _id, and nothing else", () => {
     expect([...RECORD_FINGERPRINT_EXCLUDED_KEYS].sort()).toEqual(["_id", ...metadataKeys].sort());
-    expect([...metadataKeys].sort()).toEqual(["fingerprint", "retiredAt", "revision", "revisionCreatedAt"]);
+    expect([...metadataKeys].sort()).toEqual(["carriedFrom", "fingerprint", "retiredAt", "revision", "revisionCreatedAt"]);
   });
 
   it.each([...metadataKeys, "_id"])("ignores %s, which differs between copies of identical data", (key) => {

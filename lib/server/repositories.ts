@@ -215,13 +215,12 @@ export async function failBatchIfOwned(
   );
 }
 
-/** "Built from" stamps a kept revision may take from the pull that left it in
- *  place — passed ONLY when that pull's records are identical to the published
- *  revision's (same count, same content fingerprint), so the published revision
- *  genuinely describes the state this pull observed. A strictly fuller kept
- *  revision gets none: it was built from an earlier pull, and stamping it with
- *  this one's listed total or source markers would misdescribe it. A key left
- *  `undefined` is not written; a `null` is (see `keepPublishedRevisionIfOwned`). */
+/** "Built from" stamps a kept revision takes from the pull that left it in
+ *  place. A revision is only ever kept when what that pull would serve (its
+ *  records plus anything carried forward) is identical to it — same count,
+ *  same content fingerprint — so the published revision genuinely describes the
+ *  state this pull observed. A key left `undefined` is not written; a `null` is
+ *  (see `keepPublishedRevisionIfOwned`). */
 export type KeptRevisionStamps = Partial<
   Pick<BatchDoc, "ingestedListedTotal" | "ingestedSourceFingerprint" | "ingestedRecordsStamp" | "sourceTotal">
 >;
@@ -230,9 +229,10 @@ export type KeptRevisionStamps = Partial<
  *  while this exact worker lease still owns the batch.
  *
  *  The counterpart of `publishBatchIfOwned` for the one outcome where the pull
- *  completed but was no better than what readers already see: an earlier
- *  revision holding more records — or the very same records — stays published,
- *  its record set untouched, and the batch is marked
+ *  completed but changed nothing readers would see: the revision it would have
+ *  published (its records, plus the served rows it did not return, carried
+ *  forward) is the published one, record for record. It stays published, its
+ *  record set untouched, and the batch is marked
  *  "stale" with the shortfall recorded — readable, explicitly flagged, and never
  *  skipped by a refresh, so a pull against a fixed upstream replaces it. The
  *  rest of the job carries on; nothing about this batch is a failure. */
@@ -433,6 +433,11 @@ export async function replaceBatchRecords(
         accountId,
         batchId,
       };
+      // A row this pull returned replaces any carried-forward copy of the same
+      // id staged earlier in the same revision, and must stop being marked as
+      // carried — `$set` alone would leave the old marker in place.
+      const carried = doc.carriedFrom != null;
+      if (!carried) delete doc.carriedFrom;
       return {
         updateOne: {
           filter: {
@@ -442,7 +447,7 @@ export async function replaceBatchRecords(
             revision: doc.revision,
             recordId: doc.recordId,
           },
-          update: { $set: doc },
+          update: carried ? { $set: doc } : { $set: doc, $unset: { carriedFrom: "" } },
           upsert: true,
         },
       };
@@ -505,6 +510,49 @@ export async function getRecords(
   if (opts?.skip != null) cursor = cursor.skip(opts.skip);
   if (opts?.limit != null) cursor = cursor.limit(opts.limit);
   return cursor.toArray();
+}
+
+/** Records of `revision` whose ids are NOT in `present`: what a pull that came
+ *  back short did not return, and so what the worker carries forward from the
+ *  published revision rather than drop (see `ingestBatch`).
+ *
+ *  Filtered in-process off a cursor, not with a `$nin` of every id the pull
+ *  returned — for a large campaign that is a query document of hundreds of
+ *  kilobytes. `_id` and `retiredAt` are stripped so the rows can be written
+ *  into another revision: the first would collide with the stored copy, the
+ *  second describes the stored copy only. */
+export async function getRevisionRecordsMissingFrom(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  revision: string,
+  present: ReadonlySet<string>,
+): Promise<NormalizedRecord[]> {
+  const col = await records();
+  const missing: NormalizedRecord[] = [];
+  for await (const stored of col.find({ tenantId, accountId, batchId, revision })) {
+    if (present.has(stored.recordId)) continue;
+    const copy: NormalizedRecord & { _id?: unknown } = { ...stored };
+    delete copy._id;
+    delete copy.retiredAt;
+    missing.push(copy);
+  }
+  return missing;
+}
+
+/** Drop carried-forward rows from a STAGING revision, so a resumed job can
+ *  re-derive them against the revision it will actually publish over. A no-op
+ *  for the published revision — those rows are what readers see. */
+export async function deleteCarriedRecords(
+  tenantId: string,
+  accountId: string,
+  batchId: string,
+  revision: string,
+): Promise<void> {
+  const batch = await getBatch(tenantId, accountId, batchId);
+  if (batch?.publishedRevision === revision) return;
+  const col = await records();
+  await col.deleteMany({ tenantId, accountId, batchId, revision, carriedFrom: { $exists: true } });
 }
 
 export async function getRecordsForRevision(

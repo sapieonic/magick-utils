@@ -38,6 +38,9 @@ export const NORMALIZED_RECORD_FIELD_ROLES = {
   revisionCreatedAt: "metadata",
   // Set on a superseded copy only.
   retiredAt: "metadata",
+  // Which revision a carried-forward row was copied from — a different value
+  // on every copy of the same carried row, and invisible to readers.
+  carriedFrom: "metadata",
   // The batch fingerprint at PULL time, stamped onto each record. Including it
   // would make every pull after a publish differ from the one before it (the
   // records of revision N carry fingerprint N-1), so no tie could ever match.

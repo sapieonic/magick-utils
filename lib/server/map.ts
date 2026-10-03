@@ -3,7 +3,13 @@
 // (used by the campaigns listing before any records are ingested).
 
 import type { Batch, BreakdownSeg, StatusKey } from "@/lib/types";
-import { isBatchReadable, needsCompletenessRepull, type BatchDoc, type TenantContext } from "./types";
+import {
+  isBatchReadable,
+  isReaderFacingShortfall,
+  needsCompletenessRepull,
+  type BatchDoc,
+  type TenantContext,
+} from "./types";
 import type { RawBulkJob } from "./magick-client";
 import { dispatchTypeToType, normalizeStatus } from "./normalize";
 import { normalizeJobDispatchType } from "./magick-client";
@@ -50,7 +56,9 @@ export function batchDocToBatch(doc: BatchDoc): Batch {
     // Only ever the worker's exact judgement, never `publishedRevisionMayBeShort`'s
     // legacy fallback — that one flags healthy partially-failed campaigns and
     // is fit to schedule a re-pull, not to put a warning in front of a customer.
-    shortfall: doc.shortPull ?? null,
+    // And only a SETTLED one: a short pull of a job still dispatching is
+    // recorded (it rate-limits merge re-pulls) but says nothing about upstream.
+    shortfall: isReaderFacingShortfall(doc.shortPull) ? doc.shortPull! : null,
   };
 }
 

@@ -82,12 +82,13 @@ async function refreshableBatchIds(
         // Same reasoning for a batch that may be incomplete — the listing marks
         // those stale too, but this must not depend on a listing having
         // rewritten the document since it was published. It is how a short
-        // revision (published by an older build, by a running job, or flagged
+        // revision (published by an older build, or flagged
         // by the worker) gets re-pulled once upstream pagination is fixed,
         // instead of being "proven unchanged" forever. Against an unfixed
-        // upstream the re-pull is short again and the worker keeps whichever
-        // revision holds more — writing nothing when the two are identical — so
-        // this costs upstream load, never data or storage. Deliberately NOT
+        // upstream the re-pull is short again and the worker carries forward
+        // every served record it did not return — writing nothing when the
+        // result is identical — so this costs upstream load, never data or
+        // storage. Deliberately NOT
         // subject to the merge cooldown: this is the customer's explicit ask.
         if (needsCompletenessRepull(batch)) return batchId;
         try {
@@ -184,8 +185,9 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // customer's re-export after upstream pagination is fixed would still stream
     // the short revision, because only Analytics' "Refresh data" sends
     // `refresh`. Safe against an unfixed upstream: a pull that comes back short
-    // again never replaces a revision holding more records, and one identical to
-    // the served revision writes nothing (see `ingestBatch`).
+    // again never drops a served record (they are carried forward), and one
+    // whose result is identical to the served revision writes nothing (see
+    // `ingestBatch`).
     //
     // Not on every merge, though. Against an unfixed core the re-pull is the
     // same short set every time, so re-paging each flagged batch on each
@@ -193,8 +195,10 @@ export const POST = withLogging("ingest", async (req: Request) => {
     // global per-IP limit. A batch whose short pull was observed within
     // SHORT_PULL_REPULL_COOLDOWN_MS is served as it stands; the next merge after
     // the window re-pulls it, which is what lets it converge once core is fixed.
-    // A batch that merely MAY be short (legacy stamps, a running job) has no
-    // recorded observation and is re-pulled — that pull is what judges it.
+    // Every short pull the worker makes is recorded with its time — a running
+    // job's too, unsettled — so the cooldown covers them all. A batch that
+    // merely MAY be short (legacy stamps from before `shortPull` existed) has
+    // no recorded observation and is re-pulled — that pull is what judges it.
     //
     // A plain Analytics load does NOT re-pull at all — it serves the flagged
     // data and its Refresh button is the deliberate re-pull, which ignores the

@@ -103,14 +103,14 @@ describe("CombineScreen — completed download flow", () => {
     );
   });
 
-  it("says when a batch could not be refreshed and the file holds earlier data", async () => {
+  it("says when a batch carries records from an earlier load", async () => {
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
     vi.mocked(listCampaignsByIds).mockResolvedValue({
       batches: [
-        // The kept revision holds every record upstream lists; only the latest
-        // pull was short. Nothing is missing, but the file is not current.
+        // The served revision holds every record upstream lists, 194 of them
+        // carried from an earlier load. Nothing is missing, but not all current.
         { ...batch("b1"), total: 8232, ingestStatus: "stale",
-          shortfall: { listed: 8232, received: 8038, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" } },
+          shortfall: { listed: 8232, received: 8038, carried: 194, keptPrevious: true, detectedAt: "2026-10-01T00:00:00Z" } },
         batch("b2"),
       ],
       source: "live",
@@ -118,7 +118,7 @@ describe("CombineScreen — completed download flow", () => {
     render(<CombineScreen />);
 
     fireEvent.click(await screen.findByRole("button", { name: /Generate & Download/i }));
-    expect(await screen.findByRole("status")).toHaveTextContent(/1 batch could not be refreshed/);
+    expect(await screen.findByRole("status")).toHaveTextContent(/1 batch includes records the latest pull did not return, kept from an earlier load/);
     expect(screen.queryByText(/fewer than upstream lists/)).not.toBeInTheDocument();
   });
 

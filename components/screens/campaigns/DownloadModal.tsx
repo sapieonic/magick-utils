@@ -218,7 +218,7 @@ export function DownloadModal({
               <span>
                 Upstream returned incomplete data.
                 {missing > 0 && ` The file is missing ${fmtNum(missing)} records upstream lists for this campaign.`}
-                {kept > 0 && " This campaign could not be refreshed, so the file holds the records loaded earlier."}{" "}
+                {kept > 0 && " Some records the latest pull did not return were kept from an earlier load, so they may be behind on status."}{" "}
                 {repullHint("Download")}
               </span>
             </div>

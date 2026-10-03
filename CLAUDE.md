@@ -76,22 +76,27 @@ revision back to `ready`/`stale` — a batch already poisoned by an older build 
 Only a job that PROVABLY finished dialling arms the worker's guard; a still-running, cancelled or
 unreadable job must stay exempt, or healthy campaigns get an `error` no click can clear.
 
-A pull whose job has stopped adding rows but which returns fewer **unique** records than the list
-surface's own `total` (a COUNT over the same rows) is an **incomplete upstream pull**, and it fails
-nothing. Upstream pages over a non-unique `created_at`, and Postgres's top-N heapsort loses tied rows
-*deterministically* — same rows every pass, no writes needed — so re-pulling against an unfixed core is
-pure load; the worker makes one pass. It then keeps a readable revision holding MORE records, or one
-IDENTICAL to the pull (same count and content fingerprint, which covers every reader-visible field —
-`record-fingerprint.ts`; the usual case on a re-pull, so nothing is
-written but the flag), or else publishes the short pull; the batch reads `stale` either way, the worker records
-`BatchDoc.shortPull`, and the job finishes `done` with a `JobWarning` while its other batches publish
-normally. `shortPull` is the only reader-facing statement of the gap (Analytics notice, Combine label,
-per-campaign download) — never derive one from `publishedRevisionMayBeShort`'s loose legacy fallback.
+A pull that returns fewer **unique** records than the list surface's own `total` (a COUNT over the same
+rows) is an **incomplete upstream pull**, and it fails nothing. Upstream pages over a non-unique
+`created_at`, and Postgres's top-N heapsort loses tied rows *deterministically* — same rows every pass, no
+writes needed — so re-pulling against an unfixed core is pure load; the worker makes one pass. It never
+drops a record readers already have: rows of the served revision the pull did not return are **carried
+forward** into the new revision (marked `carriedFrom`). If that union is IDENTICAL to the served revision
+(same count and content fingerprint, which covers every reader-visible field — `record-fingerprint.ts`;
+the usual case on a re-pull) nothing is written but the flag; otherwise it is published. Either way the
+batch reads `stale` and the worker records `BatchDoc.shortPull` with a `detectedAt` — for a job still
+adding rows too, as `settled: false`, because that timestamp is what rate-limits merges. Only a
+**settled** gap (the job has stopped adding rows) is reader-facing (`isReaderFacingShortfall`: Analytics
+notice, Combine label, per-campaign download) and gets a `JobWarning`, written in the same checkpoint
+that moves the job past the batch; the job finishes `done` while its other batches publish normally.
+Never derive a reader statement from `publishedRevisionMayBeShort`'s loose legacy fallback.
 `needsCompletenessRepull` is the shared predicate (listing, `failBatchIfOwned`, refresh, merge). A merge
 re-pulls a flagged batch only once `SHORT_PULL_REPULL_COOLDOWN_MS` has passed since its last observed
 short pull; an explicit Refresh always does. The first complete pull clears the flag. Compare against
-the list's `total`, never `total_contacts`. Core's `id` tiebreak should deploy first, but Utils is safe
-in either order. See BACKEND.md → *Pull completeness*.
+the list's `total`, never `total_contacts`. A job records the list ordering beside its cursor
+(`Job.cursorOrder`) and restarts a batch from offset 0 rather than resume it under a different ORDER BY —
+ascending and descending lose different tied rows. Core's `id` tiebreak should deploy first, but Utils is
+safe in either order. See BACKEND.md → *Pull completeness*.
 
 Each ingestion writes a complete new copy of a batch's records under a fresh revision, so anything that
 re-ingests unnecessarily costs a full duplicate dataset. Never make a refresh unconditional; see

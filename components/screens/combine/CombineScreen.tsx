@@ -59,8 +59,8 @@ type PreparedExport = {
   /** Records the CSV lacks against upstream's own count, for batches whose
    *  served revision is known short. */
   missingRows?: number;
-  /** Batches whose latest pull came back short, so an earlier, fuller revision
-   *  is what the CSV holds for them. */
+  /** Batches whose served data includes records the latest pull did not
+   *  return, carried forward from an earlier load. */
   keptBatches?: number;
 };
 
@@ -695,7 +695,8 @@ export function CombineScreen() {
                     {/* Never silent: a short CSV under a green "ready" is the
                         defect this exists to prevent. Two separate facts — rows
                         missing from the file, and batches whose latest pull was
-                        short so the file holds earlier data for them. */}
+                        short so the file carries some of their records from an
+                        earlier load. */}
                     {((prepared?.missingRows ?? 0) > 0 || (prepared?.keptBatches ?? 0) > 0) && (
                       <div
                         role="status"
@@ -707,7 +708,7 @@ export function CombineScreen() {
                           {(prepared?.missingRows ?? 0) > 0 &&
                             ` The file is missing ${fmtNum(prepared!.missingRows!)} records upstream lists for these campaigns.`}
                           {(prepared?.keptBatches ?? 0) > 0 &&
-                            ` ${fmtNum(prepared!.keptBatches!)} ${prepared!.keptBatches === 1 ? "batch" : "batches"} could not be refreshed, so the file holds the records loaded earlier.`}
+                            ` ${fmtNum(prepared!.keptBatches!)} ${prepared!.keptBatches === 1 ? "batch includes" : "batches include"} records the latest pull did not return, kept from an earlier load, so they may be behind on status.`}
                           {" "}{repullHint("Generate")}
                         </span>
                       </div>

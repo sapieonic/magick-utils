@@ -4,7 +4,7 @@ import { SHORT_PULL_REPULL_COOLDOWN_MS, shortPullCheckedRecently } from "@/lib/s
 const now = Date.parse("2026-10-02T12:00:00Z");
 const at = (msAgo: number) => ({
   shortPull: {
-    listed: 10, received: 9, keptPrevious: false, detectedAt: new Date(now - msAgo).toISOString(),
+    listed: 10, received: 9, carried: 0, keptPrevious: false, settled: true, detectedAt: new Date(now - msAgo).toISOString(),
   },
 });
 
@@ -20,7 +20,7 @@ describe("shortPullCheckedRecently", () => {
     expect(shortPullCheckedRecently({ shortPull: null }, now)).toBe(false);
     expect(shortPullCheckedRecently({}, now)).toBe(false);
     expect(
-      shortPullCheckedRecently({ shortPull: { listed: 1, received: 0, keptPrevious: false, detectedAt: "x" } }, now),
+      shortPullCheckedRecently({ shortPull: { listed: 1, received: 0, carried: 0, keptPrevious: false, settled: true, detectedAt: "x" } }, now),
     ).toBe(false);
     expect(shortPullCheckedRecently(at(-60_000), now)).toBe(false);
   });

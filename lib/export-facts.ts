@@ -11,8 +11,8 @@ export type ExportFacts = {
   rows: number;
   /** Records the served revisions lack against upstream's own count. */
   missing: number;
-  /** Batches whose latest pull was short, so the file holds an earlier,
-   *  fuller revision for them. */
+  /** Batches whose latest pull was short, so the file carries some of their
+   *  records forward from an earlier load. */
   kept: number;
 };
 

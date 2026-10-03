@@ -111,7 +111,7 @@ describe("DownloadModal", () => {
     expect(screen.getByRole("status")).not.toHaveTextContent(/again later/);
   });
 
-  it("says when the file holds an earlier revision because the latest pull was short", async () => {
+  it("says when the file carries records from an earlier load because the latest pull was short", async () => {
     vi.mocked(createIngestJob).mockResolvedValue({ jobId: null, total: 0, ready: true });
     vi.mocked(listCampaignsByIds).mockResolvedValue({
       batches: [{
@@ -124,7 +124,7 @@ describe("DownloadModal", () => {
     render(<DownloadModal campaign={campaign} onClose={vi.fn()} />);
 
     await userEvent.click(screen.getByRole("button", { name: /Download \d+ columns/i }));
-    expect(await screen.findByRole("status")).toHaveTextContent(/could not be refreshed, so the file holds the records loaded earlier/);
+    expect(await screen.findByRole("status")).toHaveTextContent(/records the latest pull did not return were kept from an earlier load/);
     expect(screen.queryByText(/fewer than upstream lists/)).not.toBeInTheDocument();
   });
 

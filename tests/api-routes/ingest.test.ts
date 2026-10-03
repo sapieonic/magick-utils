@@ -499,6 +499,29 @@ describe("POST /api/ingest", () => {
     expect(createJob).not.toHaveBeenCalled();
   });
 
+  // A running campaign's short pull is recorded unsettled — shown to nobody —
+  // but its observation time rate-limits merges exactly the same way. Before
+  // it was recorded at all, every Generate re-paged upstream and wrote another
+  // full copy of a running campaign, the cooldown notwithstanding.
+  it("applies the cooldown to the unsettled short pull of a job still dispatching", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    vi.mocked(getBatch).mockResolvedValue({
+      total: 2000, sourceTotal: 3000, ingestedListedTotal: 2400, selType: "ai", ingestStatus: "stale",
+      shortPull: {
+        listed: 2400, received: 2000, carried: 0, keptPrevious: false, settled: false,
+        detectedAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+      sourceId: "job-1",
+    } as never);
+    vi.mocked(countRecords).mockResolvedValue(2000);
+    vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+    const { POST } = await import("@/app/api/ingest/route");
+    const res = await POST(req({ batchIds: ["b1"], type: "merge" }));
+    await expect(res.json()).resolves.toMatchObject({ jobId: null, ready: true });
+    expect(createJob).not.toHaveBeenCalled();
+  });
+
   it("re-pulls on a merge once the cooldown has passed", async () => {
     vi.mocked(isBackendConfigured).mockReturnValue(true);
     vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
