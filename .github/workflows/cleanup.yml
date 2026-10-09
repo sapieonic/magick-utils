@@ -31,6 +31,7 @@ jobs:
         environment:
           - production
           - dedicated
+          - samarthya
     environment: ${{ matrix.environment }}
     steps:
       - name: Call cleanup endpoint
