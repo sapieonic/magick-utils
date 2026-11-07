@@ -29,6 +29,13 @@
 //     nothing is re-pulled. The probe is memoised per request, so a 50-batch
 //     selection costs one upstream call, not fifty.
 //
+// Transitional: once every live AI batch is marked (DATA_RETENTION_DAYS after
+// core ships the projection), the probe and the re-pull exception in the ingest
+// route never fire again and can be removed; the marker itself stays, since
+// `recordsAnalysisAuthoritative` reads it. If a second upstream list projection
+// ever needs the same treatment, generalise the marker then rather than adding
+// a parallel one.
+//
 // Key PRESENCE, never value: a row whose call was never analysed carries
 // `analysis_sentiment_label: null`, and a batch of such rows is fully upgraded.
 //
@@ -38,7 +45,7 @@
 // later pull (the completeness re-pull a short batch already gets) returns
 // them — rare now that core's list order has an `id` tiebreak.
 
-import type { MagickClient, RawCall } from "./magick-client";
+import type { MagickClient } from "./magick-client";
 import { TokenRefreshPermanentError } from "./firebase-token";
 import { log } from "./logger";
 import type { BatchDoc, NormalizedRecord } from "./types";
@@ -46,13 +53,13 @@ import type { BatchDoc, NormalizedRecord } from "./types";
 /** The list-row keys whose presence marks a row as served by a core that
  *  projects post-call analysis. Both, because the contract ships them together
  *  and a records set is only "upgraded" when both columns could be filled. */
-export const ANALYSIS_PROJECTION_KEYS = ["analysis_sentiment_label", "analysis_key_topics"] as const;
+const ANALYSIS_PROJECTION_KEYS = ["analysis_sentiment_label", "analysis_key_topics"] as const;
 
 /** Whether one raw upstream row carries the projection (keys present, values
  *  may be null). */
 export function rowCarriesAnalysisProjection(raw: unknown): boolean {
   if (raw == null || typeof raw !== "object") return false;
-  return ANALYSIS_PROJECTION_KEYS.every((key) => Object.prototype.hasOwnProperty.call(raw, key));
+  return ANALYSIS_PROJECTION_KEYS.every((key) => Object.hasOwn(raw, key));
 }
 
 /** Whether every record a pull returned came from a projecting core.
@@ -111,13 +118,12 @@ export function recordsAnalysisAuthoritative(
   );
 }
 
-type ProbeAnswer = "projects" | "does_not_project" | "unavailable";
-
 /**
- * A request-scoped probe: "does upstream's AI calls list now carry the
- * projection?", asked with ONE row of a job (`limit: 1`) on the same surface
- * the worker pages, so the probe and the pull cannot disagree about what they
- * would see.
+ * A request-scoped upgrade check: "is this batch an upgrade candidate
+ * (`needsAnalysisUpgrade`) AND does upstream's AI calls list now carry the
+ * projection?" The second half is asked with ONE row of a job (`limit: 1`) on
+ * the same surface the worker pages, so the probe and the pull cannot disagree
+ * about what they would see.
  *
  * Memoised for the request: the answer is a property of the deployment the
  * tenant is served by, not of one batch, so the first definitive answer — and a
@@ -134,24 +140,25 @@ type ProbeAnswer = "projects" | "does_not_project" | "unavailable";
  * again. A permanently dead credential is rethrown, as everywhere in the route.
  */
 export function createAnalysisProjectionProbe(client: Pick<MagickClient, "listCalls">) {
-  let chain: Promise<ProbeAnswer | null> = Promise.resolve(null);
-  return (sourceId: string): Promise<boolean> => {
+  // null = not settled yet (no probe made, or the last job returned no row).
+  let chain: Promise<boolean | null> = Promise.resolve(null);
+  return (batch: Pick<BatchDoc, "dispatchType" | "recordsAnalysisProjected" | "total" | "sourceId">): Promise<boolean> => {
     // Never list without a job id: master would answer for the whole account.
-    if (!sourceId) return Promise.resolve(false);
-    const next = chain.then(async (settled): Promise<ProbeAnswer | null> => {
+    if (!needsAnalysisUpgrade(batch) || !batch.sourceId) return Promise.resolve(false);
+    const sourceId = batch.sourceId;
+    const next = chain.then(async (settled): Promise<boolean | null> => {
       if (settled !== null) return settled;
       try {
         const page = await client.listCalls({ jobId: sourceId, limit: 1, offset: 0 });
-        const row: RawCall | undefined = (page.calls ?? [])[0];
-        if (!row) return null;
-        return rowCarriesAnalysisProjection(row) ? "projects" : "does_not_project";
+        const row = page.calls?.[0];
+        return row ? rowCarriesAnalysisProjection(row) : null;
       } catch (err) {
         if (err instanceof TokenRefreshPermanentError) throw err;
         log().warn({ error: err, sourceId }, "analysis projection probe failed — not re-pulling for the upgrade");
-        return "unavailable";
+        return false;
       }
     });
     chain = next;
-    return next.then((answer) => answer === "projects");
+    return next.then((answer) => answer === true);
   };
 }

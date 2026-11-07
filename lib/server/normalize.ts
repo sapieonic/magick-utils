@@ -179,7 +179,7 @@ function topicList(value: unknown): string[] | null {
  *  (the export renders both as "") and blank strings in `analysis_key_topics`,
  *  which core keeps, are dropped — kept, they would export as an empty `; `
  *  entry and count as a nameless topic. Neither is worth matching. */
-export function callAnalysisFields(raw: RawCall): { sentiment: string | null; keyTopics: string[] | null } {
+function callAnalysisFields(raw: RawCall): { sentiment: string | null; keyTopics: string[] | null } {
   const analysis = raw.call_analysis ?? null;
   const common = analysis?.common ?? null;
   const sentiment = firstString(

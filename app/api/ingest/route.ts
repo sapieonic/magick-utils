@@ -5,7 +5,7 @@ import { getSession, getTenantContext, persistRefreshedCredential } from "@/lib/
 import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
 import { jobStoppedAddingRows } from "@/lib/server/job-state";
-import { createAnalysisProjectionProbe, needsAnalysisUpgrade } from "@/lib/server/analysis-projection";
+import { createAnalysisProjectionProbe } from "@/lib/server/analysis-projection";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
 import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
 import {
@@ -60,7 +60,7 @@ async function refreshableBatchIds(
   complete: boolean[],
 ): Promise<string[]> {
   const client = new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential });
-  const projectsAnalysis = createAnalysisProjectionProbe(client);
+  const analysisUpgradeDue = createAnalysisProjectionProbe(client);
   const keep: string[] = [];
   for (let i = 0; i < batchIds.length; i += REFRESH_CHECK_CONCURRENCY) {
     const slice = batchIds.slice(i, i + REFRESH_CHECK_CONCURRENCY);
@@ -109,7 +109,7 @@ async function refreshableBatchIds(
             // only once a one-row probe shows upstream now emits the columns —
             // before that a re-pull would just write another copy of the same
             // nulls — and only until the worker marks the batch upgraded.
-            if (needsAnalysisUpgrade(batch) && (await projectsAnalysis(batch.sourceId))) {
+            if (await analysisUpgradeDue(batch)) {
               log().info({ batchId }, "refresh re-pulling — upstream now projects call analysis this batch predates");
               return batchId;
             }
@@ -298,15 +298,12 @@ export const POST = withLogging("ingest", async (req: Request) => {
     //
     // Evaluated after the cooldown check so a batch already being re-pulled
     // for completeness costs no probe.
-    const analysisUpgradeCandidates = requestedBatchIds
-      .map((_, index) => index)
-      .filter((index) => complete[index] && type === "merge" && needsAnalysisUpgrade(batchDocs[index]));
-    if (analysisUpgradeCandidates.length > 0) {
-      const projectsAnalysis = createAnalysisProjectionProbe(
+    if (type === "merge") {
+      const analysisUpgradeDue = createAnalysisProjectionProbe(
         new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential }),
       );
-      for (const index of analysisUpgradeCandidates) {
-        if (await projectsAnalysis(batchDocs[index].sourceId)) complete[index] = false;
+      for (let index = 0; index < requestedBatchIds.length; index++) {
+        if (complete[index] && (await analysisUpgradeDue(batchDocs[index]))) complete[index] = false;
       }
     }
     batchIds = forceRefresh

@@ -102,24 +102,34 @@ describe("recordsAnalysisAuthoritative", () => {
 describe("createAnalysisProjectionProbe", () => {
   const listCalls = vi.fn();
   beforeEach(() => listCalls.mockReset());
+  const candidate = (sourceId: string) => ({ dispatchType: "ai_voice_call" as const, total: 10, sourceId });
+
+  it("never probes a batch that is not an upgrade candidate", async () => {
+    listCalls.mockResolvedValue({ calls: [projectedRow], total: 10, limit: 1, offset: 0 });
+    const probe = createAnalysisProjectionProbe({ listCalls });
+    await expect(probe({ ...candidate("job-1"), recordsAnalysisProjected: true })).resolves.toBe(false);
+    await expect(probe({ ...candidate("job-1"), dispatchType: "ivr_call" })).resolves.toBe(false);
+    await expect(probe({ ...candidate("job-1"), total: 0 })).resolves.toBe(false);
+    expect(listCalls).not.toHaveBeenCalled();
+  });
 
   it("asks for ONE row of the job on the calls list surface", async () => {
     listCalls.mockResolvedValue({ calls: [projectedRow], total: 10, limit: 1, offset: 0 });
     const probe = createAnalysisProjectionProbe({ listCalls });
-    await expect(probe("job-1")).resolves.toBe(true);
+    await expect(probe(candidate("job-1"))).resolves.toBe(true);
     expect(listCalls).toHaveBeenCalledWith({ jobId: "job-1", limit: 1, offset: 0 });
   });
 
   it("answers no when the row lacks the keys (core not deployed yet)", async () => {
     listCalls.mockResolvedValue({ calls: [legacyRow], total: 10, limit: 1, offset: 0 });
     const probe = createAnalysisProjectionProbe({ listCalls });
-    await expect(probe("job-1")).resolves.toBe(false);
+    await expect(probe(candidate("job-1"))).resolves.toBe(false);
   });
 
   it("reuses a definitive answer for every later batch of the request, concurrent callers included", async () => {
     listCalls.mockResolvedValue({ calls: [projectedRow], total: 10, limit: 1, offset: 0 });
     const probe = createAnalysisProjectionProbe({ listCalls });
-    const answers = await Promise.all(["job-1", "job-2", "job-3"].map((id) => probe(id)));
+    const answers = await Promise.all(["job-1", "job-2", "job-3"].map((id) => probe(candidate(id))));
     expect(answers).toEqual([true, true, true]);
     expect(listCalls).toHaveBeenCalledTimes(1);
   });
@@ -129,8 +139,8 @@ describe("createAnalysisProjectionProbe", () => {
       .mockResolvedValueOnce({ calls: [], total: 0, limit: 1, offset: 0 })
       .mockResolvedValueOnce({ calls: [projectedRow], total: 4, limit: 1, offset: 0 });
     const probe = createAnalysisProjectionProbe({ listCalls });
-    await expect(probe("empty-job")).resolves.toBe(false);
-    await expect(probe("job-2")).resolves.toBe(true);
+    await expect(probe(candidate("empty-job"))).resolves.toBe(false);
+    await expect(probe(candidate("job-2"))).resolves.toBe(true);
     expect(listCalls).toHaveBeenCalledTimes(2);
   });
 
@@ -141,8 +151,8 @@ describe("createAnalysisProjectionProbe", () => {
       throw new MagickApiError(503, "down", "/proxy/calls");
     });
     const probe = createAnalysisProjectionProbe({ listCalls });
-    await expect(probe("job-1")).resolves.toBe(false);
-    await expect(probe("job-2")).resolves.toBe(false);
+    await expect(probe(candidate("job-1"))).resolves.toBe(false);
+    await expect(probe(candidate("job-2"))).resolves.toBe(false);
     expect(listCalls).toHaveBeenCalledTimes(1);
   });
 
@@ -151,12 +161,12 @@ describe("createAnalysisProjectionProbe", () => {
       throw new TokenRefreshPermanentError("TOKEN_EXPIRED");
     });
     const probe = createAnalysisProjectionProbe({ listCalls });
-    await expect(probe("job-1")).rejects.toBeInstanceOf(TokenRefreshPermanentError);
+    await expect(probe(candidate("job-1"))).rejects.toBeInstanceOf(TokenRefreshPermanentError);
   });
 
   it("never lists without a job id (that would answer for the whole account)", async () => {
     const probe = createAnalysisProjectionProbe({ listCalls });
-    await expect(probe("")).resolves.toBe(false);
+    await expect(probe(candidate(""))).resolves.toBe(false);
     expect(listCalls).not.toHaveBeenCalled();
   });
 });
