@@ -134,7 +134,9 @@ row — present (possibly null) on a projecting core, absent on an older one —
 from it carry real values and the CSV export's `sentiment`/`key_topics` columns fill. The worker marks
 such a batch `recordsAnalysisProjected` (every row of the pull carried the KEYS — presence, not value);
 core's rollup via `lib/server/call-analysis.ts` stays the fallback, and wins outright for any selection
-holding an unmarked batch, since its records would give a partial count. **A core deploy that only adds
+holding an unmarked batch (an empty one excepted), since its records would give a partial count — and if
+the rollup is then unavailable, that partial series is blanked, never served beside `analysisUnavailable`
+(the UI reads the flag only for its empty-state copy). **A core deploy that only adds
 list columns moves no records stamp**, so already-ingested AI batches are re-pulled once — on an explicit
 Refresh or merge only, and only after a one-row probe shows upstream emits the keys
 (`lib/server/analysis-projection.ts`); never make that path unconditional. **Bump `AGGREGATES_VERSION`

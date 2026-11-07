@@ -851,6 +851,36 @@ describe("POST /api/ingest", () => {
       expect(vi.mocked(createJob).mock.calls[0][0].batchIds).toEqual(["b1", "b2", "b3"]);
     });
 
+    for (const [label, body] of [
+      ["refresh", { type: "ingest", refresh: true }],
+      ["merge", { type: "merge" }],
+    ] as const) {
+      it(`never re-pulls an empty AI batch on ${label}, even once the probe has said "projects"`, async () => {
+        // An empty pull can never earn the marker (no row to carry the keys),
+        // so were it a candidate, the probe memoised "projects" by b1 would
+        // re-pull it on every click, forever.
+        arrange(readyAiBatch());
+        vi.mocked(getBatch).mockImplementation((_t: string, _a: string, id: string) =>
+          Promise.resolve(
+            (id === "b1"
+              ? readyAiBatch({ sourceId: "job-1" })
+              : readyAiBatch({ sourceId: "job-empty", total: 0, ingestedListedTotal: 0 })) as never,
+          ),
+        );
+        vi.mocked(countRecords).mockImplementation((_t: string, _a: string, ids: string[]) =>
+          Promise.resolve(ids[0] === "b1" ? 10 : 0),
+        );
+        listCalls.mockResolvedValue({ calls: [PROJECTED_ROW], total: 10, limit: 1, offset: 0 });
+        const { POST } = await import("@/app/api/ingest/route");
+        await POST(req({ batchIds: ["b1", "b2"], ...body }));
+
+        expect(listCalls).toHaveBeenCalledTimes(1);
+        expect(listCalls).toHaveBeenCalledWith({ jobId: "job-1", limit: 1, offset: 0 });
+        expect(createJob).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(createJob).mock.calls[0][0].batchIds).toEqual(["b1"]);
+      });
+    }
+
     it("never applies to a non-AI batch", async () => {
       arrange(readyAiBatch({ selType: "ivr", dispatchType: "static_call" }));
       const { POST } = await import("@/app/api/ingest/route");

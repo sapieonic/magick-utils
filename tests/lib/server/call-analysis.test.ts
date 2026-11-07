@@ -51,7 +51,8 @@ function projectedDocs(): BatchDoc[] {
 }
 
 /** A computed aggregate as the record path leaves it: everything else present,
- *  sentiment and topics empty because the calls list carries no `call_analysis`. */
+ *  sentiment and topics empty, as from a pre-projection core's calls list, which
+ *  carries no `call_analysis` and no `analysis_*` scalars. */
 function agg(overrides: Partial<AggregatesDoc> = {}): AggregatesDoc {
   return {
     tenantId: "t1",
@@ -293,6 +294,76 @@ describe("enrichWithCallAnalysis", () => {
     expect(aggregate.sentiment).toEqual([{ name: "Positive", value: 3 }]);
     expect(aggregate.topics).toEqual([{ topic: "t", count: 1, sentiment: "neutral" }]);
   });
+
+  // --- failure in a mixed vs an authoritative selection -----------------------
+  // In a mixed selection a non-empty record series counts the upgraded batches
+  // only. The Conversation tab reads `analysisUnavailable` solely for its empty
+  // state copy, so a partial series served beside it renders as complete — and
+  // on a settled refusal it would be cached as complete. Blank it instead.
+
+  const mixedDocs = (): BatchDoc[] => [
+    { batchId: "b1", sourceId: "job-1", selType: "ai", recordsAnalysisProjected: true } as BatchDoc,
+    { batchId: "b2", sourceId: "job-2", selType: "ai", recordsAnalysisProjected: null } as BatchDoc,
+  ];
+  const partialSeries = () =>
+    agg({
+      sentiment: [{ name: "Positive", value: 3 }],
+      topics: [{ topic: "b1 only", count: 3, sentiment: "neutral" }],
+    });
+
+  for (const [label, arrange, expected] of [
+    ["a momentary failure", () => batchAnalytics.mockRejectedValue(new Error("socket hang up")), { status: "failed", cacheable: false }],
+    [
+      "a settled refusal",
+      () => batchAnalytics.mockRejectedValue(new MagickApiError(422, "nope", "http://mm.test/x")),
+      { status: "unavailable", cacheable: true },
+    ],
+    ["a malformed rollup", () => batchAnalytics.mockResolvedValue({ key_topics: "nope" }), { status: "failed", cacheable: false }],
+  ] as const) {
+    it(`blanks a partial record series on ${label} in a mixed selection`, async () => {
+      arrange();
+      const out = await enrichWithCallAnalysis(ctx, mixedDocs(), partialSeries());
+
+      expect(out.status).toBe(expected.status);
+      expect(out.cacheable).toBe(expected.cacheable);
+      expect(out.aggregate.analysisUnavailable).toBe(true);
+      expect(out.aggregate.sentiment).toEqual([]);
+      expect(out.aggregate.topics).toEqual([]);
+      expect(out.aggregate.totalRecords).toBe(120); // every other series still served
+    });
+  }
+
+  it("blanks a partial record series when a mixed selection has a batch without a sourceId", async () => {
+    const broken = [mixedDocs()[0]!, { ...mixedDocs()[1]!, sourceId: "" } as BatchDoc];
+    const out = await enrichWithCallAnalysis(ctx, broken, partialSeries());
+
+    expect(batchAnalytics).not.toHaveBeenCalled();
+    expect(out.aggregate.analysisUnavailable).toBe(true);
+    expect(out.aggregate.sentiment).toEqual([]);
+    expect(out.aggregate.topics).toEqual([]);
+  });
+
+  for (const [label, arrange, expected] of [
+    ["a momentary failure", () => batchAnalytics.mockRejectedValue(new Error("socket hang up")), { status: "failed", cacheable: false }],
+    [
+      "a settled refusal",
+      () => batchAnalytics.mockRejectedValue(new MagickApiError(422, "nope", "http://mm.test/x")),
+      { status: "unavailable", cacheable: true },
+    ],
+  ] as const) {
+    it(`keeps an authoritative record series on ${label}`, async () => {
+      // Every batch marked: the records' sentiment describes the whole
+      // selection; only the empty topics half could not be loaded.
+      arrange();
+      const out = await enrichWithCallAnalysis(ctx, projectedDocs(), agg({ sentiment: [{ name: "Positive", value: 3 }] }));
+
+      expect(out.status).toBe(expected.status);
+      expect(out.cacheable).toBe(expected.cacheable);
+      expect(out.aggregate.analysisUnavailable).toBe(true);
+      expect(out.aggregate.sentiment).toEqual([{ name: "Positive", value: 3 }]);
+      expect(out.aggregate.topics).toEqual([]);
+    });
+  }
 
   it("degrades rather than failing the request when upstream errors", async () => {
     batchAnalytics.mockRejectedValue(new Error("socket hang up"));

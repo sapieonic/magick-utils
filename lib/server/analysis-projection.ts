@@ -31,6 +31,12 @@
 //
 // Key PRESENCE, never value: a row whose call was never analysed carries
 // `analysis_sentiment_label: null`, and a batch of such rows is fully upgraded.
+//
+// One residual: the marker is judged on the rows a pull RETURNED, so after a
+// SHORT upgrade pull the rows carried forward from the previous revision keep
+// their blank analysis while the batch reads upgraded. They fill only when a
+// later pull (the completeness re-pull a short batch already gets) returns
+// them — rare now that core's list order has an `id` tiebreak.
 
 import type { MagickClient, RawCall } from "./magick-client";
 import { TokenRefreshPermanentError } from "./firebase-token";
@@ -71,19 +77,38 @@ export function recordsCarryAnalysisProjection(records: readonly Pick<Normalized
  *  Strictly `ai_voice_call`: only `/proxy/calls` rows carry the projection, and
  *  `selType` alone cannot say which surface a batch lists from. Read with
  *  `!== true`: the driver stores an undefined field as BSON null, and documents
- *  published before this marker existed have neither. */
+ *  published before this marker existed have neither.
+ *
+ *  A batch whose published revision holds NO records is never a candidate.
+ *  There is nothing on it to upgrade, and it could never earn the marker:
+ *  `recordsCarryAnalysisProjection([])` is false, so a re-pull that again
+ *  returns nothing leaves it unmarked — and once another batch of the same
+ *  request has settled the memoised probe to "projects", it would be re-pulled
+ *  on every Refresh and every merge, forever. `total` is the published
+ *  revision's exact record count (see BatchDoc.total); both callers reach this
+ *  only for a batch that has a published revision. If upstream later adds rows
+ *  to the job, `records_updated_at` moves and the ordinary refresh re-pulls it. */
 export function needsAnalysisUpgrade(
-  batch: Pick<BatchDoc, "dispatchType" | "recordsAnalysisProjected">,
+  batch: Pick<BatchDoc, "dispatchType" | "recordsAnalysisProjected" | "total">,
 ): boolean {
-  return batch.dispatchType === "ai_voice_call" && batch.recordsAnalysisProjected !== true;
+  return batch.dispatchType === "ai_voice_call" && batch.recordsAnalysisProjected !== true && batch.total > 0;
 }
 
 /** Whether every batch of an AI selection was published from a projecting
- *  core, so the records' own sentiment/topics describe the whole selection. */
+ *  core, so the records' own sentiment/topics describe the whole selection.
+ *
+ *  A batch with no published records contributes nothing to either series, so
+ *  it cannot make them partial — and since it can never be marked (see
+ *  `needsAnalysisUpgrade`), counting it would leave every selection that
+ *  includes it non-authoritative for good. Only an explicit `total === 0` is
+ *  exempt; a missing total is not evidence of an empty batch. */
 export function recordsAnalysisAuthoritative(
-  batches: readonly Pick<BatchDoc, "recordsAnalysisProjected">[],
+  batches: readonly Pick<BatchDoc, "recordsAnalysisProjected" | "total">[],
 ): boolean {
-  return batches.length > 0 && batches.every((batch) => batch.recordsAnalysisProjected === true);
+  return (
+    batches.length > 0 &&
+    batches.every((batch) => batch.recordsAnalysisProjected === true || batch.total === 0)
+  );
 }
 
 type ProbeAnswer = "projects" | "does_not_project" | "unavailable";

@@ -32,7 +32,8 @@ export function batchSetKey(batchIds: string[]): string {
 // v8: records carry sentiment/topics themselves (legacy-flat `call_analysis` and
 //     core's `analysis_*` list scalars), and the rollup yields to them only when
 //     every batch of the selection is `recordsAnalysisProjected` — a mixed
-//     selection now takes the rollup instead of a partial record count.
+//     selection now takes the rollup instead of a partial record count, and
+//     blanks that partial count when the rollup is unavailable.
 const AGGREGATES_VERSION = "v8";
 
 /** Cache key for precomputed aggregates.

@@ -2119,7 +2119,7 @@ describe("processJob analysis-projection marker", () => {
     );
   });
 
-  it("leaves the field alone for every other surface", async () => {
+  it("never marks another surface — even from rows that carry the projection keys", async () => {
     repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 2 });
     client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "static_call", status: "completed" });
     client.listStaticCalls.mockResolvedValueOnce(page);
@@ -2127,6 +2127,13 @@ describe("processJob analysis-projection marker", () => {
 
     await processJob(job({ batchIds: ["b1"], total: 2 }));
 
-    expect(repositories.publishBatchIfOwned.mock.calls[0][0].recordsAnalysisProjected).toBeUndefined();
+    const published = repositories.publishBatchIfOwned.mock.calls[0][0];
+    // What is WRITTEN: the publish `$set`s the whole doc and the driver is not
+    // configured with `ignoreUndefined`, so this present-but-undefined key is
+    // stored as BSON null — it replaces, it does not "leave alone". Harmless:
+    // every reader asks `=== true`, and the upgrade is ai_voice_call-only.
+    expect(Object.prototype.hasOwnProperty.call(published, "recordsAnalysisProjected")).toBe(true);
+    expect(published.recordsAnalysisProjected).toBeUndefined();
+    expect(published.recordsAnalysisProjected).not.toBe(true);
   });
 });

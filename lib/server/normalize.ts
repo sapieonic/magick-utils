@@ -165,7 +165,20 @@ function topicList(value: unknown): string[] | null {
  *
  *  A blank or non-string label is no label. Topics take the first ARRAY found,
  *  as core's `COALESCE(common->key_topics, key_topics)` does, so a present but
- *  empty modern list is not silently replaced by a legacy one. */
+ *  empty modern list is not silently replaced by a legacy one.
+ *
+ *  Not byte-identical to core's projection SQL (`CALL_LIST_ANALYSIS_SCALARS`)
+ *  on odd shapes, and deliberately so. Where `call_analysis` itself is present:
+ *  `{ common: { key_topics: null }, key_topics: [...] }` is null in core (its
+ *  COALESCE keeps the JSON null) but falls through to the legacy list here; a
+ *  blank label is `''` in core but no label here (so a later source may win); a
+ *  non-string label is stringified by core's `->>` but skipped here. List rows
+ *  carry `call_analysis: null`, so those only reach a payload carrying the blob.
+ *  On the scalars themselves — the path list rows actually take — the only
+ *  differences are that a blank `analysis_sentiment_label` reads as no label
+ *  (the export renders both as "") and blank strings in `analysis_key_topics`,
+ *  which core keeps, are dropped — kept, they would export as an empty `; `
+ *  entry and count as a nameless topic. Neither is worth matching. */
 export function callAnalysisFields(raw: RawCall): { sentiment: string | null; keyTopics: string[] | null } {
   const analysis = raw.call_analysis ?? null;
   const common = analysis?.common ?? null;

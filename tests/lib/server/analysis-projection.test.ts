@@ -47,25 +47,55 @@ describe("recordsCarryAnalysisProjection", () => {
 
 describe("needsAnalysisUpgrade", () => {
   it("is true only for an unmarked ai_voice_call batch", () => {
-    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call" })).toBe(true);
+    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", total: 10 })).toBe(true);
     // Undefined persists as BSON null: a null marker is "not upgraded".
-    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: null })).toBe(true);
-    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: false })).toBe(true);
-    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: true })).toBe(false);
+    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: null, total: 10 })).toBe(true);
+    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: false, total: 10 })).toBe(true);
+    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: true, total: 10 })).toBe(false);
   });
 
   it("never applies to other surfaces, or to a batch whose surface is unknown", () => {
     for (const dispatchType of ["ivr_call", "static_call", "whatsapp_message", "email_message", undefined]) {
-      expect(needsAnalysisUpgrade({ dispatchType })).toBe(false);
+      expect(needsAnalysisUpgrade({ dispatchType, total: 10 })).toBe(false);
     }
+  });
+
+  it("never applies to a batch whose published revision holds no records", () => {
+    // `recordsCarryAnalysisProjection([])` is false, so a re-pull of an empty
+    // batch can never mark it. Were it a candidate, a request whose probe had
+    // already answered "projects" for another batch would re-pull it on every
+    // Refresh and merge, forever.
+    expect(needsAnalysisUpgrade({ dispatchType: "ai_voice_call", recordsAnalysisProjected: null, total: 0 })).toBe(false);
   });
 });
 
 describe("recordsAnalysisAuthoritative", () => {
   it("is true only when every batch is marked", () => {
-    expect(recordsAnalysisAuthoritative([{ recordsAnalysisProjected: true }, { recordsAnalysisProjected: true }])).toBe(true);
-    expect(recordsAnalysisAuthoritative([{ recordsAnalysisProjected: true }, { recordsAnalysisProjected: null }])).toBe(false);
+    expect(
+      recordsAnalysisAuthoritative([
+        { recordsAnalysisProjected: true, total: 3 },
+        { recordsAnalysisProjected: true, total: 4 },
+      ]),
+    ).toBe(true);
+    expect(
+      recordsAnalysisAuthoritative([
+        { recordsAnalysisProjected: true, total: 3 },
+        { recordsAnalysisProjected: null, total: 4 },
+      ]),
+    ).toBe(false);
     expect(recordsAnalysisAuthoritative([])).toBe(false);
+  });
+
+  it("does not let an empty, never-markable batch make a selection partial", () => {
+    // An empty batch contributes nothing to either series, and can never be
+    // marked (see needsAnalysisUpgrade) — counting it would pin every selection
+    // that includes it to the rollup for good.
+    expect(
+      recordsAnalysisAuthoritative([
+        { recordsAnalysisProjected: true, total: 3 },
+        { recordsAnalysisProjected: null, total: 0 },
+      ]),
+    ).toBe(true);
   });
 });
 

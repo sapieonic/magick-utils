@@ -187,7 +187,9 @@ export function toTopicSeries(raw: RawBatchAnalytics | null): AggregatesDoc["top
  * `recordsAnalysisProjected`): a series that already has values is left alone
  * and, with both present, this is a no-op that asks upstream nothing. In a
  * mixed selection a non-empty record series is partial, so the rollup replaces
- * it (see the header). Enrichment is best-effort by design — the rest of the tab is
+ * it (see the header) — and when the rollup cannot be had, that partial series
+ * is blanked rather than served beside `analysisUnavailable`, which the UI reads
+ * only for its empty-state copy. Enrichment is best-effort by design — the rest of the tab is
  * already computed and correct, and failing the whole request over the two cards
  * this is meant to fill would be a strictly worse outcome for the customer.
  */
@@ -212,6 +214,20 @@ export async function enrichWithCallAnalysis(
     return { aggregate: agg, status: "skipped", cacheable: true };
   }
 
+  // The aggregate served when the rollup cannot be had. When the records are
+  // authoritative their series describe the whole selection, so whatever they
+  // carry is kept and only the empty half reads "could not load". In a mixed
+  // selection they do NOT: a non-empty series there counts the upgraded batches
+  // only, and the Conversation tab reads `analysisUnavailable` solely for its
+  // empty-state copy — so a partial series served beside the flag would render
+  // as the complete answer, and on a settled refusal it would be CACHED as one.
+  // Blanking both is what makes the cards say "could not load" instead.
+  const unavailable = (): AggregatesDoc => ({
+    ...agg,
+    ...(authoritative ? {} : { sentiment: [], topics: [] }),
+    analysisUnavailable: true,
+  });
+
   // `sourceId`, NOT `batchId`. They are the same string today (map.ts keys a
   // BatchDoc by its upstream id), but `batchId` is documented as the human id
   // this app still intends to prettify, and `sourceId` is the upstream job id
@@ -229,7 +245,7 @@ export async function enrichWithCallAnalysis(
       { key: agg.key, expected: batches.length, usable: jobIds.length },
       "call-analysis enrichment skipped; some batches carry no sourceId",
     );
-    return { aggregate: { ...agg, analysisUnavailable: true }, status: "failed", cacheable: false };
+    return { aggregate: unavailable(), status: "failed", cacheable: false };
   }
 
   let raw: RawBatchAnalytics | null;
@@ -245,7 +261,7 @@ export async function enrichWithCallAnalysis(
       "call-analysis enrichment could not be applied; serving aggregates without sentiment/topics",
     );
     return {
-      aggregate: { ...agg, analysisUnavailable: true },
+      aggregate: unavailable(),
       status: settled ? "unavailable" : "failed",
       cacheable: settled,
     };
@@ -256,7 +272,7 @@ export async function enrichWithCallAnalysis(
       { key: agg.key, batchCount: jobIds.length },
       "call-analysis rollup did not match its declared shape; not caching",
     );
-    return { aggregate: { ...agg, analysisUnavailable: true }, status: "failed", cacheable: false };
+    return { aggregate: unavailable(), status: "failed", cacheable: false };
   }
 
   // Keep the records' series when they are authoritative — and, in a mixed

@@ -268,11 +268,13 @@ export interface StatusSummaryResponse {
  *  bulk-dispatch analytics (`POST /bulk-dispatch-jobs/analytics`, which fans out
  *  to core's `/calls/batch-analytics`).
  *
- *  This endpoint exists because the per-record read path cannot carry them:
- *  core's calls LIST projects a column subset that deliberately excludes the
- *  heavy `call_analysis` JSONB, and its formatter sends `call_analysis: null`
- *  rather than omitting the key — so every listed call looks like a call with no
- *  analysis. Core aggregates these in SQL straight off the blob instead.
+ *  Core's calls LIST deliberately excludes the heavy `call_analysis` JSONB (its
+ *  formatter sends `call_analysis: null`), so records pulled from an older core
+ *  carry no analysis at all. A current core projects `analysis_sentiment_label`
+ *  / `analysis_key_topics` scalars onto each list row instead (see `RawCall`),
+ *  and records pulled from it carry their own. This rollup — aggregated by core
+ *  in SQL straight off the blob — is the fallback for any selection holding a
+ *  batch ingested before that projection (see call-analysis.ts).
  *
  *  The response carries far more (totals, duration, cost, outcome and error
  *  distributions); we type only what we consume and stay defensive about the

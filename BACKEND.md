@@ -144,7 +144,10 @@ default for AI batches) came out blank on every row.
 analysed is fully upgraded), explicit `false` otherwise — and on the short-pull path that keeps the
 published revision, because an upgrade pull of unanalysed calls fingerprints identically to what it
 replaces (null fingerprints as absent) and would otherwise never be marked. Carried rows do not count:
-nothing re-reads them, so counting them would only make the upgrade loop. `bulkJobToBatchDoc` carries it
+nothing re-reads them, so counting them would only make the upgrade loop. The residual that leaves: after
+a SHORT upgrade pull, rows carried forward from the previous revision keep their blank analysis while the
+batch reads `true`, so they stay blank in the export until a later pull — the completeness re-pull a
+short batch already gets — returns them; rare now that core's list order has an `id` tiebreak. `bulkJobToBatchDoc` carries it
 through every listing (it is a `$set`; dropping it stores null). Read it with `=== true`.
 
 **The upgrade re-pull.** A core deploy that only adds list columns writes no call row, so master's
@@ -157,7 +160,10 @@ side so it cannot become a mass or repeated re-ingest:
   that reads these fields off the records, and the one that showed the blank columns. A plain Analytics
   load never re-pulls; the listing never enqueues anything.
 - **Only `dispatchType === "ai_voice_call"` batches not marked `true`** (`needsAnalysisUpgrade`). IVR,
-  static and messaging batches are untouched.
+  static and messaging batches are untouched, and so is a batch whose published revision holds no
+  records (`total === 0`): there is nothing to upgrade, and an empty pull can never earn the marker, so
+  once another batch of the request had settled the probe to "projects" it would re-pull on every click.
+  `recordsAnalysisAuthoritative` exempts such a batch for the same reason.
 - **Only once upstream projects.** `createAnalysisProjectionProbe` lists ONE row of the job
   (`listCalls`, `limit: 1`) on the surface the worker pages and checks for the keys. Before core deploys
   it says no and nothing is re-pulled — a re-pull then would only write another copy of the same nulls,
@@ -179,7 +185,11 @@ only when EVERY batch in the selection is marked (`recordsAnalysisAuthoritative`
 overwrites a series the records carry, and asks the rollup only for an empty one. In a mixed selection
 (one batch upgraded, one not) the records hold the upgraded batch's values only, so a non-empty series is
 a partial count; there the rollup — exact over every batch — replaces it (unless it came back empty for
-that series, when the partial count is kept rather than replaced by nothing).
+that series, when the partial count is kept rather than replaced by nothing). When the rollup cannot be
+had in a mixed selection — any failure, settled refusals (which are cached) included — both series are
+BLANKED rather than served beside `analysisUnavailable`, which the Conversation tab reads only for its
+empty-state copy: a partial series next to the flag would render as the complete answer. An
+authoritative selection keeps its record-derived series on failure.
 
 `call-analysis.ts` therefore asks the one endpoint that can see the blob:
 `POST /bulk-dispatch-jobs/analytics` on magick-master, which fans out to core's
@@ -203,6 +213,8 @@ top-10s merged approximately here. Notes:
 - **Either way the doc is marked `analysisUnavailable: true`**, so the Conversation tab says "couldn't
   load" instead of asserting the records carry no AI analysis. The two look identical on screen; only
   one of them is a fact about the customer's data.
+  In a mixed selection both series are also blanked (see *Enrichment precedence*), so the flag is
+  never served beside a partial series.
 - **Bump `AGGREGATES_VERSION` (`lib/server/fingerprint.ts`) whenever this changes.** `/api/analytics`
   serves a cache hit *before* enrichment runs, so without a bump every selection analysed before the
   deploy keeps serving its old empty doc until someone clicks Refresh or retention prunes it. The two

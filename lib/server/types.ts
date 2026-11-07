@@ -549,11 +549,15 @@ export interface AggregatesDoc {
   durationHistogram?: { bucket: string; calls: number; talk: number }[];
   sentiment?: { name: string; value: number }[];
   topics?: { topic: string; count: number; sentiment: string }[];
-  /** True when the post-call-analysis rollup these two series come from could
-   *  not be read (see `call-analysis.ts`). Both series are then empty for a
-   *  reason that has nothing to do with the data, so the UI must say "could not
-   *  load" instead of asserting these records carry no AI analysis. Absent on
-   *  every normal doc, including one where upstream genuinely had nothing. */
+  /** True when the post-call-analysis rollup these two series needed could
+   *  not be read (see `call-analysis.ts`). A series it would have filled is then
+   *  empty for a reason that has nothing to do with the data, so the UI must say
+   *  "could not load" instead of asserting these records carry no AI analysis.
+   *  Only a series the records carry for the WHOLE selection survives beside it;
+   *  in a mixed selection both are blanked, because the UI reads this flag only
+   *  for its empty-state copy and would show a partial series as complete.
+   *  Absent on every normal doc, including one where upstream genuinely had
+   *  nothing. */
   analysisUnavailable?: boolean;
   funnel?: { stage: string; value: number }[];
   volumeOverTime?: { date: string; calls: number; messages: number }[];

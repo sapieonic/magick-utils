@@ -62,11 +62,14 @@ export const POST = withLogging("analytics", async (req: Request) => {
   // That is a valid answer: 409-ing it surfaced as a hard error on screen and
   // pushed the client into a pointless re-ingest.
   const records = await getRecords(ctx.tenantId, ctx.accountId, batchIds);
-  // Sentiment and key topics cannot come from the records — core's calls list
-  // does not carry `call_analysis` — so they are filled from core's own rollup
-  // here. `cacheable` is false only when that upstream call failed: the cache
-  // key cannot change in response to a downstream error, so persisting a failed
-  // enrichment would pin the two empty cards until someone hit Refresh.
+  // Sentiment and key topics have two sources (call-analysis.ts). Records
+  // pulled from a core that projects the analysis scalars onto its calls list
+  // carry their own; when every batch is marked so, those series stand and the
+  // rollup is asked only for an empty one. Otherwise — a batch ingested before
+  // the projection — core's own rollup fills them here. `cacheable` is false
+  // only when that upstream call failed momentarily: the cache key cannot
+  // change in response to a downstream error, so persisting a failed
+  // enrichment would pin the two cards until someone hit Refresh.
   const { aggregate: agg, cacheable } = await enrichWithCallAnalysis(
     ctx,
     batches,

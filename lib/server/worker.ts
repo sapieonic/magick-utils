@@ -847,7 +847,11 @@ async function ingestBatch(
   // published revision — because a SHORT upgrade pull of calls nobody analysed
   // is content-identical to what it replaces (null values fingerprint as
   // absent), takes the "unchanged" path, and would otherwise re-probe and
-  // re-pull on every click. Undefined for every other surface, which leaves the field alone.
+  // re-pull on every click. Undefined for every other surface: the keep path
+  // drops undefined stamps (leaving the field as it was), while the publish
+  // `$set`s the whole doc and the driver stores the undefined as BSON null.
+  // Both are harmless — readers ask `=== true`, and the upgrade re-pull is
+  // `ai_voice_call`-only — but neither "leaves it alone" on publish.
   const analysisProjected = dispatchType === "ai_voice_call" ? recordsCarryAnalysisProjection(records) : undefined;
   // Content fingerprint of exactly what would be served. Computed before the
   // decision because the decision uses it. It covers every field of every
