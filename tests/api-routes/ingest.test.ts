@@ -22,12 +22,13 @@ vi.mock("@/lib/server/repositories", () => ({
   releaseIngestionLocks: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/lib/server/magick-client", () => ({
-  MagickClient: vi.fn(() => ({ getBulkJob })),
+  MagickClient: vi.fn(() => ({ getBulkJob, listCalls })),
 }));
 
 // hoisted so the (also-hoisted) factories above can close over them
-const { getBulkJob, persistRefreshedCredential, sessionDestroy } = vi.hoisted(() => ({
+const { getBulkJob, listCalls, persistRefreshedCredential, sessionDestroy } = vi.hoisted(() => ({
   getBulkJob: vi.fn(),
+  listCalls: vi.fn(),
   persistRefreshedCredential: vi.fn(),
   sessionDestroy: vi.fn(),
 }));
@@ -756,6 +757,144 @@ describe("POST /api/ingest", () => {
     expect((await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }))).status).toBe(200);
     expect(getBulkJob).not.toHaveBeenCalled();
     expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  // Core now projects `analysis_sentiment_label` / `analysis_key_topics` onto
+  // the calls list. That deploy writes no call row, so the records stamp proves
+  // every already-ingested AI batch unchanged — the one-off upgrade re-pull is
+  // the only way their blank sentiment/key_topics can ever fill.
+  describe("analysis-projection upgrade re-pull", () => {
+    const UNTOUCHED_JOB = { id: "job-1", status: "completed", records_updated_at: "2026-09-01T10:00:00.000000Z" };
+    const PROJECTED_ROW = { call_id: "c1", call_analysis: null, analysis_sentiment_label: "positive", analysis_key_topics: [] };
+    const LEGACY_ROW = { call_id: "c1", call_analysis: null };
+
+    function readyAiBatch(overrides: Record<string, unknown> = {}) {
+      return {
+        total: 10, selType: "ai", dispatchType: "ai_voice_call", ingestStatus: "ready",
+        sourceId: "job-1", ingestedRecordsStamp: STAMP_AT_INGEST, ingestedListedTotal: 10,
+        ...overrides,
+      };
+    }
+
+    function arrange(batch: Record<string, unknown>) {
+      vi.mocked(isBackendConfigured).mockReturnValue(true);
+      vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+      vi.mocked(getBatch).mockImplementation(
+        (_t: string, _a: string, id: string) => Promise.resolve({ ...batch, sourceId: id === "b1" ? "job-1" : `job-${id}` } as never),
+      );
+      vi.mocked(countRecords).mockResolvedValue(10);
+      vi.mocked(findActiveJobForBatches).mockResolvedValue(null);
+      getBulkJob.mockResolvedValue(UNTOUCHED_JOB);
+    }
+
+    it("re-pulls an unmarked AI batch on refresh once the probe sees the projection", async () => {
+      arrange(readyAiBatch());
+      listCalls.mockResolvedValue({ calls: [PROJECTED_ROW], total: 10, limit: 1, offset: 0 });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      expect(res.status).toBe(200);
+      // One row of THIS job, on the surface the worker pages.
+      expect(listCalls).toHaveBeenCalledWith({ jobId: "job-1", limit: 1, offset: 0 });
+      expect(createJob).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(createJob).mock.calls[0][0].batchIds).toEqual(["b1"]);
+    });
+
+    it("keeps the normal skip once the batch is marked — no probe, no re-pull", async () => {
+      arrange(readyAiBatch({ recordsAnalysisProjected: true }));
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      await expect(res.json()).resolves.toMatchObject({ jobId: null, upToDate: true });
+      expect(listCalls).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+    });
+
+    it("skips while upstream does not project yet — a re-pull would only duplicate the nulls", async () => {
+      arrange(readyAiBatch({ recordsAnalysisProjected: null }));
+      listCalls.mockResolvedValue({ calls: [LEGACY_ROW], total: 10, limit: 1, offset: 0 });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      await expect(res.json()).resolves.toMatchObject({ jobId: null, upToDate: true });
+      expect(createJob).not.toHaveBeenCalled();
+    });
+
+    it("skips when the probe fails, unlike a failed source check", async () => {
+      // The stamp has already proven the records current; "re-ingest to be safe"
+      // here would turn every click during an outage into a duplicate dataset.
+      arrange(readyAiBatch());
+      listCalls.mockImplementation(async () => {
+        throw new Error("upstream down");
+      });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      await expect(res.json()).resolves.toMatchObject({ jobId: null, upToDate: true });
+      expect(createJob).not.toHaveBeenCalled();
+    });
+
+    it("clears the session and 401s when the probe hits a dead credential", async () => {
+      arrange(readyAiBatch());
+      listCalls.mockImplementation(async () => {
+        throw new TokenRefreshPermanentError("TOKEN_EXPIRED");
+      });
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      expect(res.status).toBe(401);
+      expect(sessionDestroy).toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+    });
+
+    it("probes once per request, however many batches need it", async () => {
+      arrange(readyAiBatch());
+      listCalls.mockResolvedValue({ calls: [PROJECTED_ROW], total: 10, limit: 1, offset: 0 });
+      const { POST } = await import("@/app/api/ingest/route");
+      await POST(req({ batchIds: ["b1", "b2", "b3"], type: "ingest", refresh: true }));
+      expect(listCalls).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(createJob).mock.calls[0][0].batchIds).toEqual(["b1", "b2", "b3"]);
+    });
+
+    it("never applies to a non-AI batch", async () => {
+      arrange(readyAiBatch({ selType: "ivr", dispatchType: "static_call" }));
+      const { POST } = await import("@/app/api/ingest/route");
+      const res = await POST(req({ batchIds: ["b1"], type: "ingest", refresh: true }));
+      await expect(res.json()).resolves.toMatchObject({ jobId: null, upToDate: true });
+      expect(listCalls).not.toHaveBeenCalled();
+    });
+
+    it("is not offered to a plain Analytics load", async () => {
+      arrange(readyAiBatch());
+      listCalls.mockResolvedValue({ calls: [PROJECTED_ROW], total: 10, limit: 1, offset: 0 });
+      const { POST } = await import("@/app/api/ingest/route");
+      await POST(req({ batchIds: ["b1"], type: "ingest" }));
+      expect(listCalls).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+    });
+
+    it("re-pulls an unmarked AI batch on a merge, which feeds the CSV export", async () => {
+      arrange(readyAiBatch());
+      listCalls.mockResolvedValue({ calls: [PROJECTED_ROW], total: 10, limit: 1, offset: 0 });
+      const { POST } = await import("@/app/api/ingest/route");
+      await POST(req({ batchIds: ["b1"], type: "merge" }));
+      expect(createJob).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(createJob).mock.calls[0][0].type).toBe("merge");
+    });
+
+    it("serves a merge as it stands while upstream does not project, or once marked", async () => {
+      arrange(readyAiBatch());
+      listCalls.mockResolvedValue({ calls: [LEGACY_ROW], total: 10, limit: 1, offset: 0 });
+      const { POST } = await import("@/app/api/ingest/route");
+      await expect((await POST(req({ batchIds: ["b1"], type: "merge" }))).json()).resolves.toMatchObject({
+        jobId: null,
+        ready: true,
+      });
+
+      arrange(readyAiBatch({ recordsAnalysisProjected: true }));
+      vi.mocked(listCalls).mockClear();
+      await expect((await POST(req({ batchIds: ["b1"], type: "merge" }))).json()).resolves.toMatchObject({
+        jobId: null,
+        ready: true,
+      });
+      expect(listCalls).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+    });
   });
 
   it("400 invalid_refresh", async () => {

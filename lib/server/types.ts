@@ -272,6 +272,16 @@ export interface BatchDoc {
    * data is (or may be behind) incomplete — see PullShortfall. Absent on
    * documents written before it existed. */
   shortPull?: PullShortfall | null;
+  /** AI batches only: true when every row of the pull behind the published
+   * revision carried core's `analysis_sentiment_label` / `analysis_key_topics`
+   * list projection (keys present, values possibly null), i.e. its records'
+   * sentiment and key topics are real rather than blank for want of a column.
+   * Written by the worker on every AI publish, and on the short-pull path that
+   * keeps the published revision. False, absent or BSON null means the records
+   * predate the projection: an explicit refresh/merge re-pulls such a batch
+   * ONCE upstream is seen to project it (see analysis-projection.ts). Read it
+   * with `=== true`, never with a presence test. */
+  recordsAnalysisProjected?: boolean | null;
   /** Immutable record revision currently visible to readers. Older documents
    * without this field use the legacy unversioned record set. */
   publishedRevision?: string;

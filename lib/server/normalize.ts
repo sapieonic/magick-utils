@@ -139,6 +139,47 @@ function firstString(...values: unknown[]): string | null {
   return null;
 }
 
+/** A topic list as stored on a record: the string entries of an upstream
+ *  array, in upstream order (order is visible in the export and fingerprinted),
+ *  or null when upstream sent no array at all. An array that held nothing
+ *  usable stays an EMPTY array — "analysed, no topics" — rather than collapsing
+ *  to null, which is what this field has always meant; every reader treats the
+ *  two alike (`computeAggregates` sums `?? []`, the export renders ""). */
+function topicList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.filter((topic): topic is string => typeof topic === "string" && topic.trim() !== "");
+}
+
+/** A call's sentiment label and key topics, from whichever source carries them.
+ *
+ *  In order, per field:
+ *  1. `call_analysis.common.*` — the modern analysis shape;
+ *  2. `call_analysis.*` top-level — the legacy flat shape, which core's own
+ *     readers (`call-export.ts`, the batch-analytics rollup SQL) still COALESCE
+ *     in, so a row analysed before `common` existed reads the same here;
+ *  3. `analysis_sentiment_label` / `analysis_key_topics` — scalars core projects
+ *     onto the calls LIST and SEARCH rows, because the list deliberately omits
+ *     the `call_analysis` blob (it sends `call_analysis: null`). In practice this
+ *     is the only source a `/proxy/calls` row ever has; 1 and 2 cover a payload
+ *     that does carry the blob.
+ *
+ *  A blank or non-string label is no label. Topics take the first ARRAY found,
+ *  as core's `COALESCE(common->key_topics, key_topics)` does, so a present but
+ *  empty modern list is not silently replaced by a legacy one. */
+export function callAnalysisFields(raw: RawCall): { sentiment: string | null; keyTopics: string[] | null } {
+  const analysis = raw.call_analysis ?? null;
+  const common = analysis?.common ?? null;
+  const sentiment = firstString(
+    common?.overall_sentiment?.label,
+    analysis?.overall_sentiment?.label,
+    raw.analysis_sentiment_label,
+  );
+  const topicsSource = [common?.key_topics, analysis?.key_topics, raw.analysis_key_topics].find((value) =>
+    Array.isArray(value),
+  );
+  return { sentiment, keyTopics: topicList(topicsSource) };
+}
+
 export interface NormalizeCallOpts {
   selType: "ai" | "ivr";
   batchId: string;
@@ -152,8 +193,7 @@ export function normalizeCall(
   opts: NormalizeCallOpts,
 ): NormalizedRecord {
   const common = raw.call_analysis?.common ?? null;
-  const sentiment = common?.overall_sentiment?.label ?? null;
-  const keyTopics = Array.isArray(common?.key_topics) ? common?.key_topics ?? null : null;
+  const { sentiment, keyTopics } = callAnalysisFields(raw);
   const timestamp = firstString(raw.timestamps?.ended_at, raw.ended_at, raw.created_at);
   const activityTimestamp = isoTimestamp(
     firstString(
@@ -311,6 +351,10 @@ export interface BuildBatchDocOpts {
    *  an explicit null when absent so a complete publish CLEARS a previous one:
    *  `publishBatchIfOwned` is a `$set`, which leaves an omitted key in place. */
   shortPull?: BatchDoc["shortPull"];
+  /** See BatchDoc.recordsAnalysisProjected. Pass an explicit boolean for an AI
+   *  batch: `publishBatchIfOwned` is a `$set`, so it is the value written that
+   *  replaces the previous revision's, and an omitted one is stored as null. */
+  recordsAnalysisProjected?: boolean;
   publishedRevision?: string;
   ingestStatus?: BatchDoc["ingestStatus"];
   /** Override total (e.g. from a job's total_contacts); defaults to records.length. */
@@ -375,6 +419,7 @@ export function buildBatchDoc(
     ingestedRecordsStamp: opts.ingestedRecordsStamp,
     ingestedListedTotal: opts.ingestedListedTotal,
     shortPull: opts.shortPull ?? null,
+    recordsAnalysisProjected: opts.recordsAnalysisProjected,
     publishedRevision: opts.publishedRevision,
     ingestStatus: opts.ingestStatus ?? "ready",
     updatedAt: new Date().toISOString(),

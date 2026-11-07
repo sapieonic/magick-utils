@@ -58,6 +58,10 @@ export interface RawCallAnalysisCommon {
 export interface RawCallAnalysis {
   common?: RawCallAnalysisCommon | null;
   custom?: Record<string, unknown> | null;
+  /** Legacy flat shape: rows analysed before the `common` envelope existed
+   *  carry these at the top level. Core's own readers still fall back to them. */
+  overall_sentiment?: RawSentiment | null;
+  key_topics?: unknown[] | null;
 }
 
 export interface RawConversationTurn {
@@ -103,7 +107,17 @@ export interface RawCall {
   ended_at?: string | null;
   conversation_log?: RawConversationTurn[] | null;
   analysis_status?: string | null;
+  /** Always `null` on list/search rows: core's calls LIST omits the heavy
+   *  JSONB from its projection (see `analysis_sentiment_label` below). */
   call_analysis?: RawCallAnalysis | null;
+  /** Post-call sentiment label, projected by core onto every AI calls list and
+   *  search row as a scalar. PRESENT (possibly null) on every row from a core
+   *  that projects it and ABSENT on rows from an older core — the presence of
+   *  the key, not its value, is what says which (see analysis-projection.ts). */
+  analysis_sentiment_label?: string | null;
+  /** Post-call key topics, projected alongside `analysis_sentiment_label`;
+   *  same present-vs-absent contract. */
+  analysis_key_topics?: unknown[] | null;
   created_at?: string | null;
   // IVR / static-call extras we tolerate but don't strictly type
   dtmf_input?: string | null;

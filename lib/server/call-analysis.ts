@@ -8,6 +8,7 @@
 // `call_analysis` JSONB, and core's response formatter emits
 // `call_analysis: null` rather than omitting the key — so from our side every
 // call in the fleet looks like a call whose analysis never ran.
+// For records pulled from a core that predates the list scalars (below),
 // `normalizeCall` therefore writes `sentiment: null` / `keyTopics: null` on
 // every record, `computeAggregates` sums those to empty series, and both cards
 // render their empty state while duration and talk-time (ordinary list columns)
@@ -22,18 +23,24 @@
 // top-10s merged approximately on this side.
 //
 // The trade-off this accepts: these are SELECTION-SCOPED ROLLUPS, not per-record
-// fields. They cannot reach the CSV export or anything else that reads a
-// `NormalizedRecord`. Closing that gap needs core to project the two values as
-// scalars onto the calls list — which it already does for the WebRTC dialer list
-// (`analysis_sentiment_label` in `WEBRTC_LIST_COLUMNS`), just not for AI calls.
-// This module is written to survive that landing: it only ever fills a series
-// that is EMPTY, so once records carry their own analysis the record-derived
-// values win and this quietly becomes a no-op.
+// fields, so they cannot reach the CSV export. Core has since closed that from
+// its side: AI list/search rows carry `analysis_sentiment_label` and
+// `analysis_key_topics` scalars, `normalizeCall` reads them, and records pulled
+// from such a core carry their own analysis (the batch is then marked
+// `recordsAnalysisProjected`; see analysis-projection.ts for the one-off re-pull
+// that upgrades batches ingested before it). This module is now the FALLBACK:
+//   - every batch marked → the records describe the whole selection; a series
+//     they carry is never overwritten, and only an empty one is asked for;
+//   - any batch unmarked → the records' values (if any) cover only the upgraded
+//     batches, a partial count, so the rollup — exact over every batch — wins.
+// It stays for as long as pre-projection batches can exist: until retention
+// (DATA_RETENTION_DAYS) has deleted the last one ingested from an older core.
 
 import { MagickApiError, MagickClient, type RawBatchAnalytics } from "./magick-client";
 import { persistRefreshedCredential } from "./session";
 import { MAX_TOPICS, SENTIMENT_ORDER, sentimentDisplayName } from "./aggregate";
 import { log } from "./logger";
+import { recordsAnalysisAuthoritative } from "./analysis-projection";
 import type { AggregatesDoc, BatchDoc, TenantContext } from "./types";
 import type { SelType } from "@/lib/types";
 
@@ -176,10 +183,11 @@ export function toTopicSeries(raw: RawBatchAnalytics | null): AggregatesDoc["top
  * Return `agg` with its sentiment and topic series filled from core's post-call
  * analysis, plus whether the result is safe to cache.
  *
- * Never destructive: a series that already has values is left alone, so if the
- * records ever start carrying their own analysis (see the header note on the
- * core-side projection) the per-record numbers keep precedence and this call
- * becomes a no-op. Enrichment is best-effort by design — the rest of the tab is
+ * Never destructive when the records are authoritative (every batch marked
+ * `recordsAnalysisProjected`): a series that already has values is left alone
+ * and, with both present, this is a no-op that asks upstream nothing. In a
+ * mixed selection a non-empty record series is partial, so the rollup replaces
+ * it (see the header). Enrichment is best-effort by design — the rest of the tab is
  * already computed and correct, and failing the whole request over the two cards
  * this is meant to fill would be a strictly worse outcome for the customer.
  */
@@ -191,8 +199,15 @@ export async function enrichWithCallAnalysis(
   agg: AggregatesDoc,
 ): Promise<EnrichedAggregates> {
   const selType: SelType | undefined = batches[0]?.selType;
-  const hasSentiment = (agg.sentiment?.length ?? 0) > 0;
-  const hasTopics = (agg.topics?.length ?? 0) > 0;
+  // Record-derived series only take precedence when they describe the WHOLE
+  // selection, i.e. every batch was pulled from a core that projects the
+  // analysis columns. In a mixed selection (one batch upgraded, one ingested
+  // before the projection) the records hold the upgraded batch's values only,
+  // so a non-empty series is a partial count — keeping it would under-report
+  // while looking complete. There the rollup, exact over every batch, wins.
+  const authoritative = recordsAnalysisAuthoritative(batches);
+  const hasSentiment = authoritative && (agg.sentiment?.length ?? 0) > 0;
+  const hasTopics = authoritative && (agg.topics?.length ?? 0) > 0;
   if (!isAnalysable(selType) || agg.totalRecords === 0 || (hasSentiment && hasTopics)) {
     return { aggregate: agg, status: "skipped", cacheable: true };
   }
@@ -244,8 +259,16 @@ export async function enrichWithCallAnalysis(
     return { aggregate: { ...agg, analysisUnavailable: true }, status: "failed", cacheable: false };
   }
 
-  const sentiment = hasSentiment ? agg.sentiment : toSentimentSeries(raw);
-  const topics = hasTopics ? agg.topics : toTopicSeries(raw);
+  // Keep the records' series when they are authoritative — and, in a mixed
+  // selection, when the rollup came back empty for a series the records do
+  // carry: impossible for a consistent upstream (the rollup reads the same
+  // rows), but a partial count still beats replacing real values with nothing.
+  const rollupSentiment = toSentimentSeries(raw);
+  const rollupTopics = toTopicSeries(raw);
+  const keepRecords = (authoritativeSeries: boolean, recorded: unknown[] | undefined, rollup: unknown[] | undefined) =>
+    authoritativeSeries || ((rollup?.length ?? 0) === 0 && (recorded?.length ?? 0) > 0);
+  const sentiment = keepRecords(hasSentiment, agg.sentiment, rollupSentiment) ? agg.sentiment : rollupSentiment;
+  const topics = keepRecords(hasTopics, agg.topics, rollupTopics) ? agg.topics : rollupTopics;
   log().info(
     {
       batchCount: jobIds.length,

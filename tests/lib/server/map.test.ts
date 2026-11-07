@@ -246,6 +246,20 @@ describe("bulkJobToBatchDoc", () => {
     expect(batchDocToBatch(cleared).shortfall).toBeNull();
   });
 
+  // The listing is written with `$set`, so dropping the analysis-projection
+  // marker here would store null and send every upgraded AI batch back through
+  // the one-off upgrade re-pull on its next explicit refresh.
+  it("carries the analysis-projection marker through the listing", () => {
+    const job: RawBulkJob = { id: "ai", dispatch_type: "ai_voice_call", status: "completed", total_contacts: 3 };
+    const source = bulkJobToBatchDoc(job, ctx);
+    const committed: BatchDoc = {
+      ...source, total: 3, ingestStatus: "ready", ingestedSourceFingerprint: source.sourceFingerprint,
+      ingestedListedTotal: 3, publishedRevision: "revision-1", recordsAnalysisProjected: true,
+    };
+    expect(bulkJobToBatchDoc(job, ctx, committed).recordsAnalysisProjected).toBe(true);
+    expect(bulkJobToBatchDoc(job, ctx, { ...committed, recordsAnalysisProjected: false }).recordsAnalysisProjected).toBe(false);
+  });
+
   // A short pull of a job still dispatching is recorded — its time is what
   // rate-limits merge re-pulls — but it says nothing about upstream, so no
   // reader is told "upstream returned incomplete data". It still keeps the

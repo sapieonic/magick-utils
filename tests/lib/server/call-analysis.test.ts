@@ -37,11 +37,17 @@ const ctx = { tenantId: "t1", accountId: "a1", idToken: "tk" } as never;
 /** BatchDocs for the selection in `agg()` below. `batchId` and `sourceId` are
  *  deliberately DIFFERENT here: they happen to be equal in production today,
  *  which would let a regression to `batchId` pass unnoticed. */
-function docs(selType: SelType = "ai"): BatchDoc[] {
+function docs(selType: SelType = "ai", recordsAnalysisProjected?: boolean | null): BatchDoc[] {
   return [
-    { batchId: "b1", sourceId: "job-1", selType } as BatchDoc,
-    { batchId: "b2", sourceId: "job-2", selType } as BatchDoc,
+    { batchId: "b1", sourceId: "job-1", selType, recordsAnalysisProjected } as BatchDoc,
+    { batchId: "b2", sourceId: "job-2", selType, recordsAnalysisProjected } as BatchDoc,
   ];
+}
+
+/** Every batch pulled from a core that projects the analysis columns, so the
+ *  record-derived series describe the whole selection. */
+function projectedDocs(): BatchDoc[] {
+  return docs("ai", true);
 }
 
 /** A computed aggregate as the record path leaves it: everything else present,
@@ -197,13 +203,14 @@ describe("enrichWithCallAnalysis", () => {
   });
 
   it("never overwrites series the records already carry", async () => {
-    // Forward compatibility: once core projects sentiment/topics onto the calls
-    // list, the per-record numbers are the better answer and this must no-op.
+    // Once core projects sentiment/topics onto the calls list and every batch
+    // was pulled from it, the per-record numbers are the answer: no-op, and no
+    // upstream call.
     const existing = agg({
       sentiment: [{ name: "Positive", value: 3 }],
       topics: [{ topic: "from records", count: 2, sentiment: "neutral" }],
     });
-    const { aggregate, status } = await enrichWithCallAnalysis(ctx, docs(), existing);
+    const { aggregate, status } = await enrichWithCallAnalysis(ctx, projectedDocs(), existing);
 
     expect(status).toBe("skipped");
     expect(batchAnalytics).not.toHaveBeenCalled();
@@ -216,10 +223,75 @@ describe("enrichWithCallAnalysis", () => {
       sentiment_distribution: [{ label: "neutral", count: 9 }],
       key_topics: [{ topic: "upstream", count: 4 }],
     });
-    const { aggregate } = await enrichWithCallAnalysis(ctx, docs(), agg({ sentiment: [{ name: "Positive", value: 3 }] }));
+    const { aggregate } = await enrichWithCallAnalysis(
+      ctx,
+      projectedDocs(),
+      agg({ sentiment: [{ name: "Positive", value: 3 }] }),
+    );
 
     expect(aggregate.sentiment).toEqual([{ name: "Positive", value: 3 }]);
     expect(aggregate.topics).toEqual([{ topic: "upstream", count: 4, sentiment: "neutral" }]);
+  });
+
+  it("no-ops end to end on records normalized from a projecting core's list rows", async () => {
+    const { normalizeCall } = await import("@/lib/server/normalize");
+    const { computeAggregates } = await import("@/lib/server/aggregate");
+    const opts = { selType: "ai" as const, batchId: "b1", fingerprint: "fp" };
+    const records = [
+      normalizeCall({ call_id: "c1", status: "completed", call_analysis: null, analysis_sentiment_label: "positive", analysis_key_topics: ["refund"] }, ctx, opts),
+      normalizeCall({ call_id: "c2", status: "completed", call_analysis: null, analysis_sentiment_label: "negative", analysis_key_topics: ["refund", "callback"] }, ctx, opts),
+    ];
+    const computed = computeAggregates(records, ["b1", "b2"], ctx, "agg-key");
+    expect(computed.sentiment?.length).toBeGreaterThan(0);
+    expect(computed.topics?.length).toBeGreaterThan(0);
+
+    const { aggregate, status } = await enrichWithCallAnalysis(ctx, projectedDocs(), computed);
+
+    expect(status).toBe("skipped");
+    expect(batchAnalytics).not.toHaveBeenCalled();
+    expect(aggregate.sentiment).toBe(computed.sentiment);
+    expect(aggregate.topics).toBe(computed.topics);
+  });
+
+  it("still asks the rollup for an empty series when every batch is projected", async () => {
+    // Projected but empty is "no call analysed" — which the rollup would say
+    // too — or a core whose scalars are broken. Asking keeps the fallback.
+    batchAnalytics.mockResolvedValue({ sentiment_distribution: [{ label: "neutral", count: 9 }] });
+    const { aggregate, status } = await enrichWithCallAnalysis(ctx, projectedDocs(), agg());
+    expect(status).toBe("ok");
+    expect(aggregate.sentiment).toEqual([{ name: "Neutral", value: 9 }]);
+  });
+
+  it("prefers the rollup over a PARTIAL record series in a mixed selection", async () => {
+    // b1 upgraded (records carry values), b2 ingested before core projected
+    // the columns (records blank): the record series counts b1 only. Keeping
+    // it would under-report the selection while looking complete.
+    batchAnalytics.mockResolvedValue({
+      sentiment_distribution: [{ label: "positive", count: 3 }, { label: "negative", count: 5 }],
+      key_topics: [{ topic: "both batches", count: 8 }],
+    });
+    const mixed = [
+      { batchId: "b1", sourceId: "job-1", selType: "ai", recordsAnalysisProjected: true } as BatchDoc,
+      { batchId: "b2", sourceId: "job-2", selType: "ai", recordsAnalysisProjected: null } as BatchDoc,
+    ];
+    const partial = agg({
+      sentiment: [{ name: "Positive", value: 3 }],
+      topics: [{ topic: "b1 only", count: 3, sentiment: "neutral" }],
+    });
+    const { aggregate, status } = await enrichWithCallAnalysis(ctx, mixed, partial);
+
+    expect(status).toBe("ok");
+    expect(batchAnalytics).toHaveBeenCalledWith(["job-1", "job-2"]);
+    expect(aggregate.sentiment).toEqual([{ name: "Positive", value: 3 }, { name: "Negative", value: 5 }]);
+    expect(aggregate.topics).toEqual([{ topic: "both batches", count: 8, sentiment: "neutral" }]);
+  });
+
+  it("keeps a partial record series when a mixed selection's rollup is empty for it", async () => {
+    batchAnalytics.mockResolvedValue({ sentiment_distribution: [], key_topics: [{ topic: "t", count: 1 }] });
+    const partial = agg({ sentiment: [{ name: "Positive", value: 3 }] });
+    const { aggregate } = await enrichWithCallAnalysis(ctx, docs("ai", false), partial);
+    expect(aggregate.sentiment).toEqual([{ name: "Positive", value: 3 }]);
+    expect(aggregate.topics).toEqual([{ topic: "t", count: 1, sentiment: "neutral" }]);
   });
 
   it("degrades rather than failing the request when upstream errors", async () => {

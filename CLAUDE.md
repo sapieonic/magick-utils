@@ -126,13 +126,20 @@ re-mints a near-expired token. The only exception is a route that runs *before* 
 `/login` mid-session — `/api/accounts` was the last route still doing it, and it bounced anyone who
 clicked "Switch workspace" after idling. See BACKEND.md → *Token refresh*.
 
-The Conversation tab's **Sentiment and Key topics cannot be computed from the records** — core's calls
-list omits the `call_analysis` JSONB from its projection and sends the key as `null`, so every record
-normalizes to "no analysis". They come from core's own rollup via `lib/server/call-analysis.ts`
-(AI selections only, best-effort). Don't "fix" an empty `sentiment`/`topics` series by reaching for
-the records. **Bump `AGGREGATES_VERSION` whenever how these are computed changes** — `/api/analytics`
-serves a cache hit before enrichment runs, so otherwise every pre-deploy selection keeps its old empty
-doc. See BACKEND.md → *Sentiment and key topics*.
+**Sentiment and Key topics have two sources, and which one wins depends on the batch.** Core's calls list
+omits the `call_analysis` JSONB (it sends `null`), so records ingested from an older core carry no
+analysis at all. Core now projects `analysis_sentiment_label` / `analysis_key_topics` onto every AI list
+row — present (possibly null) on a projecting core, absent on an older one — and `normalizeCall` reads
+`call_analysis.common.*`, then the legacy flat `call_analysis.*`, then those scalars, so records pulled
+from it carry real values and the CSV export's `sentiment`/`key_topics` columns fill. The worker marks
+such a batch `recordsAnalysisProjected` (every row of the pull carried the KEYS — presence, not value);
+core's rollup via `lib/server/call-analysis.ts` stays the fallback, and wins outright for any selection
+holding an unmarked batch, since its records would give a partial count. **A core deploy that only adds
+list columns moves no records stamp**, so already-ingested AI batches are re-pulled once — on an explicit
+Refresh or merge only, and only after a one-row probe shows upstream emits the keys
+(`lib/server/analysis-projection.ts`); never make that path unconditional. **Bump `AGGREGATES_VERSION`
+whenever how these are computed changes** — `/api/analytics` serves a cache hit before enrichment runs,
+so otherwise every pre-deploy selection keeps its old doc. See BACKEND.md → *Sentiment and key topics*.
 
 ## Status
 - ✅ Full UI ported from the design handoff. `npm run dev`, `npm run build`, `npx tsc --noEmit` pass.
