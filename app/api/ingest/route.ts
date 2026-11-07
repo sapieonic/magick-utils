@@ -5,6 +5,7 @@ import { getSession, getTenantContext, persistRefreshedCredential } from "@/lib/
 import { TokenRefreshPermanentError } from "@/lib/server/firebase-token";
 import { MagickClient } from "@/lib/server/magick-client";
 import { jobStoppedAddingRows } from "@/lib/server/job-state";
+import { createAnalysisProjectionProbe } from "@/lib/server/analysis-projection";
 import { bulkJobIsUnchangedSince } from "@/lib/server/map";
 import { bulkJobRecordsStamp } from "@/lib/server/records-stamp";
 import {
@@ -59,6 +60,7 @@ async function refreshableBatchIds(
   complete: boolean[],
 ): Promise<string[]> {
   const client = new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential });
+  const analysisUpgradeDue = createAnalysisProjectionProbe(client);
   const keep: string[] = [];
   for (let i = 0; i < batchIds.length; i += REFRESH_CHECK_CONCURRENCY) {
     const slice = batchIds.slice(i, i + REFRESH_CHECK_CONCURRENCY);
@@ -100,6 +102,17 @@ async function refreshableBatchIds(
           // core row of the job was written since — not merely since the pull
           // finished. A `null` on either side never matches.
           if (bulkJobIsUnchangedSince(job, batch.ingestedRecordsStamp)) {
+            // The one exception to the skip: an AI batch ingested before core
+            // projected post-call analysis onto the calls list. That deploy
+            // writes no call row, so the stamp cannot see it, and without this
+            // the batch's sentiment/key_topics stay blank forever. Re-pulled
+            // only once a one-row probe shows upstream now emits the columns —
+            // before that a re-pull would just write another copy of the same
+            // nulls — and only until the worker marks the batch upgraded.
+            if (await analysisUpgradeDue(batch)) {
+              log().info({ batchId }, "refresh re-pulling — upstream now projects call analysis this batch predates");
+              return batchId;
+            }
             log().info({ batchId }, "refresh skipped — upstream job untouched since last ingestion");
             return null;
           }
@@ -269,6 +282,28 @@ export const POST = withLogging("ingest", async (req: Request) => {
         slice.forEach((index, offset) => {
           if (!current[offset]) complete[index] = false;
         });
+      }
+    }
+    // A merge also takes the one-off analysis upgrade (see analysis-projection.ts)
+    // for a batch it would otherwise serve as it stands. The merge feeds the CSV
+    // export, the one surface that reads sentiment/key_topics off the records —
+    // Analytics already fills both cards from core's rollup — and those columns
+    // are ticked by default, so a merge that kept serving the pre-projection
+    // revision would hand the customer the blank columns this exists to fix, with
+    // nothing on the Combine screen hinting that Analytics → Refresh would help.
+    // Bounded the same way as the refresh: an explicit Generate, one re-pull per
+    // batch ever (the worker then marks it), none at all until the probe — one
+    // `limit=1` call per request, memoised — sees upstream projecting. A plain
+    // Analytics load is NOT given it: that path never re-pulls.
+    //
+    // Evaluated after the cooldown check so a batch already being re-pulled
+    // for completeness costs no probe.
+    if (type === "merge") {
+      const analysisUpgradeDue = createAnalysisProjectionProbe(
+        new MagickClient(ctx, { onCredentialRefresh: persistRefreshedCredential }),
+      );
+      for (let index = 0; index < requestedBatchIds.length; index++) {
+        if (complete[index] && (await analysisUpgradeDue(batchDocs[index]))) complete[index] = false;
       }
     }
     batchIds = forceRefresh

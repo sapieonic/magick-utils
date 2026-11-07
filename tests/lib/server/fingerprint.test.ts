@@ -56,7 +56,7 @@ describe("batchSetKey", () => {
 
 describe("aggregatesKey", () => {
   it("includes the aggregate cache shape version", () => {
-    expect(aggregatesKey(["b", "a"])).toBe(`${batchSetKey(["a", "b"])}:legacy:v7`);
+    expect(aggregatesKey(["b", "a"])).toBe(`${batchSetKey(["a", "b"])}:legacy:v8`);
   });
 });
 

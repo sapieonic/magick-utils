@@ -36,8 +36,10 @@ the worker when the backend is configured.
 - `map.ts` — `BatchDoc` ↔ frontend `Batch`; bulk-job → `BatchDoc`. **Batch is keyed by the upstream source id.**
 - `db.ts` / `repositories.ts` — cached Mongo client, collections, indexes, tenant-scoped repo functions.
 - `aggregate.ts` — compute analytics aggregates from records.
-- `call-analysis.ts` — fills the Conversation tab's Sentiment and Key topics from core's rollup,
-  because the records cannot carry them (see *Sentiment and key topics* below).
+- `call-analysis.ts` — fills the Conversation tab's Sentiment and Key topics from core's rollup
+  when the records cannot (see *Sentiment and key topics* below).
+- `analysis-projection.ts` — whether a batch's records came from a core that projects call analysis
+  onto the calls list, and the one-off, probe-gated upgrade re-pull for those that did not.
 - `fingerprint.ts` — stable hashes for cache keys / change detection.
 - `record-fingerprint.ts` — content fingerprint of a record set (`BatchDoc.fingerprint`); covers every
   reader-visible field (see *Pull completeness*).
@@ -119,14 +121,75 @@ Notes for anyone changing this:
 
 ### Sentiment and key topics
 
-**These two series do not come from the ingested records, and cannot.** Everything else on the
-Analytics → Conversation tab is derived from `NormalizedRecord`s pulled from magick-master's
-`/proxy/calls` → core's calls LIST. That list projects a column subset which deliberately excludes the
-heavy `call_analysis` JSONB, and core's formatter emits `call_analysis: null` rather than omitting the
-key — so from here every call in the fleet is indistinguishable from a call whose analysis never ran.
-`normalizeCall` writes `sentiment: null` / `keyTopics: null` on every record and both cards render
-their empty state, while duration and talk-time (ordinary list columns) render fine. The analysis
-itself completes normally upstream; this is purely a read-path projection gap.
+**Two sources, and the batch decides which one is in charge.** Core's calls LIST projects a column subset
+that deliberately excludes the heavy `call_analysis` JSONB, and its formatter emits `call_analysis: null`
+rather than omitting the key — so a record ingested from an older core is indistinguishable from a call
+whose analysis never ran, and the CSV export's `sentiment`/`key_topics` columns (the first ticked by
+default for AI batches) came out blank on every row.
+
+1. **Per-record, from the list.** Core now projects two scalars onto every AI calls list and search row,
+   which master forwards verbatim: `analysis_sentiment_label: string | null` and
+   `analysis_key_topics: string[] | null`. Both keys are PRESENT (possibly null) on every row from a core
+   that projects them and ABSENT on rows from an older one. `normalizeCall` (`callAnalysisFields`) takes,
+   per field, `call_analysis.common.*`, then the legacy flat `call_analysis.*` (what core's own
+   `call-export.ts` and rollup SQL COALESCE in), then the scalars. Labels must be non-blank strings;
+   topics take the first ARRAY found (core's `COALESCE(common->key_topics, key_topics)`), keep only
+   non-blank strings in upstream order, and an analysed call with no topics stays `[]` rather than
+   collapsing into `null` ("no analysis") — every reader treats the two alike, the fingerprint does not.
+2. **Selection rollups, from core's analytics** (below) — the fallback for records pulled before the
+   projection existed.
+
+**`BatchDoc.recordsAnalysisProjected`** is what tells them apart. The worker writes it on every AI publish
+— `true` only when EVERY row the pull returned carried both keys (presence, not value: a batch nobody
+analysed is fully upgraded), explicit `false` otherwise — and on the short-pull path that keeps the
+published revision, because an upgrade pull of unanalysed calls fingerprints identically to what it
+replaces (null fingerprints as absent) and would otherwise never be marked. Carried rows do not count:
+nothing re-reads them, so counting them would only make the upgrade loop. The residual that leaves: after
+a SHORT upgrade pull, rows carried forward from the previous revision keep their blank analysis while the
+batch reads `true`, so they stay blank in the export until a later pull — the completeness re-pull a
+short batch already gets — returns them; rare now that core's list order has an `id` tiebreak. `bulkJobToBatchDoc` carries it
+through every listing (it is a `$set`; dropping it stores null). Read it with `=== true`.
+
+**The upgrade re-pull.** A core deploy that only adds list columns writes no call row, so master's
+`records_updated_at` does not move and `bulkJobIsUnchangedSince` proves every already-ingested AI batch
+unchanged forever — Refresh included. `POST /api/ingest` therefore makes one exception, bounded on every
+side so it cannot become a mass or repeated re-ingest:
+
+- **Only an explicit action on that batch**: Analytics → Refresh (`refreshableBatchIds`, at the
+  unchanged-stamp skip) and a merge (Combine → Generate), which feeds the CSV export — the one surface
+  that reads these fields off the records, and the one that showed the blank columns. A plain Analytics
+  load never re-pulls; the listing never enqueues anything.
+- **Only `dispatchType === "ai_voice_call"` batches not marked `true`** (`needsAnalysisUpgrade`). IVR,
+  static and messaging batches are untouched, and so is a batch whose published revision holds no
+  records (`total === 0`): there is nothing to upgrade, and an empty pull can never earn the marker, so
+  once another batch of the request had settled the probe to "projects" it would re-pull on every click.
+  `recordsAnalysisAuthoritative` exempts such a batch for the same reason.
+- **Only once upstream projects.** `createAnalysisProjectionProbe` lists ONE row of the job
+  (`listCalls`, `limit: 1`) on the surface the worker pages and checks for the keys. Before core deploys
+  it says no and nothing is re-pulled — a re-pull then would only write another copy of the same nulls,
+  every click. Memoised per request (a deployment property, not a batch one), so a 50-batch selection
+  costs one call; an empty job says nothing and the next candidate is asked.
+- **A probe failure means "no upgrade"**, unlike a failed source check (which re-ingests to be safe). The
+  stamp has already proven the records current in every field upstream can change; re-pulling on
+  "unknown" would turn every click during a master outage into a duplicate dataset. The failure is
+  memoised for the request too. A permanently dead credential is rethrown (401, session cleared).
+- **Once per batch.** The re-pull's publish stamps the marker, after which the batch takes the normal
+  skip again. A pull that straddles a rolling core deploy (pages served by old and new replicas) is left
+  unmarked on purpose, so the next explicit action finishes it rather than stranding the old rows blank.
+  The duplicate it writes is reclaimed by the superseded-revision sweep like any other.
+- **Bounded in time by retention.** `DATA_RETENTION_DAYS` (default 5) deletes old batches anyway, so the
+  population of pre-projection batches drains on its own within that window.
+
+**Enrichment precedence.** `enrichWithCallAnalysis` treats the record-derived series as authoritative
+only when EVERY batch in the selection is marked (`recordsAnalysisAuthoritative`): then it never
+overwrites a series the records carry, and asks the rollup only for an empty one. In a mixed selection
+(one batch upgraded, one not) the records hold the upgraded batch's values only, so a non-empty series is
+a partial count; there the rollup — exact over every batch — replaces it (unless it came back empty for
+that series, when the partial count is kept rather than replaced by nothing). When the rollup cannot be
+had in a mixed selection — any failure, settled refusals (which are cached) included — both series are
+BLANKED rather than served beside `analysisUnavailable`, which the Conversation tab reads only for its
+empty-state copy: a partial series next to the flag would render as the complete answer. An
+authoritative selection keeps its record-derived series on failure.
 
 `call-analysis.ts` therefore asks the one endpoint that can see the blob:
 `POST /bulk-dispatch-jobs/analytics` on magick-master, which fans out to core's
@@ -137,10 +200,8 @@ top-10s merged approximately here. Notes:
 - **AI selections only.** IVR and messaging runs have no conversation to analyse, and magick-master
   rejects a non-`ai_voice_call` job id with a 400 rather than an empty rollup.
 - **Selection-scoped rollups, not per-record fields.** They cannot reach the CSV export or anything
-  else reading a `NormalizedRecord`. Closing that needs core to project the two values as scalars onto
-  the calls list — which it already does for the WebRTC dialer list (`analysis_sentiment_label` in
-  `WEBRTC_LIST_COLUMNS`), just not for AI calls. The enrichment only ever fills an **empty** series, so
-  when that lands the per-record numbers win and this becomes a no-op.
+  else reading a `NormalizedRecord`; the list scalars above are what do. Once every batch of a selection
+  is marked, the per-record numbers win and this becomes a no-op unless a series is empty.
 - **Best-effort. Cacheability tracks "would asking again help?", not "did the call succeed?".**
   Those come apart both ways. A momentary failure (5xx, timeout, 401, 429) is `cacheable: false`:
   the cache key is a fingerprint of the batch set and its dataset, neither of which moves because a
@@ -152,6 +213,8 @@ top-10s merged approximately here. Notes:
 - **Either way the doc is marked `analysisUnavailable: true`**, so the Conversation tab says "couldn't
   load" instead of asserting the records carry no AI analysis. The two look identical on screen; only
   one of them is a fact about the customer's data.
+  In a mixed selection both series are also blanked (see *Enrichment precedence*), so the flag is
+  never served beside a partial series.
 - **Bump `AGGREGATES_VERSION` (`lib/server/fingerprint.ts`) whenever this changes.** `/api/analytics`
   serves a cache hit *before* enrichment runs, so without a bump every selection analysed before the
   deploy keeps serving its old empty doc until someone clicks Refresh or retention prunes it. The two
@@ -178,10 +241,6 @@ top-10s merged approximately here. Notes:
 - Applied at all four aggregate-computing routes (`analytics`, `insights`, `insights/compare`, `chat`)
   so the AI prose can never contradict the chart beside it.
 - Upstream caps the request at 50 job ids, which is exactly `MAX_SELECTION_BATCHES`.
-- **Known gap:** `normalizeCall` reads only the modern `call_analysis.common.*` shape, while core's
-  rollup SQL also COALESCEs a legacy top-level shape. Moot while the list carries no blob, but it
-  means the "record values win once core projects them" plan above would be correct by accident on
-  legacy-shaped rows. Fix `normalize.ts` alongside that core change, not before.
 
 ### Job-scoped list surfaces
 

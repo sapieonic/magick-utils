@@ -45,6 +45,7 @@ import { isTokenRefreshConfigured } from "./env";
 import { buildBatchDoc, normalizeCall, normalizeMessage } from "./normalize";
 import { jobFinishedDialling, jobStoppedAddingRows } from "./job-state";
 import { recordsContentFingerprint } from "./record-fingerprint";
+import { recordsCarryAnalysisProjection } from "./analysis-projection";
 import { bulkJobRecordsStamp } from "./records-stamp";
 import {
   isBatchReadable,
@@ -838,6 +839,20 @@ async function ingestBatch(
     await deleteCarriedRecords(ctx.tenantId, ctx.accountId, batchId, revision, { includePublished: resumingPublished });
   }
   const served = carried.length > 0 ? [...records, ...carried] : records;
+  // Whether this pull came from a core that projects post-call analysis onto
+  // the calls list (analysis-projection.ts). Judged on the rows this pull
+  // RETURNED: carried rows were not re-read, and no re-pull can reach them
+  // either, so counting them would only make the upgrade re-pull loop. Written
+  // on both outcomes below — a publish AND the short-pull path that keeps the
+  // published revision — because a SHORT upgrade pull of calls nobody analysed
+  // is content-identical to what it replaces (null values fingerprint as
+  // absent), takes the "unchanged" path, and would otherwise re-probe and
+  // re-pull on every click. Undefined for every other surface: the keep path
+  // drops undefined stamps (leaving the field as it was), while the publish
+  // `$set`s the whole doc and the driver stores the undefined as BSON null.
+  // Both are harmless — readers ask `=== true`, and the upgrade re-pull is
+  // `ai_voice_call`-only — but neither "leaves it alone" on publish.
+  const analysisProjected = dispatchType === "ai_voice_call" ? recordsCarryAnalysisProjection(records) : undefined;
   // Content fingerprint of exactly what would be served. Computed before the
   // decision because the decision uses it. It covers every field of every
   // record except storage metadata (see record-fingerprint.ts) — a hand-picked
@@ -914,6 +929,7 @@ async function ingestBatch(
         ingestedSourceFingerprint: batch.sourceFingerprint,
         ingestedRecordsStamp: recordsStamp,
         sourceTotal: sourceJob?.total_contacts ?? batch.sourceTotal,
+        recordsAnalysisProjected: analysisProjected,
       };
       if (!(await keepPublishedRevisionIfOwned(ctx.tenantId, ctx.accountId, batchId, jobId, leaseId, recorded, stamps))) {
         throw new Error("job lease lost while keeping the published revision");
@@ -1015,6 +1031,7 @@ async function ingestBatch(
     ingestedListedTotal: listedTotal ?? records.length,
     // Null on a complete pull, which is what clears a previous flag.
     shortPull,
+    recordsAnalysisProjected: analysisProjected,
     publishedRevision: revision,
     // A revision that may be short reads "stale" from the moment it is
     // published rather than waiting for the next listing to say so: readable,

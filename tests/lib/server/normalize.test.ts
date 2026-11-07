@@ -177,6 +177,99 @@ describe("normalizeCall", () => {
     expect(normalizeCall(raw, ctx, opts).keyTopics).toBeNull();
   });
 
+  describe("sentiment and key topics sources", () => {
+    it("reads core's list scalars — the shape every /proxy/calls row carries", () => {
+      const raw = makeRawCall({
+        call_analysis: null,
+        analysis_sentiment_label: "negative",
+        analysis_key_topics: ["refund", "callback"],
+      });
+      const rec = normalizeCall(raw, ctx, opts);
+      expect(rec.sentiment).toBe("negative");
+      expect(rec.keyTopics).toEqual(["refund", "callback"]);
+    });
+
+    it("reads the legacy flat call_analysis shape", () => {
+      const raw = makeRawCall({
+        call_analysis: { overall_sentiment: { label: "neutral" }, key_topics: ["legacy topic"] },
+      });
+      const rec = normalizeCall(raw, ctx, opts);
+      expect(rec.sentiment).toBe("neutral");
+      expect(rec.keyTopics).toEqual(["legacy topic"]);
+    });
+
+    it("prefers common.* over the legacy shape over the scalars", () => {
+      const all = makeRawCall({
+        call_analysis: {
+          common: { overall_sentiment: { label: "positive" }, key_topics: ["modern"] },
+          overall_sentiment: { label: "neutral" },
+          key_topics: ["legacy"],
+        },
+        analysis_sentiment_label: "negative",
+        analysis_key_topics: ["scalar"],
+      });
+      expect(normalizeCall(all, ctx, opts)).toMatchObject({ sentiment: "positive", keyTopics: ["modern"] });
+
+      const legacyAndScalar = makeRawCall({
+        call_analysis: { overall_sentiment: { label: "neutral" }, key_topics: ["legacy"] },
+        analysis_sentiment_label: "negative",
+        analysis_key_topics: ["scalar"],
+      });
+      expect(normalizeCall(legacyAndScalar, ctx, opts)).toMatchObject({ sentiment: "neutral", keyTopics: ["legacy"] });
+    });
+
+    it("falls through a blank or non-string label to the next source", () => {
+      const raw = makeRawCall({
+        call_analysis: { common: { overall_sentiment: { label: "  " } }, overall_sentiment: { label: 7 as never } },
+        analysis_sentiment_label: "positive",
+      });
+      expect(normalizeCall(raw, ctx, opts).sentiment).toBe("positive");
+    });
+
+    it("takes the first ARRAY of topics, so an empty modern list is not replaced by a legacy one", () => {
+      // Mirrors core's COALESCE(common->key_topics, key_topics).
+      const raw = makeRawCall({
+        call_analysis: { common: { key_topics: [] }, key_topics: ["legacy"] },
+        analysis_key_topics: ["scalar"],
+      });
+      expect(normalizeCall(raw, ctx, opts).keyTopics).toEqual([]);
+    });
+
+    it("keeps an analysed call with no topics as an empty list, distinct from 'no analysis'", () => {
+      expect(normalizeCall(makeRawCall({ analysis_key_topics: [] }), ctx, opts).keyTopics).toEqual([]);
+    });
+
+    it("drops non-string and blank topic entries, keeping upstream order", () => {
+      const raw = makeRawCall({ analysis_key_topics: ["b", 3, null, "", "  ", { t: 1 }, "a"] });
+      expect(normalizeCall(raw, ctx, opts).keyTopics).toEqual(["b", "a"]);
+    });
+
+    it("reads present-but-null scalars (an unanalysed call on a projecting core) as no analysis", () => {
+      const rec = normalizeCall(
+        makeRawCall({ call_analysis: null, analysis_sentiment_label: null, analysis_key_topics: null }),
+        ctx,
+        opts,
+      );
+      expect(rec.sentiment).toBeNull();
+      expect(rec.keyTopics).toBeNull();
+      // The keys stay in `raw` — their presence is what marks the batch as
+      // pulled from a projecting core (analysis-projection.ts).
+      expect(rec.raw).toHaveProperty("analysis_sentiment_label", null);
+      expect(rec.raw).toHaveProperty("analysis_key_topics", null);
+    });
+
+    it("is null on rows from a core that does not project the scalars (keys absent)", () => {
+      const rec = normalizeCall(makeRawCall({ call_analysis: null }), ctx, opts);
+      expect(rec.sentiment).toBeNull();
+      expect(rec.keyTopics).toBeNull();
+      expect(rec.raw).not.toHaveProperty("analysis_sentiment_label");
+    });
+
+    it("ignores a non-array scalar topic list", () => {
+      expect(normalizeCall(makeRawCall({ analysis_key_topics: "a; b" as never }), ctx, opts).keyTopics).toBeNull();
+    });
+  });
+
   it("timestamp prefers ended_at over created_at", () => {
     const raw = makeRawCall({ timestamps: { ended_at: "2026-01-02T00:00:00Z" }, created_at: "2026-01-01T00:00:00Z" });
     expect(normalizeCall(raw, ctx, opts).timestamp).toBe("2026-01-02T00:00:00Z");
@@ -362,6 +455,11 @@ describe("buildBatchDoc", () => {
     expect(doc).toHaveProperty("shortPull", null);
     const flagged = { listed: 3, received: 1, carried: 0, keptPrevious: false, settled: true, detectedAt: "x" };
     expect(buildBatchDoc([makeRecord()], ctx, baseOpts({ shortPull: flagged })).shortPull).toEqual(flagged);
+  });
+
+  it("passes the analysis-projection marker through for the publish to write", () => {
+    expect(buildBatchDoc([makeRecord()], ctx, baseOpts({ recordsAnalysisProjected: true })).recordsAnalysisProjected).toBe(true);
+    expect(buildBatchDoc([makeRecord()], ctx, baseOpts({ recordsAnalysisProjected: false })).recordsAnalysisProjected).toBe(false);
   });
 
   it("breakdown uses fixed order and only known keys", () => {

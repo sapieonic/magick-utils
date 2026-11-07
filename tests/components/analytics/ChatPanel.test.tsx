@@ -158,14 +158,22 @@ describe("ChatPanel — clear", () => {
   it("wipes the conversation back to the empty state", async () => {
     mockStreamChat.mockImplementation(async (_ids: string[], _msg: string, _history: { role: "user" | "assistant"; content: string }[], onDelta: (text: string) => void) => {
       onDelta("Settled answer.");
+      // Resolve a beat after the delta, as a real stream does, so the text is
+      // on screen while the panel is still streaming.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       return true;
     });
     renderPanel();
 
     fireEvent.click(screen.getByRole("button", { name: /Summarize the negative conversations/ }));
     await waitFor(() => expect(screen.getByText("Settled answer.")).toBeInTheDocument());
+    // The delta renders before streamChat resolves, and Clear stays disabled
+    // until it does; clicking a disabled button is a no-op, so wait for the
+    // stream to settle rather than for its text.
+    const clear = screen.getByRole("button", { name: /Clear/ });
+    await waitFor(() => expect(clear).toBeEnabled());
 
-    fireEvent.click(screen.getByRole("button", { name: /Clear/ }));
+    fireEvent.click(clear);
 
     // Conversation gone, starter prompts back.
     expect(screen.queryByText("Settled answer.")).not.toBeInTheDocument();

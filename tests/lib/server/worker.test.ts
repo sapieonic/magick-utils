@@ -1265,6 +1265,8 @@ describe("processJob incomplete upstream pull", () => {
         ingestedSourceFingerprint: "src-fp",
         ingestedRecordsStamp: bulkJobRecordsStamp(completed),
         sourceTotal: 3,
+        // An AI batch: these rows carry no analysis projection keys.
+        recordsAnalysisProjected: false,
       },
     );
     // The fresh observation re-arms the merge cooldown.
@@ -2037,5 +2039,101 @@ describe("runClaimedJob terminal failures", () => {
       { clearCredential: true },
     );
     expect(repositories.failBatchIfOwned).toHaveBeenCalledWith("t1", "a1", "b1", "j1", "lease-1");
+  });
+});
+
+// Core projects `analysis_sentiment_label` / `analysis_key_topics` onto the
+// calls list; the worker records whether the pull behind a revision carried
+// them, which is what stops the ingest route's one-off upgrade re-pull from
+// ever repeating (analysis-projection.ts).
+describe("processJob analysis-projection marker", () => {
+  const projected = (id: string) => ({
+    recordId: id,
+    status: "done",
+    raw: { call_id: id, call_analysis: null, analysis_sentiment_label: null, analysis_key_topics: null },
+  });
+  const legacy = (id: string) => ({ recordId: id, status: "done", raw: { call_id: id, call_analysis: null } });
+  const page = { calls: [{ id: "1" }, { id: "2" }], total: 2 };
+
+  afterEach(() => {
+    client.listCalls.mockReset();
+    client.listStaticCalls.mockReset();
+    repositories.getRecordsForRevision.mockReset();
+  });
+
+  it("marks an AI publish whose every row carried the projection keys — null values included", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 2 });
+    client.listCalls.mockResolvedValueOnce(page);
+    repositories.getRecordsForRevision.mockResolvedValue([projected("1"), projected("2")]);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.publishBatchIfOwned.mock.calls[0][0]).toMatchObject({ recordsAnalysisProjected: true });
+  });
+
+  it("writes an explicit false for rows from a core that does not project yet", async () => {
+    // Explicit, because the publish is a `$set`: an omitted key would leave a
+    // previous `true` behind a revision that no longer earns it.
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 2, recordsAnalysisProjected: true });
+    client.listCalls.mockResolvedValueOnce(page);
+    repositories.getRecordsForRevision.mockResolvedValue([legacy("1"), legacy("2")]);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.publishBatchIfOwned.mock.calls[0][0]).toMatchObject({ recordsAnalysisProjected: false });
+  });
+
+  it("does not mark a pull that straddled a rolling core deploy", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), total: 2 });
+    client.listCalls.mockResolvedValueOnce(page);
+    repositories.getRecordsForRevision.mockResolvedValue([projected("1"), legacy("2")]);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.publishBatchIfOwned.mock.calls[0][0]).toMatchObject({ recordsAnalysisProjected: false });
+  });
+
+  it("marks the batch on the short-pull path that keeps the published revision unchanged", async () => {
+    // The upgrade re-pull of calls nobody analysed: every value is null, so its
+    // content fingerprint matches the pre-projection revision (null fingerprints
+    // as absent) and nothing is published. Without the marker on THIS path the
+    // batch would re-probe and re-pull on every click.
+    const publishedFp = recordsContentFingerprint([legacy("1"), legacy("2")] as never);
+    repositories.getBatch.mockResolvedValue({
+      ...batch("b1"), total: 2, fingerprint: publishedFp, ingestStatus: "stale", publishedRevision: "old-rev",
+      ingestedListedTotal: 3,
+      shortPull: { listed: 3, received: 2, carried: 0, keptPrevious: false, settled: true, detectedAt: "2026-10-01T00:00:00Z" },
+    });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "ai_voice_call", status: "completed" });
+    client.listCalls.mockResolvedValueOnce({ calls: [{ id: "1" }, { id: "2" }], total: 3 });
+    repositories.getRecordsForRevision.mockResolvedValue([projected("1"), projected("2")]);
+    expect(recordsContentFingerprint([projected("1"), projected("2")] as never)).toBe(publishedFp);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    expect(repositories.publishBatchIfOwned).not.toHaveBeenCalled();
+    expect(repositories.keepPublishedRevisionIfOwned).toHaveBeenCalledWith(
+      "t1", "a1", "b1", "j1", "lease-1",
+      expect.anything(),
+      expect.objectContaining({ recordsAnalysisProjected: true }),
+    );
+  });
+
+  it("never marks another surface — even from rows that carry the projection keys", async () => {
+    repositories.getBatch.mockResolvedValue({ ...batch("b1"), selType: "ivr", total: 2 });
+    client.getBulkJob.mockResolvedValue({ id: "source-b1", dispatch_type: "static_call", status: "completed" });
+    client.listStaticCalls.mockResolvedValueOnce(page);
+    repositories.getRecordsForRevision.mockResolvedValue([projected("1"), projected("2")]);
+
+    await processJob(job({ batchIds: ["b1"], total: 2 }));
+
+    const published = repositories.publishBatchIfOwned.mock.calls[0][0];
+    // What is WRITTEN: the publish `$set`s the whole doc and the driver is not
+    // configured with `ignoreUndefined`, so this present-but-undefined key is
+    // stored as BSON null — it replaces, it does not "leave alone". Harmless:
+    // every reader asks `=== true`, and the upgrade is ai_voice_call-only.
+    expect(Object.prototype.hasOwnProperty.call(published, "recordsAnalysisProjected")).toBe(true);
+    expect(published.recordsAnalysisProjected).toBeUndefined();
+    expect(published.recordsAnalysisProjected).not.toBe(true);
   });
 });

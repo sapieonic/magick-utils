@@ -222,7 +222,10 @@ export async function failBatchIfOwned(
  *  state this pull observed. A key left `undefined` is not written; a `null` is
  *  (see `keepPublishedRevisionIfOwned`). */
 export type KeptRevisionStamps = Partial<
-  Pick<BatchDoc, "ingestedListedTotal" | "ingestedSourceFingerprint" | "ingestedRecordsStamp" | "sourceTotal">
+  Pick<
+    BatchDoc,
+    "ingestedListedTotal" | "ingestedSourceFingerprint" | "ingestedRecordsStamp" | "sourceTotal" | "recordsAnalysisProjected"
+  >
 >;
 
 /** Leave the published revision in place after a pull that came back short,

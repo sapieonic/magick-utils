@@ -320,6 +320,10 @@ export function bulkJobToBatchDoc(job: RawBulkJob, ctx: TenantContext, existing?
     // the one kept in its place), not about this listing, so it survives every
     // listing until a pull is complete.
     shortPull: existing?.shortPull ?? null,
+    // Also about the published revision. Carried, never re-derived: this doc is
+    // written with `$set`, so leaving the key out stores null and would send
+    // every upgraded AI batch back through the upgrade re-pull.
+    recordsAnalysisProjected: existing?.recordsAnalysisProjected,
     publishedRevision: existing?.publishedRevision,
     // "stale" keeps the published revision readable — analytics and exports
     // keep working off it — while marking that a refresh has something to pull.

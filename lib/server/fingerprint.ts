@@ -28,7 +28,13 @@ export function batchSetKey(batchIds: string[]): string {
 /** Version tag for the aggregates cache shape / status vocabulary. Bump this when
  *  the way aggregates are computed changes (e.g. status bucketing) so stale cached
  *  AggregatesDocs are bypassed automatically rather than served until manual refresh. */
-const AGGREGATES_VERSION = "v7"; // v7: sentiment/topics from core's call-analysis rollup
+// v7: sentiment/topics from core's call-analysis rollup.
+// v8: records carry sentiment/topics themselves (legacy-flat `call_analysis` and
+//     core's `analysis_*` list scalars), and the rollup yields to them only when
+//     every batch of the selection is `recordsAnalysisProjected` — a mixed
+//     selection now takes the rollup instead of a partial record count, and
+//     blanks that partial count when the rollup is unavailable.
+const AGGREGATES_VERSION = "v8";
 
 /** Cache key for precomputed aggregates.
  *
@@ -55,7 +61,8 @@ export function compareKey(
   // AGGREGATES_VERSION is part of the key: a comparison's topicShifts and
   // sentimentShift are derived from the two aggregate series, so a bump that
   // changes how those are computed invalidates every stored narrative too.
-  // Without this, the v7 chart shows real topics while this route serves prose
-  // generated when both series were always empty.
+  // Without this, the chart shows real topics while this route serves prose
+  // generated when both series were computed differently (v7: always empty
+  // before it; v8: rollup vs per-record precedence).
   return `compare:${batchSetKey(currentBatchIds)}:${currentDataset}:${batchSetKey(baselineBatchIds)}:${baselineDataset}:${model}:${AGGREGATES_VERSION}`;
 }

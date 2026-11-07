@@ -142,6 +142,42 @@ describe("POST /api/export", () => {
     expect(close).toHaveBeenCalled();
   });
 
+  // Core's calls list now carries the analysis as scalars; the record that
+  // normalizes out of such a row must reach the CSV. `sentiment` is ticked by
+  // default for AI batches in the Combine picker, and used to export blank on
+  // every row because the list sends `call_analysis: null`.
+  it("emits sentiment and key_topics from a list row's analysis scalars", async () => {
+    vi.mocked(isBackendConfigured).mockReturnValue(true);
+    vi.mocked(getTenantContext).mockResolvedValue(ctx as never);
+    setRecordCount(2);
+    vi.mocked(getBatch).mockResolvedValue({ name: "Camp A", selType: "ai", ingestStatus: "ready", total: 2 } as never);
+    const { normalizeCall } = await import("@/lib/server/normalize");
+    const opts = { selType: "ai" as const, batchId: "b1", fingerprint: "fp" };
+    const analysed = normalizeCall(
+      {
+        call_id: "c1", status: "completed", call_analysis: null,
+        analysis_sentiment_label: "negative", analysis_key_topics: ["refund", "callback, later"],
+      },
+      ctx,
+      opts,
+    );
+    const unanalysed = normalizeCall(
+      { call_id: "c2", status: "no_answer", call_analysis: null, analysis_sentiment_label: null, analysis_key_topics: null },
+      ctx,
+      opts,
+    );
+    const { it } = cursor([analysed, unanalysed]);
+    vi.mocked(streamRecordsForFilter).mockResolvedValue(it as never);
+
+    const { POST } = await import("@/app/api/export/route");
+    const res = await POST(postReq({ batchIds: ["b1"], columns: ["call_id", "sentiment", "key_topics"] }));
+    const lines = (await readAll(res)).trim().split("\n");
+
+    expect(lines[0]).toBe("call_id,sentiment,key_topics");
+    expect(lines[1]).toBe('c1,negative,"refund; callback, later"');
+    expect(lines[2]).toBe("c2,,");
+  });
+
   // The count and the stream describe one export. Resolving the published
   // revisions separately for each let a refresh publish in between, so the count
   // read the old revision while the cursor walked the new one — and a complete
