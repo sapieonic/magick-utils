@@ -1,3 +1,10 @@
+## [1.4.2](https://github.com/sapieonic/magick-utils/compare/v1.4.1...v1.4.2) (2026-11-07)
+
+
+### Bug Fixes
+
+* **export:** fill sentiment and key_topics from core's calls-list analysis ([#46](https://github.com/sapieonic/magick-utils/issues/46)) ([09cf9a7](https://github.com/sapieonic/magick-utils/commit/09cf9a75296414ae171f04d88096f8e3a805b09c))
+
 ## [1.4.1](https://github.com/sapieonic/magick-utils/compare/v1.4.0...v1.4.1) (2026-10-03)
 
 
